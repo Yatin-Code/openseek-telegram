@@ -41,7 +41,7 @@ from .logutil import plain, setup_logging
 from .netpolicy import DestinationPolicy, filter_forwarded_headers
 from .pairing import PairingClosed, PairingFailed, PairingManager, RateLimited
 from .public import PublicLimiter, classify
-from .pool import PoolClient, PoolError, PoolService, PoolSync, TelegramBotStore
+from .pool import MAX_NVMT_BYTES, PoolClient, PoolError, PoolService, PoolSync, TelegramBotStore
 from .contrib import ContributionPolicy, Spacing, clean_hosts
 from .tls import ensure_certificate
 from .vtt import LAYOUTS, render
@@ -251,7 +251,8 @@ class Guard:
             return await _send_json(send, 403, {"error": "proxy_refused"})
         clen = headers.get("content-length")
         pool_upload = scope.get("path", "").startswith("/v1/pool/") and scope["method"] == "PUT"
-        body_limit = 256 * 1024 if pool_upload else MAX_BODY
+        package_upload = pool_upload and scope.get("path", "").endswith("/nvmt")
+        body_limit = MAX_NVMT_BYTES if package_upload else (256 * 1024 if pool_upload else MAX_BODY)
         if clen is not None and (not clen.isdigit() or int(clen) > body_limit):
             return await _send_json(send, 413, {"error": "too_large"})
         body = b""
@@ -866,6 +867,50 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
             n_tiles = int(q.get("n_tiles", ""))
             data = await request.body()
             result = await asyncio.to_thread(pool.upload, fp, profile, k, pts_ms, duration_ms, n_tiles, data)
+        except ValueError:
+            return err(400, "bad_request")
+        except PoolError as exc:
+            return err(exc.status, exc.code)
+        return JSONResponse(result, status_code=200 if result["duplicate"] else 201,
+                            headers={"Cache-Control": "no-store"})
+
+    @app.get("/v1/pool/{fp}/nvmt")
+    async def pool_nvmt(request: Request, fp: str):
+        pool = core.pool
+        if pool is None:
+            return err(404, "not_found")
+        if not pool_allowed(request, pool):
+            return err(403, "forbidden")
+        profile = request.query_params.get("profile", "")
+        try:
+            got = await asyncio.to_thread(pool.package, fp, profile)
+        except PoolError as exc:
+            return err(exc.status, exc.code)
+        if got is None:
+            return err(404, "not_found")
+        data, meta = got
+        return Response(data, media_type="application/vnd.openseek.nvmt",
+                        headers={"Cache-Control": "no-store",
+                                 "X-OpenSeek-Duration-Ms": str(meta["duration_ms"]),
+                                 "X-OpenSeek-N-Tiles": str(meta["n_tiles"]),
+                                 "X-OpenSeek-Profile": meta["profile"],
+                                 "X-OpenSeek-Sha256": meta["sha256"]})
+
+    @app.put("/v1/pool/{fp}/nvmt")
+    async def pool_put_nvmt(request: Request, fp: str):
+        pool = core.pool
+        if pool is None:
+            return err(404, "not_found")
+        if not pool_allowed(request, pool, write=True):
+            return err(403, "forbidden")
+        media_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        if media_type not in ("application/vnd.openseek.nvmt", "application/octet-stream"):
+            return err(400, "bad_request")
+        try:
+            profile = request.query_params.get("profile", "")
+            duration_ms = int(request.query_params.get("duration_ms", ""))
+            data = await request.body()
+            result = await asyncio.to_thread(pool.upload_package, fp, profile, duration_ms, data)
         except ValueError:
             return err(400, "bad_request")
         except PoolError as exc:
