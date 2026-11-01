@@ -8,7 +8,8 @@ See `docs/SECURITY-MODEL.md` for the security properties. Clients can be written
   pin = `sha256//` + base64(SHA-256(SPKI DER)). No plain-HTTP API.
 - Admin UI/CLI: `http://127.0.0.1:8788` (loopback only) shows the pairing code, server address and pin
   fingerprint, paired devices (revoke), cache stats. CLI: `openseek pair`, `openseek devices`, `openseek revoke <id>`.
-- JSON bodies ≤ 16 KiB, `Content-Type: application/json`. Errors: `{"error": "<code>"}` — stable snake_case
+- JSON bodies ≤ 16 KiB, `Content-Type: application/json`; shared NVMT packages are binary and capped at 16 MiB.
+  Errors: `{"error": "<code>"}` — stable snake_case
   codes, never echoing input.
 - Auth: `Authorization: Bearer <token>` (43-char base64url of 32 random bytes).
 - Optional shared-pool PUTs use raw `image/jpeg` bodies up to 256 KiB, not JSON.
@@ -94,6 +95,26 @@ body. The server checks the fingerprint, profile, tile bounds, grid timestamp, d
 decode/dimensions and digest, then posts it to Telegram with `sendDocument`. New tile: 201; identical retry: 200;
 conflicting bytes for an immutable tile key: 409; invalid tile: 400. A conflicting tile never replaces the first.
 The pool key is `(fingerprint, profile, k)`; different encodes remain separate.
+
+### TV-generated NVMT packages
+
+Nuvio TV captures thumbnails locally and packs them into its versioned `NVMT` binary format. These endpoints
+share the same fingerprint, pairing, contribution permission, Telegram storage, and anonymous-read limits as
+the tile API.
+
+`GET /v1/pool/{fp}/nvmt?profile=nvmt-v1-g5|nvmt-v1-g10` returns the raw NVMT v1 package; a miss is 404. The
+response includes `X-OpenSeek-Duration-Ms`, `X-OpenSeek-N-Tiles`, `X-OpenSeek-Profile`, and `X-OpenSeek-Sha256`.
+Clients should validate the header and fingerprint before applying the package locally.
+
+`PUT /v1/pool/{fp}/nvmt?profile=nvmt-v1-g5|nvmt-v1-g10&duration_ms=…` accepts raw NVMT v1 bytes with
+`Content-Type: application/vnd.openseek.nvmt` (or `application/octet-stream`), up to 16 MiB. The server checks
+the profile, grid, duration, slot count, duplicate/out-of-range slots, and decodes each JPEG to verify 320×180
+dimensions. It stores the merged package as one Telegram document. The first accepted JPEG for each slot stays;
+later uploads add only missing slots. New coverage: 201; unchanged retry: 200; duration conflict for the same
+fingerprint/profile: 409; malformed data: 400.
+
+Profiles map `nvmt-v1-g5` to a 5-second grid and `nvmt-v1-g10` to a 10-second grid. Different file versions
+have different fingerprints and separate pool entries.
 
 ### Data plane (capability URLs; no headers needed; Bearer also accepted)
 `cap` = base64url(HMAC-SHA256(server_secret, device_id ‖ preview_id ‖ exp))[0:32]; `exp` ≤ now + 6 h.
