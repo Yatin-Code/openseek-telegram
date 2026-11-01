@@ -32,6 +32,13 @@ CREATE TABLE IF NOT EXISTS pool_tiles (
   file_id TEXT NOT NULL, message_id INTEGER NOT NULL, created REAL NOT NULL,
   PRIMARY KEY (fp, profile, k));
 CREATE INDEX IF NOT EXISTS pool_tiles_fp_profile ON pool_tiles(fp, profile, k);
+-- TV-generated Nuvio NVMT packs. Telegram stores the package; this row is the
+-- exact-file lookup and points at the current merged package revision.
+CREATE TABLE IF NOT EXISTS pool_packages (
+  fp TEXT NOT NULL, profile TEXT NOT NULL, duration_ms INTEGER NOT NULL,
+  n_slots INTEGER NOT NULL, n_tiles INTEGER NOT NULL, size INTEGER NOT NULL,
+  sha256 TEXT NOT NULL, file_id TEXT NOT NULL, message_id INTEGER NOT NULL, created REAL NOT NULL,
+  PRIMARY KEY (fp, profile));
 -- Durable upload queue: only keys/metadata are stored here; the JPEG remains in the normal cache.
 CREATE TABLE IF NOT EXISTS pool_outbox (
   fp TEXT NOT NULL, k INTEGER NOT NULL, pts_ms INTEGER NOT NULL, duration_ms INTEGER NOT NULL,

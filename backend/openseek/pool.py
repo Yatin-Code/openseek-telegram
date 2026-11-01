@@ -29,8 +29,10 @@ from .scheduler import tile_count
 
 log = logging.getLogger("openseek.pool")
 MAX_TILE_BYTES = 256 * 1024
+MAX_NVMT_BYTES = 16 * 1024 * 1024
 MAX_DURATION_MS = 12 * 60 * 60 * 1000
 TILE_INTERVAL_MS = 10_000
+NVMT_PROFILES = {"nvmt-v1-g5": 5_000, "nvmt-v1-g10": 10_000}
 
 
 class _DualStackHTTPSConnection(http.client.HTTPSConnection):
@@ -118,6 +120,10 @@ class TelegramBotStore:
         return result["result"]
 
     def put(self, data: bytes, caption: str) -> tuple[str, int]:
+        return self.put_document(data, caption, "tile.jpg", "image/jpeg")
+
+    def put_document(self, data: bytes, caption: str, filename: str,
+                     content_type: str = "application/octet-stream") -> tuple[str, int]:
         boundary = "openseek-" + secrets.token_hex(16)
         pieces: list[bytes] = []
 
@@ -129,8 +135,8 @@ class TelegramBotStore:
         field("chat_id", self.channel_id)
         field("caption", caption)
         pieces.extend([f"--{boundary}\r\n".encode(),
-                       b'Content-Disposition: form-data; name="document"; filename="tile.jpg"\r\n',
-                       b"Content-Type: image/jpeg\r\n\r\n", data, b"\r\n",
+                       f'Content-Disposition: form-data; name="document"; filename="{filename}"\r\n'.encode(),
+                       f"Content-Type: {content_type}\r\n\r\n".encode(), data, b"\r\n",
                        f"--{boundary}--\r\n".encode()])
         req = urllib.request.Request(self._api_url("sendDocument"), data=b"".join(pieces), method="POST",
                                      headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
@@ -147,7 +153,7 @@ class TelegramBotStore:
             raise PoolError(502, "telegram_error")
         return file_id, message_id
 
-    def get(self, file_id: str) -> bytes:
+    def get(self, file_id: str, max_bytes: int = MAX_TILE_BYTES) -> bytes:
         result = self._json("getFile", {"file_id": file_id})
         path = result.get("file_path") if isinstance(result, dict) else None
         if not isinstance(path, str) or not path or ".." in Path(path).parts:
@@ -156,12 +162,89 @@ class TelegramBotStore:
         req = urllib.request.Request(url, method="GET")
         try:
             with self.opener(req, timeout=self.timeout_s) as response:
-                data = response.read(MAX_TILE_BYTES + 1)
+                data = response.read(max_bytes + 1)
         except (OSError, urllib.error.URLError, TimeoutError) as exc:
             raise PoolError(503, "telegram_unavailable") from exc
-        if len(data) > MAX_TILE_BYTES:
+        if len(data) > max_bytes:
             raise PoolError(502, "telegram_file_too_large")
         return data
+
+    def get_document(self, file_id: str) -> bytes:
+        return self.get(file_id, MAX_NVMT_BYTES)
+
+    def delete_message(self, message_id: int) -> None:
+        self._json("deleteMessage", {"chat_id": self.channel_id, "message_id": message_id})
+
+
+def _nvmt_read32(data: bytes, at: int) -> int:
+    return int.from_bytes(data[at:at + 4], "little")
+
+
+def _nvmt_write32(data: bytearray, at: int, value: int) -> None:
+    data[at:at + 4] = int(value).to_bytes(4, "little", signed=False)
+
+
+def decode_nvmt(fp: str, profile: str, duration_ms: int, data: bytes) -> tuple[int, int, dict[int, tuple[int, bytes]]]:
+    """Validate the TV's bounded NVMT v1 package and return (grid, slots, tiles)."""
+    grid = NVMT_PROFILES.get(profile)
+    if not is_fingerprint(fp) or grid is None:
+        raise PoolError(400, "bad_key")
+    if not isinstance(duration_ms, int) or not 0 < duration_ms <= MAX_DURATION_MS:
+        raise PoolError(400, "bad_duration")
+    if not isinstance(data, bytes) or len(data) < 20:
+        raise PoolError(400, "bad_package")
+    if len(data) > MAX_NVMT_BYTES:
+        raise PoolError(413, "package_too_large")
+    if data[:4] != b"NVMT" or _nvmt_read32(data, 4) != 1:
+        raise PoolError(400, "bad_package")
+    package_grid, n_slots, count = (_nvmt_read32(data, 8), _nvmt_read32(data, 12), _nvmt_read32(data, 16))
+    expected_slots = (duration_ms + grid - 1) // grid
+    if (package_grid != grid or n_slots != expected_slots or count == 0
+            or count > n_slots or n_slots > 8640):
+        raise PoolError(400, "bad_package_metadata")
+    pos, tiles = 20, {}
+    for _ in range(count):
+        if pos + 12 > len(data):
+            raise PoolError(400, "bad_package")
+        slot, pts_raw, size = (_nvmt_read32(data, pos), _nvmt_read32(data, pos + 4), _nvmt_read32(data, pos + 8))
+        pts_ms = pts_raw if pts_raw < 0x80000000 else pts_raw - 0x100000000
+        pos += 12
+        if (slot >= n_slots or slot in tiles or size < 125 or size > 200_000
+                or pos + size > len(data) or not 0 <= pts_ms <= duration_ms
+                or abs(pts_ms - slot * grid) > 10_000):
+            raise PoolError(400, "bad_package_tile")
+        jpeg = data[pos:pos + size]
+        if not jpeg_ok(jpeg):
+            raise PoolError(400, "bad_jpeg")
+        try:
+            with Image.open(io.BytesIO(jpeg)) as image:
+                if image.format != "JPEG" or image.size != (TILE_W, TILE_H):
+                    raise PoolError(400, "bad_jpeg_dimensions")
+                image.verify()
+        except (UnidentifiedImageError, OSError, SyntaxError) as exc:
+            raise PoolError(400, "bad_jpeg") from exc
+        tiles[slot] = (pts_ms, jpeg)
+        pos += size
+    if pos != len(data) or len(tiles) != count:
+        raise PoolError(400, "bad_package")
+    return grid, n_slots, tiles
+
+
+def encode_nvmt(grid: int, n_slots: int, tiles: dict[int, tuple[int, bytes]]) -> bytes:
+    data = bytearray(20)
+    data[:4] = b"NVMT"
+    _nvmt_write32(data, 4, 1)
+    _nvmt_write32(data, 8, grid)
+    _nvmt_write32(data, 12, n_slots)
+    _nvmt_write32(data, 16, len(tiles))
+    for slot, (pts_ms, jpeg) in sorted(tiles.items()):
+        record = bytearray(12)
+        _nvmt_write32(record, 0, slot)
+        _nvmt_write32(record, 4, pts_ms)
+        _nvmt_write32(record, 8, len(jpeg))
+        data.extend(record)
+        data.extend(jpeg)
+    return bytes(data)
 
 
 def validate_tile(fp: str, profile: str, k: int, pts_ms: int, duration_ms: int,
@@ -248,6 +331,74 @@ class PoolService:
             raise PoolError(502, "stored_tile_corrupt")
         return data, {"pts_ms": pts_ms, "duration_ms": duration_ms, "n_tiles": n_tiles,
                       "sha256": digest, "profile": profile}
+
+    def package(self, fp: str, profile: str) -> tuple[bytes, dict] | None:
+        if not is_fingerprint(fp) or profile not in NVMT_PROFILES:
+            raise PoolError(400, "bad_key")
+        rows = self.db.q("SELECT duration_ms,n_slots,n_tiles,size,sha256,file_id FROM pool_packages "
+                         "WHERE fp=? AND profile=?", (fp, profile))
+        if not rows:
+            return None
+        duration_ms, n_slots, n_tiles, size, digest, file_id = rows[0]
+        try:
+            data = self.storage.get_document(file_id)
+        except AttributeError:
+            data = self.storage.get(file_id, MAX_NVMT_BYTES)
+        if len(data) != size or hashlib.sha256(data).hexdigest() != digest:
+            raise PoolError(502, "stored_package_corrupt")
+        _grid, got_slots, tiles = decode_nvmt(fp, profile, duration_ms, data)
+        if got_slots != n_slots or len(tiles) != n_tiles:
+            raise PoolError(502, "stored_package_corrupt")
+        return data, {"duration_ms": duration_ms, "n_slots": n_slots, "n_tiles": n_tiles,
+                      "sha256": digest, "profile": profile}
+
+    def upload_package(self, fp: str, profile: str, duration_ms: int, data: bytes) -> dict:
+        grid, n_slots, incoming = decode_nvmt(fp, profile, duration_ms, data)
+        with self._lock:
+            rows = self.db.q("SELECT duration_ms,n_slots,n_tiles,size,sha256,file_id,message_id "
+                             "FROM pool_packages WHERE fp=? AND profile=?", (fp, profile))
+            previous = rows[0] if rows else None
+            merged = dict(incoming)
+            if previous:
+                old_duration, old_slots, old_count, old_size, old_digest, old_file, old_message = previous
+                if old_duration != duration_ms or old_slots != n_slots:
+                    raise PoolError(409, "media_metadata_conflict")
+                try:
+                    old_data = self.storage.get_document(old_file)
+                except AttributeError:
+                    old_data = self.storage.get(old_file, MAX_NVMT_BYTES)
+                if len(old_data) != old_size or hashlib.sha256(old_data).hexdigest() != old_digest:
+                    raise PoolError(502, "stored_package_corrupt")
+                _old_grid, _old_slots, old_tiles = decode_nvmt(fp, profile, duration_ms, old_data)
+                # The first accepted frame for a slot is immutable; concurrent
+                # viewers can add coverage without replacing another tile.
+                merged = dict(old_tiles)
+                for slot, tile in incoming.items():
+                    merged.setdefault(slot, tile)
+            package = encode_nvmt(grid, n_slots, merged)
+            if len(package) > MAX_NVMT_BYTES:
+                raise PoolError(413, "package_too_large")
+            digest = hashlib.sha256(package).hexdigest()
+            if previous and digest == previous[4]:
+                return {"stored": False, "duplicate": True, "tiles": len(merged), "sha256": digest}
+            caption = f"openseek:nvmt:v1:{fp}:{profile}:{digest}"
+            try:
+                file_id, message_id = self.storage.put_document(
+                    package, caption, f"{fp}.{profile}.nvmt", "application/octet-stream")
+            except AttributeError as exc:
+                raise PoolError(503, "package_storage_unavailable") from exc
+            self.db.x("INSERT INTO pool_packages(fp,profile,duration_ms,n_slots,n_tiles,size,sha256,file_id,message_id,created) "
+                      "VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(fp,profile) DO UPDATE SET "
+                      "duration_ms=excluded.duration_ms,n_slots=excluded.n_slots,n_tiles=excluded.n_tiles," 
+                      "size=excluded.size,sha256=excluded.sha256,file_id=excluded.file_id," 
+                      "message_id=excluded.message_id,created=excluded.created",
+                      (fp, profile, duration_ms, n_slots, len(merged), len(package), digest, file_id, message_id, time.time()))
+            if previous:
+                try:
+                    self.storage.delete_message(previous[6])
+                except (AttributeError, PoolError):
+                    pass
+        return {"stored": True, "duplicate": False, "tiles": len(merged), "sha256": digest}
 
 
 class PoolClient:
