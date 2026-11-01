@@ -18,6 +18,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import OrderedDict
 from pathlib import Path
 
 from PIL import Image, UnidentifiedImageError
@@ -88,6 +89,36 @@ class PoolError(Exception):
     def __init__(self, status: int, code: str):
         super().__init__(code)
         self.status, self.code = status, code
+
+
+class _PackageCache:
+    """Small process-local LRU for validated NVMT packages fetched from Telegram."""
+
+    def __init__(self, max_bytes: int = 32 * 1024 * 1024):
+        self.max_bytes = max_bytes
+        self.bytes = 0
+        self.items: OrderedDict[tuple[str, str, str], bytes] = OrderedDict()
+        self.lock = threading.Lock()
+
+    def get(self, key: tuple[str, str, str]) -> bytes | None:
+        with self.lock:
+            data = self.items.get(key)
+            if data is not None:
+                self.items.move_to_end(key)
+            return data
+
+    def put(self, key: tuple[str, str, str], data: bytes) -> None:
+        if not data or len(data) > self.max_bytes:
+            return
+        with self.lock:
+            old = self.items.pop(key, None)
+            if old is not None:
+                self.bytes -= len(old)
+            while self.items and self.bytes + len(data) > self.max_bytes:
+                _old_key, old_data = self.items.popitem(last=False)
+                self.bytes -= len(old_data)
+            self.items[key] = data
+            self.bytes += len(data)
 
 
 class TelegramBotStore:
@@ -277,6 +308,7 @@ class PoolService:
         self.db, self.storage = db, storage
         self.read_key, self.write_key = read_key, write_key
         self._lock = threading.RLock()
+        self._package_cache = _PackageCache()
 
     def authorize(self, given: str | None, write: bool = False) -> bool:
         wanted = self.write_key if write else self.read_key
@@ -340,15 +372,19 @@ class PoolService:
         if not rows:
             return None
         duration_ms, n_slots, n_tiles, size, digest, file_id = rows[0]
-        try:
-            data = self.storage.get_document(file_id)
-        except AttributeError:
-            data = self.storage.get(file_id, MAX_NVMT_BYTES)
-        if len(data) != size or hashlib.sha256(data).hexdigest() != digest:
-            raise PoolError(502, "stored_package_corrupt")
-        _grid, got_slots, tiles = decode_nvmt(fp, profile, duration_ms, data)
-        if got_slots != n_slots or len(tiles) != n_tiles:
-            raise PoolError(502, "stored_package_corrupt")
+        cache_key = (fp, profile, digest)
+        data = self._package_cache.get(cache_key)
+        if data is None:
+            try:
+                data = self.storage.get_document(file_id)
+            except AttributeError:
+                data = self.storage.get(file_id, MAX_NVMT_BYTES)
+            if len(data) != size or hashlib.sha256(data).hexdigest() != digest:
+                raise PoolError(502, "stored_package_corrupt")
+            _grid, got_slots, tiles = decode_nvmt(fp, profile, duration_ms, data)
+            if got_slots != n_slots or len(tiles) != n_tiles:
+                raise PoolError(502, "stored_package_corrupt")
+            self._package_cache.put(cache_key, data)
         return data, {"duration_ms": duration_ms, "n_slots": n_slots, "n_tiles": n_tiles,
                       "sha256": digest, "profile": profile}
 
@@ -393,6 +429,7 @@ class PoolService:
                       "size=excluded.size,sha256=excluded.sha256,file_id=excluded.file_id," 
                       "message_id=excluded.message_id,created=excluded.created",
                       (fp, profile, duration_ms, n_slots, len(merged), len(package), digest, file_id, message_id, time.time()))
+            self._package_cache.put((fp, profile, digest), package)
             if previous:
                 try:
                     self.storage.delete_message(previous[6])
