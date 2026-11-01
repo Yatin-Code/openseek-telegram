@@ -557,6 +557,21 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
         scheme, _, credential = request.headers.get("authorization", "").partition(" ")
         return credential if scheme.lower() == "bearer" and credential else None
 
+    def pool_allowed(request: Request, pool: PoolService, write: bool = False) -> bool:
+        # Keep the host-to-host pool keys for OpenSeek synchronization. Nuvio and
+        # other paired clients use their revocable device token instead; a guest
+        # can publish only when both the invitation and the host's sharing switch
+        # grant contribution. The public listener may serve read-only cache hits
+        # without a device token, under its per-IP pool_read budget.
+        if pool.authorize(pool_key(request), write=write):
+            return True
+        device_id = request.state.device_id
+        if write:
+            return core.can_contribute(device_id)
+        if device_id is not None:
+            return True
+        return bool(request.scope.get("openseek.public"))
+
     @app.get("/v1/health")
     async def health(request: Request):
         if request.scope.get("openseek.public"):
@@ -795,7 +810,7 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
         pool = core.pool
         if pool is None:
             return err(404, "not_found")
-        if not pool.authorize(pool_key(request)):
+        if not pool_allowed(request, pool):
             return err(403, "forbidden")
         profile = request.query_params.get("profile", "")
         try:
@@ -811,7 +826,7 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
         pool = core.pool
         if pool is None:
             return err(404, "not_found")
-        if not pool.authorize(pool_key(request)):
+        if not pool_allowed(request, pool):
             return err(403, "forbidden")
         k = parse_index(name[:-4], 999_999) if name.endswith(".jpg") else None
         if k is None:
@@ -838,7 +853,7 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
         pool = core.pool
         if pool is None:
             return err(404, "not_found")
-        if not pool.authorize(pool_key(request), write=True):
+        if not pool_allowed(request, pool, write=True):
             return err(403, "forbidden")
         k = parse_index(name[:-4], 999_999) if name.endswith(".jpg") else None
         if k is None or request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "image/jpeg":
