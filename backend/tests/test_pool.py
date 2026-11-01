@@ -24,7 +24,8 @@ from openseek.db import DB
 from openseek.engine import Extractor
 from openseek.fetch import fingerprint
 from openseek.jobs import Source
-from openseek.pool import PoolClient, PoolError, PoolService, PoolSync, TelegramBotStore
+from openseek.pool import (MAX_NVMT_BYTES, PoolClient, PoolError, PoolService,
+                           PoolSync, TelegramBotStore, decode_nvmt, encode_nvmt)
 from openseek.scheduler import tile_count
 from openseek.vtt import render
 
@@ -36,6 +37,11 @@ def jpeg(color=(21, 49, 90)) -> bytes:
     out = io.BytesIO()
     Image.new("RGB", (320, 180), color).save(out, "JPEG", quality=75)
     return out.getvalue()
+
+
+def nvmt_package(grid: int, duration_ms: int, tiles: dict[int, tuple[int, bytes]]) -> bytes:
+    slots = (duration_ms + grid - 1) // grid
+    return encode_nvmt(grid, slots, tiles)
 
 
 class FakeResponse:
@@ -379,6 +385,76 @@ def test_pool_auth_validation_first_writer_conflict_and_variant_isolation(tmp_pa
         assert error.value.code == "bad_timestamp"
     finally:
         db.close()
+
+
+def test_nvmt_package_validation_merge_and_asgi_download(tmp_path, monkeypatch):
+    """TV-sized NVMT packages merge by exact file/profile and survive the real HTTP routes."""
+    tg = FakeTelegramBotAPI()
+
+    class NoSourceProxy:
+        def stop(self):
+            pass
+
+    async def inline_to_thread(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(app_module.asyncio, "to_thread", inline_to_thread)
+    core = Core(Settings(data_dir=tmp_path / "pool-host", pool_enabled=True,
+                         pool_read_key=READ_KEY, pool_write_key=WRITE_KEY,
+                         telegram_bot_token="123456:test", telegram_channel_id="-100123"),
+                pool_storage=TelegramBotStore("123456:test", "-100123", opener=tg.urlopen),
+                proxy=NoSourceProxy())
+    api = ASGIPoolAPI(create_api_app(core))
+    fp = hashlib.sha256(b"one exact TV video").hexdigest()
+    duration_ms, grid = 20_000, 5_000
+    a, b, replacement = jpeg((21, 49, 90)), jpeg((90, 49, 21)), jpeg((5, 6, 7))
+
+    def put(tiles, *, profile="nvmt-v1-g5", duration=duration_ms, content_type="application/vnd.openseek.nvmt"):
+        data = nvmt_package(grid, duration, tiles)
+        return api(f"https://pool.test/v1/pool/{fp}/nvmt?profile={profile}&duration_ms={duration}",
+                   data, {"Authorization": f"Bearer {WRITE_KEY}", "Content-Type": content_type}, 2)
+
+    try:
+        # Two TVs can add coverage without replacing the first accepted frame for a slot.
+        first = put({0: (0, a), 2: (10_000, a)})
+        assert first.status == 201, first.read()
+        second = put({0: (0, replacement), 1: (5_000, b)})
+        assert second.status == 201, second.read()
+        assert tg.messages == 2
+
+        url = f"https://pool.test/v1/pool/{fp}/nvmt?profile=nvmt-v1-g5"
+        got = api(url, None, {"Authorization": f"Bearer {READ_KEY}"}, 2)
+        assert got.status == 200
+        assert got.headers["content-type"] == "application/vnd.openseek.nvmt"
+        assert got.headers["x-openseek-duration-ms"] == str(duration_ms)
+        assert got.headers["x-openseek-profile"] == "nvmt-v1-g5"
+        assert got.headers["x-openseek-sha256"] == hashlib.sha256(got.data).hexdigest()
+        assert decode_nvmt(fp, "nvmt-v1-g5", duration_ms, got.data)[2] == {
+            0: (0, a), 1: (5_000, b), 2: (10_000, a)}
+
+        duplicate = put({0: (0, a), 1: (5_000, b), 2: (10_000, a)})
+        assert duplicate.status == 200
+        assert json.loads(duplicate.data)["duplicate"] is True
+
+        # Anonymous reads are rejected on the private API; writes need the write key.
+        assert api(url, None, {}, 2).status in (401, 403)
+        denied = api(f"https://pool.test/v1/pool/{fp}/nvmt?profile=nvmt-v1-g5&duration_ms={duration_ms}",
+                     nvmt_package(grid, duration_ms, {3: (15_000, b)}),
+                     {"Authorization": f"Bearer {READ_KEY}", "Content-Type": "application/vnd.openseek.nvmt"}, 2)
+        assert denied.status == 403
+
+        # Invalid metadata, mismatched profile, non-NVMT bytes, and >16 MiB are refused.
+        assert put({0: (0, a)}, profile="nvmt-v1-g10").status == 400
+        # The package itself is valid, but a different duration cannot overwrite this exact key.
+        assert put({0: (0, a)}, duration=25_000).status == 409
+        bad_type = put({0: (0, a)}, content_type="image/jpeg")
+        assert bad_type.status == 400
+        with pytest.raises(PoolError, match="bad_package"):
+            decode_nvmt(fp, "nvmt-v1-g5", duration_ms, b"not an NVMT package")
+        with pytest.raises(PoolError, match="package_too_large"):
+            decode_nvmt(fp, "nvmt-v1-g5", duration_ms, b"x" * (MAX_NVMT_BYTES + 1))
+    finally:
+        core.stop()
 
 
 def test_real_sample_decode_to_telegram_pool_and_second_instance(tmp_path, monkeypatch):
