@@ -1,0 +1,37 @@
+# Public Telegram-backed pool host. Create .pool-secrets/host.env from docs/TELEGRAM-POOL.md first.
+name: openseek-telegram-pool
+
+services:
+  openseek:
+    build: .
+    image: openseek-telegram-pool:local
+    restart: unless-stopped
+    env_file:
+      - .pool-secrets/host.env
+    environment:
+      OPENSEEK_DATA_DIR: /data
+      OPENSEEK_HOST: 0.0.0.0
+      OPENSEEK_PUBLISHED_ON: 127.0.0.1
+      OPENSEEK_PUBLIC_BIND: 0.0.0.0
+      OPENSEEK_PUBLIC_PORT: 8789
+      OPENSEEK_TLS_CERT_FILE: /run/openseek-certs/fullchain.pem
+      OPENSEEK_TLS_KEY_FILE: /run/openseek-certs/privkey.pem
+    ports:
+      - "127.0.0.1:8787:8787"
+      - "443:8789"
+    volumes:
+      - openseek-pool-data:/data
+      - /opt/openseek/certs:/run/openseek-certs:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 512m
+    memswap_limit: 512m
+    cpus: 1.0
+
+volumes:
+  openseek-pool-data:

@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+bench/fixtures/
+data/
+*.log
+.env
+.pool-secrets/
+
+backend/tests/fixtures/generated/
