@@ -72,8 +72,10 @@ Latest-wins; `at_ms=null` = scrubbing ended. Client sends ≤ 8/s. Never awaited
 
 ### Optional shared tile pool
 
-Pool endpoints are off unless the host sets `OPENSEEK_POOL_ENABLED=1`. OpenSeek-to-OpenSeek sync may use the
-separate read and write bearer keys (`OPENSEEK_POOL_READ_KEY`, `OPENSEEK_POOL_WRITE_KEY`). Paired app clients use
+Pool endpoints are available only on a pool host configured with `OPENSEEK_POOL_MODE=host` and Telegram host
+credentials, or with the legacy `OPENSEEK_POOL_ENABLED=1` setting. An unset mode is local-only; `channel` mode
+has no HTTP pool endpoints and reads Telegram through MTProto. OpenSeek-to-OpenSeek sync may use the separate read
+and write bearer keys (`OPENSEEK_POOL_READ_KEY`, `OPENSEEK_POOL_WRITE_KEY`). Paired app clients use
 their revocable device token for reads; a guest can write only when its invitation grants contribution and the
 host's contribution switch is on. The public listener may serve anonymous reads under its per-IP `pool_read`
 budget. Never put Telegram credentials or the shared pool write key in an app build.

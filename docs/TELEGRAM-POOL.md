@@ -23,6 +23,7 @@ The shared pool can run on an existing OpenSeek host. Set these variables on tha
 
 ```sh
 export OPENSEEK_POOL_ENABLED=1
+export OPENSEEK_POOL_MODE=host
 export OPENSEEK_POOL_READ_KEY='replace-with-at-least-24-random-characters'
 export OPENSEEK_POOL_WRITE_KEY='use-a-different-24-plus-character-secret'
 export OPENSEEK_TELEGRAM_BOT_TOKEN='keep-this-only-on-the-pool-host'
@@ -56,6 +57,7 @@ Each participating host continues to run its own OpenSeek instance and performs 
 
 ```sh
 export OPENSEEK_POOL_URL='https://pool.example.org'
+export OPENSEEK_POOL_MODE=host
 export OPENSEEK_POOL_READ_KEY='the-pool-read-key'
 ```
 
@@ -81,8 +83,8 @@ bytes for that exact tile key; the pool keeps the first tile.
   and size. Downloads verify the stored SHA-256 before returning bytes.
 * Telegram is not the lookup index. If a Telegram upload succeeds but the following SQLite commit fails, an
   unindexed Telegram message may remain. Its caption includes the pool key and digest for later cleanup.
-* The pool API is optional. With `POOL_ENABLED=0` and no `POOL_URL`, OpenSeek behaves as the original local-only
-  service. A local pool does not make missing tiles appear without a participant that has generated them.
+* The pool is optional. If `OPENSEEK_POOL_MODE` is unset, OpenSeek is local-only unless the legacy
+  `OPENSEEK_POOL_ENABLED=1` switch selects host mode. A `POOL_URL` by itself no longer enables pool traffic.
 * A source that is a different release, resolution, or duration will normally have a different fingerprint. Any
   cross-release reuse stays in OpenSeek's approximate metadata path and must not be presented as exact.
 
@@ -102,3 +104,67 @@ python -m pytest tests/test_pool.py
 
 Real Telegram smoke testing is a separate deployment check and requires a bot token and channel ID configured in
 the pool host's environment. Never put a bot token in a player URL, VTT, client configuration, Git, or issue report.
+
+## Channel mode (no pool API host)
+
+Set `OPENSEEK_POOL_MODE=channel` on every participating OpenSeek. Each instance uses a local SQLite index of one
+private Telegram group or channel, downloads documents by message ID, and caches validated bytes in its ordinary
+tile cache. There is no pool HTTP API in this mode. A fresh instance scans the full channel and rebuilds its index;
+later scans continue after the last Telegram message ID. The channel is the source of truth.
+
+Run the guided setup on the instance:
+
+```sh
+python -m openseek setup
+```
+
+Choose **Join a community pool**. For invite-link onboarding, use a private supergroup whose members can send media.
+The wizard logs in with a Telegram user session, joins the invite, checks channel access, and writes `openseek.env`
+with mode `0600`. It does not modify an existing `.env`. It prints the command to load the new file. A bot cannot
+join with an invite link; an administrator must add a bot to the group and grant read and post permissions.
+
+The equivalent user-session configuration is:
+
+```sh
+OPENSEEK_POOL_MODE=channel
+OPENSEEK_TELEGRAM_API_ID=123456
+OPENSEEK_TELEGRAM_API_HASH=0123456789abcdef0123456789abcdef
+OPENSEEK_TELEGRAM_SESSION_FILE=/var/lib/openseek/telegram/openseek.session
+OPENSEEK_TELEGRAM_CHANNEL_ID=-1001234567890
+OPENSEEK_CONTRIBUTION=1
+```
+
+Get the API ID and hash from Telegram's API development page. The session file is created under the data directory by
+default and is restricted to mode `0600`. To authenticate manually, set the session file and run
+`python -m openseek pool login`. A channel-mode instance needs read access to the private channel even when it sends
+contributions through a librarian.
+
+`OPENSEEK_CONTRIBUTION=1` publishes completed tiles from a durable local outbox. Direct group posting requires the
+user session to be a member with Send Messages and Send Media rights, or a bot that an administrator added. For a
+Telegram relay, set `OPENSEEK_LIBRARIAN=@pool_librarian_bot`; contributors DM the bot and it validates and reposts
+the document. The relay must run with `OPENSEEK_LIBRARIAN_ENABLED=1`, a bot token, MTProto API credentials, and write
+permission in the shared channel. Telegram does not allow a bot to DM another bot. Keep the relay open only if the
+community accepts open contributions; uploads are rate-limited and bad documents are deleted and temporarily
+blocked.
+
+An HTTPS librarian URL receives a `PUT /v1/tiles/{fp}/{k}.jpg` with `image/jpeg`, the tile caption in
+`X-OpenSeek-Caption`, and `pts_ms`, `duration_ms`, and `n_tiles` query values. It must return JSON containing the
+reposted channel `message_id`; an optional `OPENSEEK_LIBRARIAN_KEY` is sent as a bearer token. The endpoint is an
+external relay and is not exposed by channel-mode OpenSeek.
+
+Use these commands to inspect or repair the local index:
+
+```sh
+python -m openseek pool status
+python -m openseek pool scan
+python -m openseek pool rebuild
+```
+
+The loopback admin dashboard also shows pool mode and has Scan and Rebuild controls. Channel-mode uploads keep the
+caption `openseek:v1:<fp>:<profile>:<k>:<sha256>`; their Telegram document filenames carry the timestamp and media
+duration needed for NVMT subsets. Older host-mode posts keep working for tile reads, but their captions contain no
+duration metadata, so they cannot be used to build exact NVMT packages until a metadata-bearing duplicate appears.
+
+Channel mode ignores legacy host URL/key settings. With mode unset, host settings are ignored unless
+`OPENSEEK_POOL_ENABLED=1`; `host` keeps the HTTP pool API and Bot API store. `python -m openseek pool status` reports
+the selected mode without returning tokens or session data.

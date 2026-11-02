@@ -95,9 +95,10 @@ are detected (size/JPEG marker check) and regenerated. Configurable cache size c
 `no-new-privileges`, default seccomp, memory/CPU/pids limits, no host network, no UPnP. Publish on the LAN only;
 the backend refuses client source IPs that are not private/loopback unless `OPENSEEK_ALLOW_PUBLIC_CLIENTS=1`.
 
-**SR-18 (MUST) No telemetry.** No telemetry or update checks. When pool settings are empty, no outbound connections
-occur except client-requested media fetches. Pool opt-in may contact only the configured HTTPS pool URL and, on a
-pool host, Telegram's Bot API. *Verify:* review + `test_no_outbound_on_idle`.
+**SR-18 (MUST) No telemetry.** No telemetry or update checks. With pool mode unset and the legacy host switch off,
+no pool connections occur except client-requested media fetches. Host mode may contact the configured HTTPS pool URL
+and Telegram Bot API; channel mode may contact only the configured Telegram channel and optional librarian. *Verify:*
+review + `test_no_outbound_on_idle`.
 
 **SR-19 (MUST) No secrets in responses.** Errors are stable codes, never echo URLs or headers. Response headers:
 `Cache-Control: no-store` on API JSON, `private` on data; `X-Content-Type-Options: nosniff`.

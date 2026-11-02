@@ -68,9 +68,10 @@ to that file with owner-only permissions; leave it unset in normal use.
 
 Logging: log lines never contain query strings, userinfo, tokens, capability segments, pairing codes or forwarded headers; host names are reduced to a salted hash that changes on every restart. The uvicorn access log is enabled and records
 client IP, method, redacted path and status. OpenSeek does not rotate or truncate logs; rotate them yourself if viewing history is a concern. The start-up banner prints the bind address, LAN URL and certificate pin.
-There is no telemetry or update check. With the shared pool disabled and no pool URL configured, the backend makes
-no outbound connection except media fetches requested by clients (a test checks that an idle server makes none).
-Pool opt-in adds HTTPS requests only to the operator-configured pool URL or, on the pool host, Telegram's Bot API.
+There is no telemetry or update check. With `OPENSEEK_POOL_MODE` unset and the legacy host switch disabled, the
+backend makes no pool connection (a test checks that an idle server makes none). Host mode may contact the configured
+HTTPS pool URL and Telegram Bot API. Channel mode uses MTProto for the configured Telegram group/channel and, when
+selected, its librarian bot. No source URL is sent to either pool mode.
 OpenSeek Desktop contacts a public metadata service (Cinemeta) for titles and posters.
 
 ## Windows installer

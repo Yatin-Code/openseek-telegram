@@ -12,6 +12,7 @@ services:
       OPENSEEK_DATA_DIR: /data
       OPENSEEK_HOST: 0.0.0.0
       OPENSEEK_PUBLISHED_ON: 127.0.0.1
+      OPENSEEK_POOL_MODE: host
       OPENSEEK_PUBLIC_BIND: 0.0.0.0
       OPENSEEK_PUBLIC_PORT: 8789
       OPENSEEK_TLS_CERT_FILE: /run/openseek-certs/fullchain.pem

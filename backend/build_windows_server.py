@@ -25,7 +25,7 @@ EXCLUDES = ["tkinter", "unittest", "pytest", "_pytest", "httpx", "psutil", "pydo
 HIDDEN = ["uvicorn.protocols.http.h11_impl", "uvicorn.protocols.websockets.websockets_impl", "uvicorn.protocols.http.auto",
           "uvicorn.lifespan.on", "uvicorn.lifespan.off", "uvicorn.lifespan.auto", "uvicorn.loops.asyncio", "uvicorn.loops.auto",
           "h11", "anyio._backends._asyncio", "cryptography", "cryptography.hazmat.bindings._rust",
-          "openseek.worker", "openseek.engine", "openseek.altpipeline", "openseek.altsource"]
+          "openseek.worker", "openseek.engine", "openseek.altpipeline", "openseek.altsource", "telethon"]
 VERSION_INFO = """VSVersionInfo(
   ffi=FixedFileInfo(filevers=({a}, {b}, {c}, 0), prodvers=({a}, {b}, {c}, 0), mask=0x3f, flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0, date=(0, 0)),
   kids=[
@@ -70,7 +70,7 @@ def main() -> int:
     cmd = [py, "-m", "PyInstaller", "--noconfirm", "--clean", "--console", "--noupx", "--name", "OpenSeekServer",
            "--version-file", vf, "--distpath", dist, "--workpath", work, "--specpath", out, "--paths", HERE,
            "--collect-all", "av", "--collect-submodules", "uvicorn", "--collect-submodules", "anyio",
-           "--collect-submodules", "PIL"]
+           "--collect-submodules", "PIL", "--collect-submodules", "telethon"]
     for m in EXCLUDES:
         cmd += ["--exclude-module", m]
     for m in HIDDEN:

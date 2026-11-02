@@ -25,8 +25,8 @@ License: [AGPL-3.0-or-later](LICENSE).
 * Optional public guest listener (off by default): invite-only, deny-by-default, per-address rate limits and blocks.
 * Contributor Mode (off by default): trusted guests may contribute thumbnails from their own link, under an
   allowlisted-host, https-only, SSRF-safe policy and a work-conserving scheduler that yields to the owner.
-* Optional Telegram-backed shared tile pool: independent OpenSeek servers can fetch exact-fingerprint tiles
-  before doing their own frame decode, and opted-in servers upload their already-generated JPEGs asynchronously.
+* Optional Telegram-backed shared tile pool: use a host API or let instances index one private Telegram group/channel
+  directly. Channel mode reads exact-fingerprint tiles and publishes opted-in JPEGs without a pool API host.
 * Desktop app (`desktop/`, PySide6, Windows): dashboard, poster library, live activity, logs, sharing, settings.
   See [docs/DESKTOP.md](docs/DESKTOP.md).
 
@@ -145,14 +145,24 @@ All settings are environment variables read at start-up. Invalid values stop the
 | `OPENSEEK_ALT_*` | off | Experimental alternative low-resolution source negotiation (`OPENSEEK_ALT_SOURCE` and related); see `backend/openseek/config.py` |
 | `OPENSEEK_CAPTURE_SOURCE_FILE` | empty | Diagnostics: writes the resolved source link to a file. Leave unset |
 | `OPENSEEK_LOG_LEVEL` | `INFO` | Log level |
-| `OPENSEEK_POOL_ENABLED` | `0` | Serve shared-pool API on this instance; requires Telegram credentials and both keys |
-| `OPENSEEK_POOL_URL` | empty | Shared pool base URL; HTTPS except loopback tests |
+| `OPENSEEK_POOL_MODE` | unset | `host` or `channel`; unset means local-only, except legacy `POOL_ENABLED=1` selects host mode |
+| `OPENSEEK_POOL_ENABLED` | `0` | Serve the existing shared-pool API (host mode); requires Telegram credentials and both keys |
+| `OPENSEEK_POOL_URL` | empty | Host-mode shared pool URL; HTTPS except loopback tests |
 | `OPENSEEK_POOL_READ_KEY` | empty | Pool read secret, at least 24 characters |
 | `OPENSEEK_POOL_WRITE_KEY` | empty | Pool upload secret, at least 24 characters |
-| `OPENSEEK_POOL_SHARE` | `0` | Publish this instance's already-generated tiles to `POOL_URL` |
+| `OPENSEEK_POOL_SHARE` | `0` | Publish this instance's already-generated tiles to `POOL_URL` in host mode |
 | `OPENSEEK_POOL_TIMEOUT_S` | `2` | Per-request timeout for shared tile access |
-| `OPENSEEK_TELEGRAM_BOT_TOKEN` | empty | Pool host only; secret bot token |
-| `OPENSEEK_TELEGRAM_CHANNEL_ID` | empty | Pool host only; private channel where the bot can post |
+| `OPENSEEK_TELEGRAM_BOT_TOKEN` | empty | Telegram bot identity; secret |
+| `OPENSEEK_TELEGRAM_CHANNEL_ID` | empty | Private group/channel used by the selected pool mode |
+| `OPENSEEK_TELEGRAM_API_ID` / `OPENSEEK_TELEGRAM_API_HASH` | empty | Telethon MTProto app credentials for channel mode |
+| `OPENSEEK_TELEGRAM_SESSION` | empty | User StringSession or session filename for channel mode |
+| `OPENSEEK_TELEGRAM_SESSION_FILE` | `<data>/telegram/openseek.session` | Explicit mode-0600 user session file |
+| `OPENSEEK_POOL_CHANNEL_SCAN_LIMIT` | `2000` | Maximum Telegram messages scanned per pass |
+| `OPENSEEK_POOL_INDEX_REFRESH_S` | `300` | Channel index refresh interval in seconds |
+| `OPENSEEK_CONTRIBUTION` | `0` | Opt in to channel-mode uploads |
+| `OPENSEEK_LIBRARIAN` | empty | `@bot` or HTTPS upload relay for channel contributions |
+| `OPENSEEK_LIBRARIAN_KEY` | empty | Optional bearer key for an HTTPS upload relay |
+| `OPENSEEK_LIBRARIAN_ENABLED` | `0` | Run this channel-mode instance as a Telegram DM upload relay |
 
 There is deliberately no variable that relaxes the outbound destination policy. The authoritative list is
 `backend/openseek/config.py`.
@@ -186,7 +196,8 @@ Details: [docs/SECURITY-MODEL.md](docs/SECURITY-MODEL.md). To report a vulnerabi
 ## Responsible use
 
 OpenSeek is free and self-hosted. The project does not provide movie downloads. The optional pool is operated by whoever
-configures it; every contributing OpenSeek owner opts in through `OPENSEEK_POOL_SHARE`. You must hold the rights, permissions
+configures it; every contributing OpenSeek owner opts in through `OPENSEEK_POOL_SHARE` (host mode) or
+`OPENSEEK_CONTRIBUTION` (channel mode). You must hold the rights, permissions
 or applicable legal exceptions needed to generate and share thumbnails from the media you point OpenSeek at. This notice does
 not remove anyone's legal responsibility and is not legal advice.
 See [docs/RESPONSIBLE-USE.md](docs/RESPONSIBLE-USE.md).
@@ -227,6 +238,6 @@ Dockerfile only, not prebuilt Docker images**; build the image yourself with `do
 * No prebuilt Docker images are published (see License); build from the Dockerfile.
 * The desktop app is Windows only. The server is developed on Windows and tested in Linux containers.
 * Access logs record client IPs and request times and are not rotated by OpenSeek.
-* The Telegram pool is experimental and currently uses shared read/write bearer keys. Treat write-key holders as
-  trusted contributors; conflicting renders are resolved by first-writer-wins. Pool metadata is local SQLite on the
-  pool host, and remote Telegram upload success followed by a local database failure can leave an orphaned channel post.
+* The Telegram pool is experimental. Host mode uses shared read/write bearer keys; channel mode keeps a rebuildable
+  SQLite index on each instance and uses Telethon MTProto. Conflicting renders are resolved by first-writer-wins.
+  See [docs/TELEGRAM-POOL.md](docs/TELEGRAM-POOL.md) for mode selection and setup.
