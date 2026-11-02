@@ -397,7 +397,7 @@ class PoolService:
         # Runtime is only a coarse filter. The TV must compare sample frames before accepting a candidate.
         tolerance = max(90_000, int(duration_ms * 0.15))
         rows = self.db.q(
-            "SELECT p.fp,p.profile,p.duration_ms,p.n_slots,p.n_tiles "
+            "SELECT p.fp,p.profile,p.duration_ms,n.n_slots,n.n_tiles "
             "FROM pool_episode_packages p JOIN pool_packages n ON n.fp=p.fp AND n.profile=p.profile "
             "WHERE p.episode_key=? AND ABS(p.duration_ms-?)<=? "
             "ORDER BY ABS(p.duration_ms-?) ASC,p.updated DESC LIMIT ?",
@@ -432,6 +432,15 @@ class PoolService:
             self.db.x("INSERT INTO pool_episode_packages(episode_key,fp,profile,duration_ms,updated) VALUES(?,?,?,?,?) "
                        "ON CONFLICT(episode_key,fp,profile) DO UPDATE SET duration_ms=excluded.duration_ms,updated=excluded.updated",
                        (episode_key, fp, profile, duration_ms, time.time()))
+
+    def index_episode_package(self, fp: str, profile: str, episode_key: str) -> bool:
+        if not is_fingerprint(fp) or profile not in NVMT_PROFILES or not _EPISODE_KEY.fullmatch(episode_key):
+            raise PoolError(400, "bad_episode_key")
+        rows = self.db.q("SELECT duration_ms FROM pool_packages WHERE fp=? AND profile=?", (fp, profile))
+        if not rows:
+            return False
+        self._index_episode_package(episode_key, fp, profile, int(rows[0][0]))
+        return True
 
     def upload_package(self, fp: str, profile: str, duration_ms: int, data: bytes,
                        episode_key: str | None = None) -> dict:

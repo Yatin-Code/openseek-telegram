@@ -912,6 +912,12 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
         if got is None:
             return err(404, "not_found")
         data, meta = got
+        episode_key = request.query_params.get("episode_key")
+        if episode_key:
+            try:
+                await asyncio.to_thread(pool.index_episode_package, fp, profile, episode_key)
+            except PoolError as exc:
+                return err(exc.status, exc.code)
         return Response(data, media_type="application/vnd.openseek.nvmt",
                         headers={"Cache-Control": "no-store",
                                  "X-OpenSeek-Duration-Ms": str(meta["duration_ms"]),

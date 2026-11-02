@@ -102,7 +102,9 @@ Nuvio TV captures thumbnails locally and packs them into its versioned `NVMT` bi
 share the same fingerprint, pairing, contribution permission, Telegram storage, and anonymous-read limits as
 the tile API.
 
-`GET /v1/pool/{fp}/nvmt?profile=nvmt-v1-g5|nvmt-v1-g10` returns the raw NVMT v1 package; a miss is 404. The
+`GET /v1/pool/{fp}/nvmt?profile=nvmt-v1-g5|nvmt-v1-g10` returns the raw NVMT v1 package; a miss is 404. An
+optional `episode_key` records the hash-to-package association after an exact hit, so older packages can join the
+cross-encode index when a client reads them. The
 response includes `X-OpenSeek-Duration-Ms`, `X-OpenSeek-N-Tiles`, `X-OpenSeek-Profile`, and `X-OpenSeek-Sha256`.
 Clients should validate the header and fingerprint before applying the package locally.
 
@@ -118,7 +120,8 @@ later uploads add only missing slots. New coverage: 201; unchanged retry: 200; d
 fingerprint/profile: 409; malformed data: 400.
 
 For TV episode sharing, clients may include a 64-character SHA-256 `episode_key` derived from the catalog ID,
-season, and episode. The server stores only this hash, not the catalog ID or title. `GET
+season, and episode. The server stores only this pseudonymous hash, not the catalog ID or title; because catalog
+IDs are guessable, this hash is not encryption or a privacy guarantee. `GET
 /v1/pool/episodes/{episode_key}?duration_ms=…` returns up to eight nearby package candidates. Runtime is only a
 coarse filter: clients must compare sample frames before accepting a different fingerprint. A client can request
 those sample records with the `slots` query above, then fetch the full package after verification. This index is
