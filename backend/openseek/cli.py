@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 from .config import ConfigError, Settings
 
@@ -31,6 +33,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="openseek")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("serve", help="run the daemon (HTTPS API + loopback admin)")
+    sub.add_parser("setup", help="write a protected pool configuration file")
     sub.add_parser("pair", help="open a 10-minute pairing window and print the code")
     sub.add_parser("devices", help="list paired devices")
     sub.add_parser("dashboard", help="open the local admin dashboard (the secret travels in the URL fragment, never over the network)")
@@ -38,9 +41,27 @@ def main(argv: list[str] | None = None) -> int:
     rv.add_argument("device_id")
     oa = sub.add_parser("openapi", help="write the API's OpenAPI document")
     oa.add_argument("path")
+    pool = sub.add_parser("pool", help="inspect or rebuild the Telegram channel pool")
+    pool_sub = pool.add_subparsers(dest="pool_action", required=True)
+    pool_sub.add_parser("status", help="show the configured pool state")
+    pool_sub.add_parser("scan", help="scan new Telegram messages once")
+    pool_sub.add_parser("rebuild", help="clear and rebuild the channel index")
+    pool_sub.add_parser("login", help="log in to a Telegram user session")
     a = ap.parse_args(argv)
+    if a.cmd == "setup":
+        from .setup import run_setup
+        return run_setup()
     try:
-        settings = Settings.from_env()
+        env = dict(os.environ)
+        if a.cmd == "pool" and a.pool_action == "login":
+            if env.get("OPENSEEK_POOL_MODE", "").strip().lower() != "channel":
+                print("set OPENSEEK_POOL_MODE=channel and Telegram API credentials before pool login", file=sys.stderr)
+                return 2
+            if not (env.get("OPENSEEK_TELEGRAM_BOT_TOKEN") or env.get("OPENSEEK_TELEGRAM_SESSION") or
+                    env.get("OPENSEEK_TELEGRAM_SESSION_FILE")):
+                data_dir = env.get("OPENSEEK_DATA_DIR", "data")
+                env["OPENSEEK_TELEGRAM_SESSION_FILE"] = str(Path(data_dir) / "telegram" / "openseek.session")
+        settings = Settings.from_env(env)
     except ConfigError as e:
         print(f"configuration error: {e}", file=sys.stderr)
         return 2
@@ -48,6 +69,36 @@ def main(argv: list[str] | None = None) -> int:
     if a.cmd == "serve":
         from .app import serve
         serve(settings)
+        return 0
+    if a.cmd == "pool":
+        if a.pool_action == "login":
+            from .pool import PoolError
+            from .telegram_mt import TelegramMTProtoStore
+
+            store = TelegramMTProtoStore(settings)
+            try:
+                store.login()
+                print("Telegram user session saved with restricted file permissions.")
+                return 0
+            except PoolError as exc:
+                print(f"Telegram login failed ({exc.code})", file=sys.stderr)
+                return 1
+            finally:
+                store.close()
+        method, path = {
+            "status": ("GET", "/admin/pool/status"),
+            "scan": ("POST", "/admin/pool/scan"),
+            "rebuild": ("POST", "/admin/pool/rebuild"),
+        }[a.pool_action]
+        try:
+            status, body = _admin(settings, method, path)
+        except (urllib.error.URLError, OSError):
+            print("cannot reach the OpenSeek daemon on the loopback admin port", file=sys.stderr)
+            return 1
+        if status != 200 or body is None:
+            print(f"failed (HTTP {status})", file=sys.stderr)
+            return 1
+        print(json.dumps(body, indent=2, sort_keys=True))
         return 0
     if a.cmd == "dashboard":
         import webbrowser

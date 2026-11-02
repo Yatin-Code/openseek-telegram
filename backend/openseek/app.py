@@ -45,6 +45,7 @@ from .pool import (MAX_NVMT_BYTES, ChannelPoolClient, ChannelPoolSync, PoolClien
                    PoolError, PoolService, PoolSync, TelegramBotStore)
 from .channel_index import ChannelIndex
 from .telegram_mt import TelegramMTProtoStore
+from .contribution import TelegramLibrarian
 from .contrib import ContributionPolicy, Spacing, clean_hosts
 from .tls import ensure_certificate
 from .vtt import LAYOUTS, render
@@ -81,6 +82,7 @@ class Core:
         self.pool = None
         self.channel_store = None
         self.channel_index = None
+        self.librarian = None
         mode = settings.effective_pool_mode
         if settings.pool_host_enabled:
             storage = pool_storage or TelegramBotStore(settings.telegram_bot_token, settings.telegram_channel_id,
@@ -91,6 +93,9 @@ class Core:
             self.channel_index = ChannelIndex(
                 self.db, self.channel_store, channel_id=settings.telegram_channel_id,
                 scan_limit=settings.pool_channel_scan_limit, refresh_s=settings.pool_index_refresh_s)
+            if settings.librarian_enabled and hasattr(self.channel_store, "set_message_handler"):
+                self.librarian = TelegramLibrarian(self.channel_store, self.channel_index)
+                self.librarian.attach()
             self.pool_client = ChannelPoolClient(self.cache, self.channel_index, self.channel_store)
             self.pool_sync = (ChannelPoolSync(self.db, self.cache, self.channel_store, self.channel_index)
                               if settings.contribution else None)
@@ -146,7 +151,11 @@ class Core:
         self.proxy.start()
         if self.channel_store:
             self.channel_store.start()
-            self.channel_index.refresh(force=True)
+            state = self.channel_index.status()
+            if not state["scanned_at"]:
+                self.channel_index.rebuild()
+            else:
+                self.channel_index.refresh(force=True)
             self.channel_index.start()
         if self.pool_sync:
             self.pool_sync.start()
@@ -1114,6 +1123,17 @@ window.pubOn=!!(sh.public&&sh.public.listening&&sh.public.host);if(sh.enabled){h
 for(const i of sh.invites){h+='<tr><td>'+esc(i.label||i.invite_id.slice(0,8))+'</td><td>'+esc(i.state)+'</td><td>'+esc(i.expires_in_s)+' s</td><td>'+
 (i.state=='open'?'<button onclick="act(\\'DELETE\\',\\'/admin/invites/'+esc(i.invite_id)+'\\')">Revoke</button>':'')+'</td></tr>'}
 h+='</table>'}
+h+='<h2>Pool</h2>';
+const p=await (await fetch('/admin/pool/status',{headers:H})).json();
+h+='<p>Mode <b>'+esc(p.mode)+'</b>';
+if(p.mode==='channel'){h+='; channel <code>'+esc(p.channel_id)+'</code>; '+esc(p.tiles)+' tiles; last message '+
+esc(p.last_message_id)+'; pending uploads '+esc(p.outbox)+' <button onclick="act(\\'POST\\',\\'/admin/pool/scan\\')">Scan</button> '+
+'<button onclick="act(\\'POST\\',\\'/admin/pool/rebuild\\')">Rebuild index</button>'}
+else if(p.mode==='host'){h+='; API '+(p.api_enabled?'enabled':'disabled')+(p.api_url?'; URL <code>'+esc(p.api_url)+'</code>':'')+
+'; '+esc(p.tiles)+' tiles; '+
+esc(p.packages)+' packages; pending uploads '+esc(p.outbox)}
+else{h+='; no shared pool connections'}
+h+='</p>';
 h+='<h2>Cache</h2><p>'+esc(r.cache.entries)+' titles, '+esc(r.cache.tiles)+' tiles, '+
 esc((r.cache.bytes/1048576).toFixed(1))+' MiB of '+esc((r.cache.max_bytes/1048576).toFixed(0))+' MiB; '+
 esc(r.active_sources)+' active source(s)</p>';document.getElementById('s').innerHTML=h}
@@ -1380,14 +1400,20 @@ def create_admin_app(core: Core) -> FastAPI:
             result = {"mode": mode, **core.channel_index.status()}
         elif mode == "host" and core.pool is not None:
             result = {"mode": mode, "api_enabled": True,
+                      "api_url": f"https://{core.settings.public_host}" if core.settings.public_host else None,
+                      "spki_pin": core.spki_pin,
+                      "channel_id": core.settings.telegram_channel_id,
                       "tiles": core.db.q("SELECT COUNT(*) FROM pool_tiles")[0][0],
                       "packages": core.db.q("SELECT COUNT(*) FROM pool_packages")[0][0],
-                      "outbox": core.db.q("SELECT COUNT(*) FROM pool_outbox")[0][0]}
+                      "outbox": core.db.q("SELECT COUNT(*) FROM pool_outbox")[0][0],
+                      "last_error": core.pool_sync.last_error if core.pool_sync else ""}
         else:
             result = {"mode": mode, "api_enabled": False}
         if mode == "channel":
             pending = core.db.q("SELECT COUNT(*) FROM pool_channel_outbox")
             result["outbox"] = int(pending[0][0]) if pending else 0
+            result["last_error"] = (core.pool_sync.last_error if core.pool_sync else
+                                    core.channel_index.last_error if core.channel_index else "")
         return result
 
     @app.post("/admin/pool/scan")
