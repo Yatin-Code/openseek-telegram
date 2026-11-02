@@ -138,6 +138,55 @@ class DB:
     def purge_release_meta(self) -> int:
         return self.x("DELETE FROM release_meta")
 
+    def purge_pool(self, invalid_tiles: list[tuple], invalid_packages: list[tuple],
+                   outbox_before: float, max_attempts: int, *, dry_run: bool = True,
+                   vacuum: bool = False) -> dict[str, int]:
+        """Sweep dead Telegram references, orphan episode indexes, and exhausted old uploads."""
+        with self._lock:
+            tile_rows = self.conn.execute("SELECT fp,profile,k FROM pool_tiles").fetchall()
+            package_rows = self.conn.execute("SELECT fp,profile FROM pool_packages").fetchall()
+            episode_rows = self.conn.execute("SELECT episode_key,fp,profile FROM pool_episode_packages").fetchall()
+            outbox_rows = self.conn.execute(
+                "SELECT fp,k FROM pool_outbox WHERE created<? AND attempts>?", (outbox_before, max_attempts)
+            ).fetchall()
+            invalid_tile_keys = set(invalid_tiles)
+            invalid_package_keys = set(invalid_packages)
+            current_packages = set(package_rows)
+            surviving_packages = current_packages - invalid_package_keys
+            orphan_episodes = [row for row in episode_rows if (row[1], row[2]) not in surviving_packages]
+            tile_targets = [row for row in tile_rows if row in invalid_tile_keys]
+            package_targets = [row for row in package_rows if row in invalid_package_keys]
+            counts = {
+                "pool_tiles": len(tile_targets),
+                "pool_packages": len(package_targets),
+                "pool_episode_packages": len(orphan_episodes),
+                "pool_outbox": len(outbox_rows),
+            }
+            if dry_run:
+                return counts
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                for fp, profile, k in tile_targets:
+                    self.conn.execute("DELETE FROM pool_tiles WHERE fp=? AND profile=? AND k=?", (fp, profile, k))
+                for fp, profile in package_targets:
+                    self.conn.execute("DELETE FROM pool_packages WHERE fp=? AND profile=?", (fp, profile))
+                for episode_key, fp, profile in orphan_episodes:
+                    self.conn.execute(
+                        "DELETE FROM pool_episode_packages WHERE episode_key=? AND fp=? AND profile=?",
+                        (episode_key, fp, profile))
+                for fp, k in outbox_rows:
+                    self.conn.execute("DELETE FROM pool_outbox WHERE fp=? AND k=?", (fp, k))
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
+            if vacuum:
+                self.conn.execute("PRAGMA optimize")
+                self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                self.conn.execute("VACUUM")
+                self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            return counts
+
     def release_rows(self) -> list[dict]:
         """Exactly what is stored, joined with the cache entry (for the owner's dashboard / API)."""
         out = []

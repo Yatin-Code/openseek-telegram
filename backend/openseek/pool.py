@@ -88,9 +88,10 @@ def _urlopen(req, timeout: float = 8.0):
 
 
 class PoolError(Exception):
-    def __init__(self, status: int, code: str):
+    def __init__(self, status: int, code: str, *, duration_ms: int | None = None):
         super().__init__(code)
         self.status, self.code = status, code
+        self.duration_ms = duration_ms
 
 
 class _PackageCache:
@@ -146,11 +147,33 @@ class TelegramBotStore:
         try:
             with self.opener(req, timeout=self.timeout_s) as response:
                 result = json.loads(response.read(1024 * 1024))
+        except urllib.error.HTTPError as exc:
+            if method != "getFile":
+                raise PoolError(503, "telegram_unavailable") from exc
+            try:
+                result = json.loads(exc.read(1024 * 1024))
+            except (OSError, ValueError) as parse_exc:
+                raise PoolError(503, "telegram_unavailable") from parse_exc
+            finally:
+                exc.close()
         except (OSError, urllib.error.URLError, TimeoutError, ValueError) as exc:
             raise PoolError(503, "telegram_unavailable") from exc
+        if (isinstance(result, dict) and result.get("ok") is not True and method == "getFile"
+                and result.get("error_code") == 400):
+            raise PoolError(404, "telegram_file_not_found")
         if not isinstance(result, dict) or result.get("ok") is not True:
             raise PoolError(502, "telegram_error")
         return result["result"]
+
+    def file_exists(self, file_id: str) -> bool:
+        """Check Telegram metadata without downloading the document bytes."""
+        try:
+            self._json("getFile", {"file_id": file_id})
+            return True
+        except PoolError as exc:
+            if exc.code == "telegram_file_not_found":
+                return False
+            raise
 
     def put(self, data: bytes, caption: str) -> tuple[str, int]:
         return self.put_document(data, caption, "tile.jpg", "image/jpeg")
@@ -455,7 +478,7 @@ class PoolService:
             if previous:
                 old_duration, old_slots, old_count, old_size, old_digest, old_file, old_message = previous
                 if old_duration != duration_ms or old_slots != n_slots:
-                    raise PoolError(409, "media_metadata_conflict")
+                    raise PoolError(409, "media_metadata_conflict", duration_ms=int(old_duration))
                 try:
                     old_data = self.storage.get_document(old_file)
                 except AttributeError:
@@ -495,6 +518,42 @@ class PoolService:
                 except (AttributeError, PoolError):
                     pass
         return {"stored": True, "duplicate": False, "tiles": len(merged), "sha256": digest}
+
+    def purge(self, *, dry_run: bool = True, outbox_older_than_days: int = 30,
+              outbox_attempts: int = 5, vacuum: bool = False) -> dict:
+        """Remove rows for Telegram documents confirmed missing and stale failed outbox work."""
+        if not isinstance(outbox_older_than_days, int) or not 1 <= outbox_older_than_days <= 3650:
+            raise PoolError(400, "bad_purge_options")
+        if not isinstance(outbox_attempts, int) or not 0 <= outbox_attempts <= 100:
+            raise PoolError(400, "bad_purge_options")
+        with self._lock:
+            tiles = self.db.q("SELECT fp,profile,k,file_id,message_id FROM pool_tiles")
+            packages = self.db.q("SELECT fp,profile,file_id,message_id FROM pool_packages")
+            invalid_tiles, invalid_packages = [], []
+            for row in tiles:
+                if not self.storage.file_exists(row[3]):
+                    invalid_tiles.append(row)
+            for row in packages:
+                if not self.storage.file_exists(row[2]):
+                    invalid_packages.append(row)
+            cutoff = time.time() - outbox_older_than_days * 86400
+            before = self.db.path.stat().st_size if self.db.path.exists() else 0
+            counts = self.db.purge_pool(
+                [(row[0], row[1], row[2]) for row in invalid_tiles],
+                [(row[0], row[1]) for row in invalid_packages], cutoff, outbox_attempts,
+                dry_run=dry_run, vacuum=vacuum)
+            messages_attempted = 0
+            if not dry_run:
+                for row in [*invalid_tiles, *invalid_packages]:
+                    try:
+                        self.storage.delete_message(int(row[-1]))
+                        messages_attempted += 1
+                    except (AttributeError, PoolError, ValueError):
+                        log.warning("could not delete Telegram pool message during purge")
+            after = self.db.path.stat().st_size if self.db.path.exists() else 0
+            return {"dry_run": dry_run, **counts, "telegram_messages_delete_attempted": messages_attempted,
+                    "database_bytes_before": before, "database_bytes_after": after,
+                    "vacuumed": bool(vacuum and not dry_run)}
 
 
 class PoolClient:

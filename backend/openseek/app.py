@@ -459,6 +459,14 @@ class LibraryIn(BaseModel):
     purge: StrictBool = False
 
 
+class PoolPurgeIn(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    dry_run: StrictBool = True
+    outbox_older_than_days: StrictInt = Field(default=30, ge=1, le=3650)
+    outbox_attempts: StrictInt = Field(default=5, ge=0, le=100)
+    vacuum: StrictBool = False
+
+
 class PriorityIn(BaseModel):
     model_config = ConfigDict(extra="ignore")
     at_ms: StrictInt | None = Field(default=None, ge=0, le=MAX_MS)
@@ -572,6 +580,14 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
         if device_id is not None:
             return True
         return bool(request.scope.get("openseek.public"))
+
+    def pool_write_denial(request: Request, pool: PoolService) -> JSONResponse | None:
+        if pool.authorize(pool_key(request), write=True):
+            return None
+        device_id = request.state.device_id
+        if device_id is not None and core.auth.role_of(device_id) == "guest":
+            return err(403, "not_contribute")
+        return err(403, "forbidden")
 
     @app.get("/v1/health")
     async def health(request: Request):
@@ -854,8 +870,9 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
         pool = core.pool
         if pool is None:
             return err(404, "not_found")
-        if not pool_allowed(request, pool, write=True):
-            return err(403, "forbidden")
+        denied = pool_write_denial(request, pool)
+        if denied is not None:
+            return denied
         k = parse_index(name[:-4], 999_999) if name.endswith(".jpg") else None
         if k is None or request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "image/jpeg":
             return err(400, "bad_request")
@@ -930,8 +947,9 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
         pool = core.pool
         if pool is None:
             return err(404, "not_found")
-        if not pool_allowed(request, pool, write=True):
-            return err(403, "forbidden")
+        denied = pool_write_denial(request, pool)
+        if denied is not None:
+            return denied
         media_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
         if media_type not in ("application/vnd.openseek.nvmt", "application/octet-stream"):
             return err(400, "bad_request")
@@ -944,7 +962,9 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
         except ValueError:
             return err(400, "bad_request")
         except PoolError as exc:
-            return err(exc.status, exc.code)
+            headers = ({"X-OpenSeek-Duration-Ms": str(exc.duration_ms)}
+                       if exc.duration_ms is not None else None)
+            return err(exc.status, exc.code, headers)
         return JSONResponse(result, status_code=200 if result["duplicate"] else 201,
                             headers={"Cache-Control": "no-store"})
 
@@ -1317,6 +1337,18 @@ def create_admin_app(core: Core) -> FastAPI:
     @app.delete("/admin/library/releases")
     async def library_purge():
         return {"purged": core.db.purge_release_meta()}
+
+    @app.post("/admin/pool/purge")
+    async def pool_purge(body: PoolPurgeIn):
+        if core.pool is None:
+            return err(404, "not_found")
+        try:
+            return await asyncio.to_thread(
+                core.pool.purge, dry_run=body.dry_run,
+                outbox_older_than_days=body.outbox_older_than_days,
+                outbox_attempts=body.outbox_attempts, vacuum=body.vacuum)
+        except PoolError as exc:
+            return err(exc.status, exc.code)
 
     @app.post("/admin/alt/release")
     async def alt_release():

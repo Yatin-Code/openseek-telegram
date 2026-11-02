@@ -5,8 +5,10 @@ import hashlib
 import io
 import json
 import asyncio
+import httpx
 import time
 import threading
+import urllib.error
 from pathlib import Path
 from email.parser import BytesParser
 from email.policy import default
@@ -17,7 +19,7 @@ from PIL import Image
 import pytest
 
 import openseek.app as app_module
-from openseek.app import Core, create_api_app
+from openseek.app import Core, create_admin_app, create_api_app
 from openseek.cache import Cache, PROFILE
 from openseek.config import Settings
 from openseek.db import DB
@@ -71,6 +73,9 @@ class FakeTelegramBotAPI:
     def __init__(self):
         self.files: dict[str, bytes] = {}
         self.messages = 0
+        self.get_file_calls = 0
+        self.download_calls = 0
+        self.deleted_messages: list[int] = []
 
     def urlopen(self, req, timeout=8.0):
         from urllib.parse import urlparse
@@ -90,12 +95,18 @@ class FakeTelegramBotAPI:
                 "message_id": self.messages,
                 "document": {"file_id": file_id, "file_size": len(data)}}}).encode())
         if url.path.endswith("/getFile"):
+            self.get_file_calls += 1
             file_id = parse_qs(body.decode()).get("file_id", [""])[0]
             if file_id not in self.files:
-                return FakeResponse(b'{"ok":false}', status=404)
+                raise urllib.error.HTTPError(req.full_url, 400, "Bad Request", None,
+                                              io.BytesIO(b'{"ok":false,"error_code":400}'))
             return FakeResponse(json.dumps({"ok": True, "result": {
                 "file_path": f"docs/{file_id}.jpg"}}).encode())
+        if url.path.endswith("/deleteMessage"):
+            self.deleted_messages.append(int(parse_qs(body.decode()).get("message_id", ["0"])[0]))
+            return FakeResponse(b'{"ok":true,"result":true}')
         if "/file/bot" in url.path:
+            self.download_calls += 1
             file_id = url.path.rsplit("/", 1)[-1].removesuffix(".jpg")
             if file_id in self.files:
                 return FakeResponse(self.files[file_id], headers={"Content-Type": "image/jpeg"})
@@ -442,11 +453,26 @@ def test_nvmt_package_validation_merge_and_asgi_download(tmp_path, monkeypatch):
                      nvmt_package(grid, duration_ms, {3: (15_000, b)}),
                      {"Authorization": f"Bearer {READ_KEY}", "Content-Type": "application/vnd.openseek.nvmt"}, 2)
         assert denied.status == 403
+        assert json.loads(denied.data)["error"] == "forbidden"
+
+        # A valid paired guest without the contribution permission gets a
+        # distinguishable error so the TV can show it beside the setting.
+        guest_token = "A" * 43
+        core.auth.register("Read only", hashlib.sha256(guest_token.encode()).hexdigest(), role="guest")
+        guest_denied = api(
+            f"https://pool.test/v1/pool/{fp}/nvmt?profile=nvmt-v1-g5&duration_ms={duration_ms}",
+            nvmt_package(grid, duration_ms, {3: (15_000, b)}),
+            {"Authorization": f"Bearer {guest_token}", "Content-Type": "application/vnd.openseek.nvmt"}, 2)
+        assert guest_denied.status == 403
+        assert json.loads(guest_denied.data)["error"] == "not_contribute"
 
         # Invalid metadata, mismatched profile, non-NVMT bytes, and >16 MiB are refused.
         assert put({0: (0, a)}, profile="nvmt-v1-g10").status == 400
         # The package itself is valid, but a different duration cannot overwrite this exact key.
-        assert put({0: (0, a)}, duration=25_000).status == 409
+        conflict = put({0: (0, a)}, duration=25_000)
+        assert conflict.status == 409
+        assert conflict.headers["x-openseek-duration-ms"] == str(duration_ms)
+        assert json.loads(conflict.data)["error"] == "media_metadata_conflict"
         bad_type = put({0: (0, a)}, content_type="image/jpeg")
         assert bad_type.status == 400
         with pytest.raises(PoolError, match="bad_package"):
@@ -508,6 +534,7 @@ def test_episode_variant_index_and_sparse_sample_routes(tmp_path, monkeypatch):
         entries = json.loads(candidates.data)["candidates"]
         assert [entry["fp"] for entry in entries] == [fp_new, fp_old]
         assert entries[0]["n_tiles"] == len(new_tiles)
+        assert [entry["duration_delta_ms"] for entry in entries] == [0, duration_new - duration_old]
 
         # Candidate verification fetches only the requested sparse set, not the full NVMT.
         sparse_url = (f"https://pool.test/v1/pool/{fp_new}/nvmt?profile=nvmt-v1-g5"
