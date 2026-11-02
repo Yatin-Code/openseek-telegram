@@ -41,7 +41,10 @@ from .logutil import plain, setup_logging
 from .netpolicy import DestinationPolicy, filter_forwarded_headers
 from .pairing import PairingClosed, PairingFailed, PairingManager, RateLimited
 from .public import PublicLimiter, classify
-from .pool import MAX_NVMT_BYTES, PoolClient, PoolError, PoolService, PoolSync, TelegramBotStore
+from .pool import (MAX_NVMT_BYTES, ChannelPoolClient, ChannelPoolSync, PoolClient,
+                   PoolError, PoolService, PoolSync, TelegramBotStore)
+from .channel_index import ChannelIndex
+from .telegram_mt import TelegramMTProtoStore
 from .contrib import ContributionPolicy, Spacing, clean_hosts
 from .tls import ensure_certificate
 from .vtt import LAYOUTS, render
@@ -76,15 +79,27 @@ class Core:
         self.db = DB(self.data_dir / "openseek.db")
         self.cache = Cache(self.data_dir, self.db, settings.cache_max_bytes, settings.retention_days)
         self.pool = None
-        if settings.pool_enabled:
+        self.channel_store = None
+        self.channel_index = None
+        mode = settings.effective_pool_mode
+        if settings.pool_host_enabled:
             storage = pool_storage or TelegramBotStore(settings.telegram_bot_token, settings.telegram_channel_id,
                                                        settings.upstream_timeout_s)
             self.pool = PoolService(self.db, storage, settings.pool_read_key, settings.pool_write_key)
-        self.pool_client = (PoolClient(settings.pool_url, settings.pool_read_key, settings.pool_write_key,
-                                       settings.pool_timeout_s)
-                            if settings.pool_url and settings.pool_read_key else None)
-        self.pool_sync = (PoolSync(self.db, self.cache, self.pool_client)
-                          if self.pool_client and settings.pool_share else None)
+        if mode == "channel":
+            self.channel_store = pool_storage or TelegramMTProtoStore(settings)
+            self.channel_index = ChannelIndex(
+                self.db, self.channel_store, channel_id=settings.telegram_channel_id,
+                scan_limit=settings.pool_channel_scan_limit, refresh_s=settings.pool_index_refresh_s)
+            self.pool_client = ChannelPoolClient(self.cache, self.channel_index, self.channel_store)
+            self.pool_sync = (ChannelPoolSync(self.db, self.cache, self.channel_store, self.channel_index)
+                              if settings.contribution else None)
+        else:
+            self.pool_client = (PoolClient(settings.pool_url, settings.pool_read_key, settings.pool_write_key,
+                                           settings.pool_timeout_s)
+                                if mode == "host" and settings.pool_url and settings.pool_read_key else None)
+            self.pool_sync = (PoolSync(self.db, self.cache, self.pool_client)
+                              if self.pool_client and settings.pool_share else None)
         self.cert_path, self.key_path, self.spki_pin = ensure_certificate(
             self.data_dir, settings.tls_cert_file, settings.tls_key_file)
         self.caps = CapSigner(load_or_create_secret(self.data_dir / "secret.key"))
@@ -129,6 +144,10 @@ class Core:
 
     def start(self) -> "Core":
         self.proxy.start()
+        if self.channel_store:
+            self.channel_store.start()
+            self.channel_index.refresh(force=True)
+            self.channel_index.start()
         if self.pool_sync:
             self.pool_sync.start()
         self.jobs.start()
@@ -140,6 +159,10 @@ class Core:
         self.jobs.shutdown()
         if self.pool_sync:
             self.pool_sync.stop()
+        if self.channel_index:
+            self.channel_index.stop()
+        if self.channel_store:
+            self.channel_store.close()
         self.proxy.stop()
         self.db.close()
 
@@ -1347,6 +1370,41 @@ def create_admin_app(core: Core) -> FastAPI:
                 core.pool.purge, dry_run=body.dry_run,
                 outbox_older_than_days=body.outbox_older_than_days,
                 outbox_attempts=body.outbox_attempts, vacuum=body.vacuum)
+        except PoolError as exc:
+            return err(exc.status, exc.code)
+
+    @app.get("/admin/pool/status")
+    async def pool_status():
+        mode = core.settings.effective_pool_mode
+        if mode == "channel" and core.channel_index is not None:
+            result = {"mode": mode, **core.channel_index.status()}
+        elif mode == "host" and core.pool is not None:
+            result = {"mode": mode, "api_enabled": True,
+                      "tiles": core.db.q("SELECT COUNT(*) FROM pool_tiles")[0][0],
+                      "packages": core.db.q("SELECT COUNT(*) FROM pool_packages")[0][0],
+                      "outbox": core.db.q("SELECT COUNT(*) FROM pool_outbox")[0][0]}
+        else:
+            result = {"mode": mode, "api_enabled": False}
+        if mode == "channel":
+            pending = core.db.q("SELECT COUNT(*) FROM pool_channel_outbox")
+            result["outbox"] = int(pending[0][0]) if pending else 0
+        return result
+
+    @app.post("/admin/pool/scan")
+    async def pool_scan():
+        if core.channel_index is None:
+            return err(404, "not_found")
+        try:
+            return await asyncio.to_thread(core.channel_index.refresh, True)
+        except PoolError as exc:
+            return err(exc.status, exc.code)
+
+    @app.post("/admin/pool/rebuild")
+    async def pool_rebuild():
+        if core.channel_index is None:
+            return err(404, "not_found")
+        try:
+            return await asyncio.to_thread(core.channel_index.rebuild)
         except PoolError as exc:
             return err(exc.status, exc.code)
 

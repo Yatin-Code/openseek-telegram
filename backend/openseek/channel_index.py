@@ -160,6 +160,16 @@ class ChannelIndex:
         return {"message_id": int(message_id), "pts_ms": int(pts_ms), "duration_ms": int(duration_ms),
                 "n_tiles": int(n_tiles), "size": int(size), "sha256": digest}
 
+    def forget(self, fp: str, profile: str, k: int, message_id: int | None = None) -> bool:
+        """Drop a stale or corrupt Telegram reference without affecting a newer winner."""
+        if not is_fingerprint(fp) or profile != PROFILE or not isinstance(k, int):
+            return False
+        if message_id is None:
+            return self.db.x("DELETE FROM pool_channel_tiles WHERE fp=? AND profile=? AND k=?",
+                             (fp, profile, k)) > 0
+        return self.db.x("DELETE FROM pool_channel_tiles WHERE fp=? AND profile=? AND k=? AND message_id=?",
+                         (fp, profile, k, int(message_id))) > 0
+
     def manifest(self, fp: str, profile: str) -> dict | None:
         if not is_fingerprint(fp) or profile != PROFILE:
             raise PoolError(400, "bad_key")

@@ -794,3 +794,198 @@ class PoolSync:
                           (attempts, time.time() + delay, fp, k))
                 log.info("pool upload deferred fp=%s tile=%d retry_s=%d", fp[:8], k, delay)
 
+
+class ChannelPoolClient:
+    """Local reader for a channel index; Telegram failures remain cache misses."""
+
+    def __init__(self, cache, index, store, *, max_cache_bytes: int = 16 * 1024 * 1024):
+        self.cache, self.index, self.store = cache, index, store
+        self.max_cache_bytes = max_cache_bytes
+        self._items: OrderedDict[tuple[int, str], bytes] = OrderedDict()
+        self._cache_bytes = 0
+        self._misses: dict[tuple[str, int], float] = {}
+        self._lock = threading.RLock()
+
+    def get_tile(self, fp: str, k: int) -> tuple[bytes, int] | None:
+        mark = (fp, k)
+        now = time.monotonic()
+        with self._lock:
+            if self._misses.get(mark, 0) > now:
+                return None
+        try:
+            row = self.index.lookup(fp, PROFILE, k)
+        except PoolError:
+            return None
+        if row is None:
+            with self._lock:
+                self._misses[mark] = now + 30
+            return None
+        message_id, digest = row["message_id"], row["sha256"]
+        key = (message_id, digest)
+        with self._lock:
+            data = self._items.get(key)
+            if data is not None:
+                self._items.move_to_end(key)
+        if data is None:
+            try:
+                data = self.store.get_tile(message_id)
+            except PoolError as exc:
+                if exc.code in ("telegram_message_not_found", "stored_tile_corrupt", "tile_too_large"):
+                    self.index.forget(fp, PROFILE, k, message_id)
+                with self._lock:
+                    self._misses[mark] = now + (30 if exc.status == 404 else 10)
+                return None
+            except Exception as exc:
+                log.debug("channel tile read failed (%s)", type(exc).__name__)
+                with self._lock:
+                    self._misses[mark] = now + 10
+                return None
+            if (len(data) != row["size"] or len(data) > MAX_TILE_BYTES or not jpeg_ok(data) or
+                    hashlib.sha256(data).hexdigest() != digest):
+                self.index.forget(fp, PROFILE, k, message_id)
+                with self._lock:
+                    self._misses[mark] = now + 10
+                return None
+            # Duration metadata is not present on legacy host posts. Use the
+            # protocol's maximum valid duration to still validate JPEG type and
+            # dimensions; the scheduler uses the canonical tile timestamp.
+            duration_ms = row["duration_ms"] or MAX_DURATION_MS
+            n_tiles = row["n_tiles"] or tile_count(duration_ms)
+            try:
+                validate_tile(fp, PROFILE, k, row["pts_ms"], duration_ms, n_tiles, data)
+            except PoolError:
+                self.index.forget(fp, PROFILE, k, message_id)
+                with self._lock:
+                    self._misses[mark] = now + 10
+                return None
+            self._cache_put(key, data)
+        try:
+            self.cache.put_tile(fp, k, row["pts_ms"], data)
+        except (OSError, ValueError):
+            # The scheduler can still use and store the bytes itself.
+            pass
+        with self._lock:
+            self._misses.pop(mark, None)
+        return data, row["pts_ms"]
+
+    def _cache_put(self, key: tuple[int, str], data: bytes) -> None:
+        if not data or len(data) > self.max_cache_bytes:
+            return
+        with self._lock:
+            old = self._items.pop(key, None)
+            if old is not None:
+                self._cache_bytes -= len(old)
+            while self._items and self._cache_bytes + len(data) > self.max_cache_bytes:
+                _old_key, old_data = self._items.popitem(last=False)
+                self._cache_bytes -= len(old_data)
+            self._items[key] = data
+            self._cache_bytes += len(data)
+
+    def manifest(self, fp: str, profile: str) -> dict | None:
+        return self.index.manifest(fp, profile)
+
+    def package_slots(self, fp: str, profile: str, slots: list[int]):
+        return self.index.package_slots(fp, profile, slots)
+
+    def episode_candidates(self, episode_key: str, duration_ms: int) -> list[dict]:
+        return self.index.episode_candidates(episode_key, duration_ms)
+
+
+class ChannelPoolSync:
+    """Durable asynchronous channel publisher, isolated from host-mode HTTP outbox."""
+
+    def __init__(self, db: DB, cache, store, index):
+        self.db, self.cache, self.store, self.index = db, cache, store, index
+        self._wake = threading.Event()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is None or not self._thread.is_alive():
+            self._stop.clear()
+            self._thread = threading.Thread(target=self._run, name="openseek-channel-outbox", daemon=True)
+            self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._wake.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=3)
+
+    def enqueue(self, fp: str, k: int) -> None:
+        entry = self.cache.entry(fp)
+        if entry is None or not entry.duration_ms or not entry.n_tiles:
+            return
+        pts_ms = entry.tiles.get(k, k * TILE_INTERVAL_MS)
+        self.db.x("INSERT OR IGNORE INTO pool_channel_outbox(fp,k,pts_ms,duration_ms,n_tiles,created) "
+                  "VALUES(?,?,?,?,?,?)", (fp, k, pts_ms, entry.duration_ms, entry.n_tiles, time.time()))
+        self._wake.set()
+
+    def pending(self) -> int:
+        rows = self.db.q("SELECT COUNT(*) FROM pool_channel_outbox")
+        return int(rows[0][0]) if rows else 0
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            rows = self.db.q("SELECT fp,k,pts_ms,duration_ms,n_tiles,attempts,retry_after "
+                             "FROM pool_channel_outbox ORDER BY created LIMIT 1")
+            if not rows:
+                self._wake.wait(1.0)
+                self._wake.clear()
+                continue
+            fp, k, pts_ms, duration_ms, n_tiles, attempts, retry_after = rows[0]
+            wait_s = float(retry_after) - time.time()
+            if wait_s > 0:
+                self._wake.wait(min(wait_s, 2.0))
+                self._wake.clear()
+                continue
+            try:
+                self._publish(fp, int(k), int(pts_ms), int(duration_ms), int(n_tiles))
+            except Exception as exc:
+                attempts = int(attempts) + 1
+                delay = min(300, 2 ** min(attempts, 8))
+                self.db.x("UPDATE pool_channel_outbox SET attempts=?,retry_after=? WHERE fp=? AND k=?",
+                          (attempts, time.time() + delay, fp, k))
+                log.info("channel upload deferred fp=%s tile=%d retry_s=%d (%s)",
+                         fp[:8], k, delay, type(exc).__name__)
+
+    def _publish(self, fp: str, k: int, pts_ms: int, duration_ms: int, n_tiles: int) -> None:
+        rows = self.db.q("SELECT message_id FROM pool_channel_outbox WHERE fp=? AND k=?", (fp, k))
+        message_id = int(rows[0][0]) if rows else 0
+        if message_id:
+            self.index.refresh(force=True)
+            winner = self.index.lookup(fp, PROFILE, k)
+            if winner is None:
+                raise PoolError(503, "telegram_index_not_updated")
+            if winner["message_id"] != message_id:
+                self.store.delete_message(message_id)
+            self.db.x("DELETE FROM pool_channel_outbox WHERE fp=? AND k=?", (fp, k))
+            return
+        data = self.cache.tile_bytes(fp, k)
+        if data is None:
+            self.db.x("DELETE FROM pool_channel_outbox WHERE fp=? AND k=?", (fp, k))
+            return
+        digest = validate_tile(fp, PROFILE, k, pts_ms, duration_ms, n_tiles, data)
+        current = self.index.lookup(fp, PROFILE, k)
+        if current is not None:
+            if current["sha256"] != digest:
+                log.info("channel tile conflict fp=%s tile=%d; existing tile kept", fp[:8], k)
+            self.db.x("DELETE FROM pool_channel_outbox WHERE fp=? AND k=?", (fp, k))
+            return
+        caption = f"openseek:v1:{fp}:{PROFILE}:{k}:{digest}"
+        metadata = {"pts_ms": pts_ms, "duration_ms": duration_ms, "n_tiles": n_tiles}
+        try:
+            message_id = self.store.put_tile(data, caption, metadata)
+        except TypeError:
+            message_id = self.store.put_tile(data, caption)
+        self.db.x("UPDATE pool_channel_outbox SET message_id=? WHERE fp=? AND k=?", (message_id, fp, k))
+        # Scan once so concurrent publishers are resolved by Telegram's
+        # ascending message IDs. If this post loses, best-effort delete ours.
+        self.index.refresh(force=True)
+        winner = self.index.lookup(fp, PROFILE, k)
+        if winner is None:
+            raise PoolError(503, "telegram_index_not_updated")
+        if winner["sha256"] != digest and winner["message_id"] != message_id:
+            self.store.delete_message(message_id)
+        self.db.x("DELETE FROM pool_channel_outbox WHERE fp=? AND k=?", (fp, k))
+

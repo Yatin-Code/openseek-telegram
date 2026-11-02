@@ -44,6 +44,11 @@ CREATE INDEX IF NOT EXISTS pool_channel_tiles_fp ON pool_channel_tiles(fp, profi
 CREATE TABLE IF NOT EXISTS pool_channel_state (
   channel_id TEXT PRIMARY KEY, last_message_id INTEGER NOT NULL DEFAULT 0,
   scanned_at REAL NOT NULL DEFAULT 0);
+-- Separate durable queue so HTTP-host uploads and channel uploads never share retry state.
+CREATE TABLE IF NOT EXISTS pool_channel_outbox (
+  fp TEXT NOT NULL, k INTEGER NOT NULL, pts_ms INTEGER NOT NULL, duration_ms INTEGER NOT NULL,
+  n_tiles INTEGER NOT NULL, created REAL NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+  retry_after REAL NOT NULL DEFAULT 0, message_id INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(fp,k));
 -- TV-generated Nuvio NVMT packs. Telegram stores the package; this row is the
 -- exact-file lookup and points at the current merged package revision.
 CREATE TABLE IF NOT EXISTS pool_packages (
@@ -114,6 +119,9 @@ class DB:
                           ("contribute", "INTEGER NOT NULL DEFAULT 0")):
             if name not in have:
                 self.conn.execute(f"ALTER TABLE devices ADD COLUMN {name} {ddl}")
+        channel_outbox = {r[1] for r in self.conn.execute("PRAGMA table_info(pool_channel_outbox)").fetchall()}
+        if channel_outbox and "message_id" not in channel_outbox:
+            self.conn.execute("ALTER TABLE pool_channel_outbox ADD COLUMN message_id INTEGER NOT NULL DEFAULT 0")
 
     def put_thumb_source(self, play_fp: str, thumb_fp: str, a: float, b: float, residual_ms: float,
                          kind: str) -> None:

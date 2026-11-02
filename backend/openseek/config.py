@@ -206,6 +206,12 @@ class Settings:
         return self.effective_pool_mode == "host" and self.pool_share
 
     @property
+    def pool_host_enabled(self) -> bool:
+        return (self.effective_pool_mode == "host" and
+                (self.pool_enabled or (self.pool_mode == "host" and
+                 bool(self.telegram_bot_token or self.telegram_channel_id))))
+
+    @property
     def tolerance_ms(self) -> int:
         return int(round(self.tolerance_s * 1000))
 
@@ -287,8 +293,23 @@ class Settings:
             "LIBRARIAN_ENABLED": ("librarian_enabled", _bool),
             "LOG_LEVEL": ("log_level", str),
         }
+        raw_mode = env.get("OPENSEEK_POOL_MODE", "").strip().lower()
+        if raw_mode in ("host", "channel"):
+            mode_hint = raw_mode
+        else:
+            try:
+                mode_hint = "host" if _bool(env.get("OPENSEEK_POOL_ENABLED", "")) else "local"
+            except ConfigError:
+                mode_hint = "host"       # the converter below reports the invalid legacy flag
+        host_only = {"POOL_ENABLED", "POOL_URL", "POOL_READ_KEY", "POOL_WRITE_KEY", "POOL_SHARE", "POOL_TIMEOUT_S"}
+        channel_only = {"TELEGRAM_API_ID", "TELEGRAM_API_HASH", "TELEGRAM_SESSION", "TELEGRAM_SESSION_FILE",
+                        "POOL_CHANNEL_SCAN_LIMIT", "POOL_INDEX_REFRESH_S", "CONTRIBUTION", "LIBRARIAN",
+                        "LIBRARIAN_KEY", "LIBRARIAN_ENABLED"}
+        skip = host_only if mode_hint == "channel" else channel_only if mode_hint == "host" else host_only | channel_only
         kw = {}
         for suffix, (name, fn) in conv.items():
+            if suffix in skip:
+                continue
             raw = env.get("OPENSEEK_" + suffix)
             if raw is None or raw == "":
                 continue
@@ -321,7 +342,15 @@ class Settings:
                        if env.get("OPENSEEK_" + key)]
             if ignored:
                 log.warning("channel pool mode ignores legacy host settings: %s", ", ".join(ignored))
-        elif mode in ("host", "local"):
+        elif mode == "local":
+            ignored = [key for key in ("POOL_URL", "POOL_READ_KEY", "POOL_WRITE_KEY", "POOL_SHARE", "POOL_ENABLED",
+                                       "TELEGRAM_API_ID", "TELEGRAM_API_HASH", "TELEGRAM_SESSION",
+                                       "TELEGRAM_SESSION_FILE", "POOL_CHANNEL_SCAN_LIMIT", "POOL_INDEX_REFRESH_S",
+                                       "CONTRIBUTION", "LIBRARIAN", "LIBRARIAN_KEY", "LIBRARIAN_ENABLED")
+                       if env.get("OPENSEEK_" + key)]
+            if ignored:
+                log.warning("local-only mode ignores pool settings: %s", ", ".join(ignored))
+        elif mode == "host":
             ignored = [key for key in ("TELEGRAM_API_ID", "TELEGRAM_API_HASH", "TELEGRAM_SESSION",
                                        "TELEGRAM_SESSION_FILE", "POOL_CHANNEL_SCAN_LIMIT", "POOL_INDEX_REFRESH_S",
                                        "CONTRIBUTION", "LIBRARIAN", "LIBRARIAN_KEY", "LIBRARIAN_ENABLED")
@@ -363,52 +392,54 @@ class Settings:
             raise ConfigError("OPENSEEK_PUBLIC_PORT must differ from the API and admin ports")
         if self.public_host and not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?:\d{1,5}", self.public_host):
             raise ConfigError("OPENSEEK_PUBLIC_HOST must be host:port, e.g. name.duckdns.org:443")
-        if not 0.25 <= self.pool_timeout_s <= 15.0:
+        if self.effective_pool_mode == "host" and not 0.25 <= self.pool_timeout_s <= 15.0:
             raise ConfigError("OPENSEEK_POOL_TIMEOUT_S must be 0.25..15")
         if self.pool_mode not in ("", "host", "channel"):
             raise ConfigError("OPENSEEK_POOL_MODE must be host or channel")
         mode = self.effective_pool_mode
-        if mode != "channel" and self.pool_url:
+        if mode == "host" and self.pool_url:
             parsed_pool = urlsplit(self.pool_url)
             loopback_http = parsed_pool.scheme == "http" and parsed_pool.hostname in ("127.0.0.1", "localhost", "::1")
             if (parsed_pool.scheme != "https" and not loopback_http) or not parsed_pool.hostname or parsed_pool.username or parsed_pool.password:
                 raise ConfigError("OPENSEEK_POOL_URL must use HTTPS (HTTP is allowed only for loopback testing)")
             if parsed_pool.query or parsed_pool.fragment:
                 raise ConfigError("OPENSEEK_POOL_URL must not include a query or fragment")
-        if mode != "channel" and self.pool_url and (not self.pool_read_key or len(self.pool_read_key) < 24):
+        if mode == "host" and self.pool_url and (not self.pool_read_key or len(self.pool_read_key) < 24):
             raise ConfigError("OPENSEEK_POOL_URL requires an OPENSEEK_POOL_READ_KEY of at least 24 characters")
-        if mode != "channel" and self.pool_share and (not self.pool_url or len(self.pool_write_key) < 24):
+        if mode == "host" and self.pool_share and (not self.pool_url or len(self.pool_write_key) < 24):
             raise ConfigError("OPENSEEK_POOL_SHARE requires OPENSEEK_POOL_URL and a 24-character OPENSEEK_POOL_WRITE_KEY")
         if bool(self.tls_cert_file) != bool(self.tls_key_file):
             raise ConfigError("OPENSEEK_TLS_CERT_FILE and OPENSEEK_TLS_KEY_FILE must be configured together")
         if self.tls_cert_file and (not self.tls_cert_file.is_file() or not self.tls_key_file.is_file()):
             raise ConfigError("OPENSEEK_TLS_CERT_FILE and OPENSEEK_TLS_KEY_FILE must name existing files")
-        if mode == "host" and self.pool_enabled:
+        if mode == "host" and self.pool_host_enabled:
             if not self.pool_read_key or len(self.pool_read_key) < 24:
                 raise ConfigError("OPENSEEK_POOL_READ_KEY must be at least 24 characters when pool serving is enabled")
             if not self.pool_write_key or len(self.pool_write_key) < 24:
                 raise ConfigError("OPENSEEK_POOL_WRITE_KEY must be at least 24 characters when pool serving is enabled")
             if not self.telegram_bot_token or not self.telegram_channel_id:
                 raise ConfigError("pool serving requires OPENSEEK_TELEGRAM_BOT_TOKEN and OPENSEEK_TELEGRAM_CHANNEL_ID")
-        if self.pool_channel_scan_limit < 1 or self.pool_channel_scan_limit > 100_000:
-            raise ConfigError("OPENSEEK_POOL_CHANNEL_SCAN_LIMIT must be 1..100000")
-        if self.pool_index_refresh_s < 10 or self.pool_index_refresh_s > 86400:
-            raise ConfigError("OPENSEEK_POOL_INDEX_REFRESH_S must be 10..86400")
-        if self.telegram_api_id < 0:
-            raise ConfigError("OPENSEEK_TELEGRAM_API_ID must be a positive integer")
+        if mode == "host" and not self.pool_url and not self.pool_host_enabled:
+            raise ConfigError("host mode requires OPENSEEK_POOL_URL or enabled pool-host credentials")
         if mode == "channel":
+            if self.pool_channel_scan_limit < 1 or self.pool_channel_scan_limit > 100_000:
+                raise ConfigError("OPENSEEK_POOL_CHANNEL_SCAN_LIMIT must be 1..100000")
+            if self.pool_index_refresh_s < 10 or self.pool_index_refresh_s > 86400:
+                raise ConfigError("OPENSEEK_POOL_INDEX_REFRESH_S must be 10..86400")
+            if self.telegram_api_id < 0:
+                raise ConfigError("OPENSEEK_TELEGRAM_API_ID must be a positive integer")
             if not self.telegram_channel_id or not (self.telegram_bot_token or self.telegram_session or self.telegram_session_file):
                 raise ConfigError("channel pool mode requires OPENSEEK_TELEGRAM_CHANNEL_ID and a bot token or user session")
             if not self.telegram_api_id or not self.telegram_api_hash:
                 raise ConfigError("channel pool mode requires OPENSEEK_TELEGRAM_API_ID and OPENSEEK_TELEGRAM_API_HASH")
             if self.contribution and not (self.telegram_bot_token or self.telegram_session or self.telegram_session_file):
                 raise ConfigError("OPENSEEK_CONTRIBUTION requires a Telegram identity")
-        if self.librarian and not (re.fullmatch(r"@[A-Za-z0-9_]{5,32}", self.librarian) or
-                                   (urlsplit(self.librarian).scheme == "https" and urlsplit(self.librarian).hostname)):
-            raise ConfigError("OPENSEEK_LIBRARIAN must be a bot username or HTTPS URL")
-        if self.librarian_key and not self.librarian:
-            raise ConfigError("OPENSEEK_LIBRARIAN_KEY requires OPENSEEK_LIBRARIAN")
-        if self.librarian_enabled:
+            if self.librarian and not (re.fullmatch(r"@[A-Za-z0-9_]{5,32}", self.librarian) or
+                                       (urlsplit(self.librarian).scheme == "https" and urlsplit(self.librarian).hostname)):
+                raise ConfigError("OPENSEEK_LIBRARIAN must be a bot username or HTTPS URL")
+            if self.librarian_key and not self.librarian:
+                raise ConfigError("OPENSEEK_LIBRARIAN_KEY requires OPENSEEK_LIBRARIAN")
+        if mode == "channel" and self.librarian_enabled:
             if not self.telegram_bot_token or not self.telegram_channel_id:
                 raise ConfigError("OPENSEEK_LIBRARIAN_ENABLED requires a bot token and channel ID")
             if not self.telegram_api_id or not self.telegram_api_hash:
