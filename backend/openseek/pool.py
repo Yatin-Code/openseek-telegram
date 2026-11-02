@@ -414,7 +414,14 @@ class PoolService:
             return None
         data, meta = got
         grid, n_slots, tiles = decode_nvmt(fp, profile, meta["duration_ms"], data)
-        selected = {k: tiles[k] for k in dict.fromkeys(slots) if k in tiles}
+        selected: dict[int, tuple[int, bytes]] = {}
+        for wanted in dict.fromkeys(slots):
+            if wanted in tiles:
+                selected[wanted] = tiles[wanted]
+                continue
+            nearest = min(tiles, key=lambda k: abs(k - wanted))
+            if abs(nearest - wanted) <= 1:
+                selected.setdefault(nearest, tiles[nearest])
         if not selected:
             return None
         partial = encode_nvmt(grid, n_slots, selected)

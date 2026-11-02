@@ -106,8 +106,9 @@ the tile API.
 response includes `X-OpenSeek-Duration-Ms`, `X-OpenSeek-N-Tiles`, `X-OpenSeek-Profile`, and `X-OpenSeek-Sha256`.
 Clients should validate the header and fingerprint before applying the package locally.
 
-The optional `slots=1,2,...` query returns only those available NVMT records in a valid partial package (up to 12
-slots). This lets a client fetch nearby images before downloading the full package.
+The optional `slots=1,2,...` query returns those NVMT records, or the nearest available record within one slot,
+in a valid partial package (up to 12 requested slots). This lets a client fetch nearby images before downloading
+the full package.
 
 `PUT /v1/pool/{fp}/nvmt?profile=nvmt-v1-g5|nvmt-v1-g10&duration_ms=…&episode_key=…` accepts raw NVMT v1 bytes with
 `Content-Type: application/vnd.openseek.nvmt` (or `application/octet-stream`), up to 16 MiB. The server checks
