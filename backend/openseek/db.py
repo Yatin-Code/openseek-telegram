@@ -33,6 +33,17 @@ CREATE TABLE IF NOT EXISTS pool_tiles (
   file_id TEXT NOT NULL, message_id INTEGER NOT NULL, created REAL NOT NULL,
   PRIMARY KEY (fp, profile, k));
 CREATE INDEX IF NOT EXISTS pool_tiles_fp_profile ON pool_tiles(fp, profile, k);
+-- Rebuildable per-instance view of the shared MTProto channel. Telegram is the
+-- source of tile bytes; this table stores only validated metadata.
+CREATE TABLE IF NOT EXISTS pool_channel_tiles (
+  fp TEXT NOT NULL, profile TEXT NOT NULL, k INTEGER NOT NULL, pts_ms INTEGER NOT NULL,
+  duration_ms INTEGER NOT NULL, n_tiles INTEGER NOT NULL, size INTEGER NOT NULL, sha256 TEXT NOT NULL,
+  message_id INTEGER NOT NULL, created REAL NOT NULL,
+  PRIMARY KEY (fp, profile, k));
+CREATE INDEX IF NOT EXISTS pool_channel_tiles_fp ON pool_channel_tiles(fp, profile, k);
+CREATE TABLE IF NOT EXISTS pool_channel_state (
+  channel_id TEXT PRIMARY KEY, last_message_id INTEGER NOT NULL DEFAULT 0,
+  scanned_at REAL NOT NULL DEFAULT 0);
 -- TV-generated Nuvio NVMT packs. Telegram stores the package; this row is the
 -- exact-file lookup and points at the current merged package revision.
 CREATE TABLE IF NOT EXISTS pool_packages (
