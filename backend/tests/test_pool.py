@@ -457,6 +457,69 @@ def test_nvmt_package_validation_merge_and_asgi_download(tmp_path, monkeypatch):
         core.stop()
 
 
+def test_episode_variant_index_and_sparse_sample_routes(tmp_path, monkeypatch):
+    """Different encodes can be discovered by episode key and sampled before full reuse."""
+    tg = FakeTelegramBotAPI()
+
+    class NoSourceProxy:
+        def stop(self):
+            pass
+
+    async def inline_to_thread(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(app_module.asyncio, "to_thread", inline_to_thread)
+    core = Core(Settings(data_dir=tmp_path / "pool-host", pool_enabled=True,
+                         pool_read_key=READ_KEY, pool_write_key=WRITE_KEY,
+                         telegram_bot_token="123456:test", telegram_channel_id="-100123"),
+                pool_storage=TelegramBotStore("123456:test", "-100123", opener=tg.urlopen),
+                proxy=NoSourceProxy())
+    api = ASGIPoolAPI(create_api_app(core))
+    episode_key = hashlib.sha256(b"stable, client-side episode key").hexdigest()
+    fp_old = hashlib.sha256(b"first encode").hexdigest()
+    fp_new = hashlib.sha256(b"second encode").hexdigest()
+    duration_old, duration_new, grid = 20_000, 60_000, 5_000
+    old_tiles = {0: (0, jpeg((10, 30, 50))), 1: (5_000, jpeg((30, 50, 70))),
+                 2: (10_000, jpeg((50, 70, 90))), 3: (15_000, jpeg((70, 90, 110)))}
+    new_tiles = {0: (0, jpeg((11, 31, 51))), 2: (10_000, jpeg((31, 51, 71))),
+                 8: (40_000, jpeg((51, 71, 91))), 11: (55_000, jpeg((71, 91, 111)))}
+    headers = {"Authorization": f"Bearer {WRITE_KEY}",
+               "Content-Type": "application/vnd.openseek.nvmt"}
+
+    def put(fp, duration, tiles, with_episode_key):
+        query = f"profile=nvmt-v1-g5&duration_ms={duration}"
+        if with_episode_key:
+            query += f"&episode_key={episode_key}"
+        return api(f"https://pool.test/v1/pool/{fp}/nvmt?{query}",
+                   nvmt_package(grid, duration, tiles), headers, 2)
+
+    try:
+        assert put(fp_old, duration_old, old_tiles, False).status == 201
+        # A read by an updated client backfills the episode index for an older package.
+        old_url = (f"https://pool.test/v1/pool/{fp_old}/nvmt?profile=nvmt-v1-g5"
+                   f"&episode_key={episode_key}")
+        assert api(old_url, None, {"Authorization": f"Bearer {READ_KEY}"}, 2).status == 200
+
+        # New contributions are indexed as they are uploaded.
+        assert put(fp_new, duration_new, new_tiles, True).status == 201
+        candidates = api(f"https://pool.test/v1/pool/episodes/{episode_key}?duration_ms={duration_new}",
+                         None, {"Authorization": f"Bearer {READ_KEY}"}, 2)
+        assert candidates.status == 200
+        entries = json.loads(candidates.data)["candidates"]
+        assert [entry["fp"] for entry in entries] == [fp_new, fp_old]
+        assert entries[0]["n_tiles"] == len(new_tiles)
+
+        # Candidate verification fetches only the requested sparse set, not the full NVMT.
+        sparse_url = (f"https://pool.test/v1/pool/{fp_new}/nvmt?profile=nvmt-v1-g5"
+                      "&slots=0,2,8,11")
+        sparse = api(sparse_url, None, {"Authorization": f"Bearer {READ_KEY}"}, 2)
+        assert sparse.status == 200
+        assert int(sparse.headers["x-openseek-n-tiles"]) == len(new_tiles)
+        assert decode_nvmt(fp_new, "nvmt-v1-g5", duration_new, sparse.data)[2] == new_tiles
+    finally:
+        core.stop()
+
+
 def test_real_sample_decode_to_telegram_pool_and_second_instance(tmp_path, monkeypatch):
     """Optional real-media smoke test for /home/yat/sample.mkv through the pool HTTP routes."""
     sample = Path("/home/yat/sample.mkv")
