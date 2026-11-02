@@ -425,13 +425,67 @@ class PoolService:
             "WHERE p.episode_key=? AND ABS(p.duration_ms-?)<=? "
             "ORDER BY ABS(p.duration_ms-?) ASC,p.updated DESC LIMIT ?",
             (episode_key, duration_ms, tolerance, duration_ms, max(1, min(limit, 8))))
-        return [{"fp": fp, "profile": profile, "duration_ms": dur, "n_slots": slots, "n_tiles": tiles}
+        return [{"fp": fp, "profile": profile, "duration_ms": dur, "duration_delta_ms": abs(dur - duration_ms),
+                 "n_slots": slots, "n_tiles": tiles}
                 for fp, profile, dur, slots, tiles in rows]
+
+    def _package_slots_from_tiles(self, fp: str, profile: str, slots: list[int],
+                                  tile_rows: list[tuple]) -> tuple[bytes, dict] | None:
+        """Build a sparse NVMT response from individual ten-second tile documents."""
+        grid = NVMT_PROFILES[profile]
+        tile_step = TILE_INTERVAL_MS // grid
+        duration_ms = int(tile_rows[0][2])
+        n_slots = (duration_ms + grid - 1) // grid
+        n_tiles = int(tile_rows[0][3])
+        if TILE_INTERVAL_MS % grid or n_tiles != tile_count(duration_ms):
+            raise PoolError(502, "stored_tile_corrupt")
+        by_slot = {int(row[0]) * tile_step: row for row in tile_rows}
+        if any(int(row[2]) != duration_ms or int(row[3]) != n_tiles for row in tile_rows):
+            raise PoolError(502, "stored_tile_corrupt")
+        selected_rows: dict[int, tuple] = {}
+        for wanted in dict.fromkeys(slots):
+            if wanted in by_slot:
+                selected_rows[wanted] = by_slot[wanted]
+                continue
+            nearest = min(by_slot, key=lambda k: abs(k - wanted))
+            if abs(nearest - wanted) <= 1:
+                selected_rows.setdefault(nearest, by_slot[nearest])
+        if not selected_rows:
+            return None
+        selected: dict[int, tuple[int, bytes]] = {}
+        for k, row in selected_rows.items():
+            tile_k, pts_ms, _duration, _n_tiles, size, digest, file_id = row
+            data = self.storage.get(file_id, MAX_TILE_BYTES)
+            if len(data) != size or hashlib.sha256(data).hexdigest() != digest:
+                raise PoolError(502, "stored_tile_corrupt")
+            try:
+                validate_tile(fp, PROFILE, tile_k, pts_ms, duration_ms, n_tiles, data)
+            except PoolError as exc:
+                raise PoolError(502, "stored_tile_corrupt") from exc
+            selected[k] = (pts_ms, data)
+        partial = encode_nvmt(grid, n_slots, selected)
+        return partial, {"duration_ms": duration_ms, "n_slots": n_slots, "n_tiles": len(selected),
+                         "sha256": hashlib.sha256(partial).hexdigest(), "profile": profile}
 
     def package_slots(self, fp: str, profile: str, slots: list[int]) -> tuple[bytes, dict] | None:
         """Return a small NVMT subset for the TV to verify visually before downloading the full pack."""
         if not slots or len(slots) > 12 or any(not isinstance(k, int) or k < 0 for k in slots):
             raise PoolError(400, "bad_slots")
+        if not is_fingerprint(fp) or profile not in NVMT_PROFILES:
+            raise PoolError(400, "bad_key")
+        # The single-tile API stores 320x180 q75 frames every ten seconds.
+        # g10 uses each row directly; g5 maps rows to even-numbered NVMT slots.
+        tile_rows = self.db.q(
+            "SELECT k,pts_ms,duration_ms,n_tiles,size,sha256,file_id FROM pool_tiles "
+            "WHERE fp=? AND profile=? ORDER BY k", (fp, PROFILE))
+        if tile_rows:
+            packages = self.db.q("SELECT duration_ms,n_slots FROM pool_packages WHERE fp=? AND profile=?",
+                                 (fp, profile))
+            grid = NVMT_PROFILES[profile]
+            expected_slots = (int(tile_rows[0][2]) + grid - 1) // grid
+            if packages and (packages[0][0] != tile_rows[0][2] or packages[0][1] != expected_slots):
+                raise PoolError(502, "stored_tile_corrupt")
+            return self._package_slots_from_tiles(fp, profile, slots, tile_rows)
         got = self.package(fp, profile)
         if got is None:
             return None

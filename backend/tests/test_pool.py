@@ -547,6 +547,139 @@ def test_episode_variant_index_and_sparse_sample_routes(tmp_path, monkeypatch):
         core.stop()
 
 
+def test_cold_g10_sparse_request_fetches_tile_documents_not_merged_package(tmp_path, monkeypatch):
+    tg = FakeTelegramBotAPI()
+
+    class NoSourceProxy:
+        def stop(self):
+            pass
+
+    async def inline_to_thread(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(app_module.asyncio, "to_thread", inline_to_thread)
+    core = Core(Settings(data_dir=tmp_path / "pool-host", pool_enabled=True,
+                         pool_read_key=READ_KEY, pool_write_key=WRITE_KEY,
+                         telegram_bot_token="123456:test", telegram_channel_id="-100123"),
+                pool_storage=TelegramBotStore("123456:test", "-100123", opener=tg.urlopen),
+                proxy=NoSourceProxy())
+    api = ASGIPoolAPI(create_api_app(core))
+    fp = hashlib.sha256(b"sparse single tile route source").hexdigest()
+    duration_ms, grid = 40_000, 10_000
+    tiles = {k: (k * grid, jpeg((20 + k, 50 + k, 80 + k))) for k in range(4)}
+    try:
+        # Keep the old merged pack available as a fallback, then clear the LRU
+        # so any accidental sparse call to package() must hit Telegram.
+        assert core.pool.upload_package(fp, "nvmt-v1-g10", duration_ms,
+                                        nvmt_package(grid, duration_ms, tiles))["stored"]
+        for k, (pts_ms, data) in tiles.items():
+            url = (f"https://pool.test/v1/pool/{fp}/tiles/{k}.jpg?profile={PROFILE}"
+                   f"&pts_ms={pts_ms}&duration_ms={duration_ms}&n_tiles=4")
+            uploaded = api(url, data, {"Authorization": f"Bearer {WRITE_KEY}",
+                                      "Content-Type": "image/jpeg"}, 2)
+            assert uploaded.status == 201
+        with core.pool._package_cache.lock:
+            core.pool._package_cache.items.clear()
+            core.pool._package_cache.bytes = 0
+
+        before_get, before_download = tg.get_file_calls, tg.download_calls
+        sparse_url = (f"https://pool.test/v1/pool/{fp}/nvmt?profile=nvmt-v1-g10"
+                      "&slots=0,1,2,3")
+        sparse = api(sparse_url, None, {"Authorization": f"Bearer {READ_KEY}"}, 2)
+        assert sparse.status == 200
+        assert decode_nvmt(fp, "nvmt-v1-g10", duration_ms, sparse.data)[2] == tiles
+        assert tg.get_file_calls - before_get == len(tiles)
+        assert tg.download_calls - before_download == len(tiles)
+
+        g5_tiles = {k * 2: (k * grid, data) for k, (_pts, data) in tiles.items()}
+        assert core.pool.upload_package(fp, "nvmt-v1-g5", duration_ms,
+                                        nvmt_package(5_000, duration_ms, g5_tiles))["stored"]
+        before_get, before_download = tg.get_file_calls, tg.download_calls
+        sparse_g5 = api(
+            f"https://pool.test/v1/pool/{fp}/nvmt?profile=nvmt-v1-g5&slots=0,1,2,3,4,5,6,7",
+            None, {"Authorization": f"Bearer {READ_KEY}"}, 2)
+        assert sparse_g5.status == 200
+        assert decode_nvmt(fp, "nvmt-v1-g5", duration_ms, sparse_g5.data)[2] == g5_tiles
+        assert tg.get_file_calls - before_get == len(tiles)
+        assert tg.download_calls - before_download == len(tiles)
+    finally:
+        core.stop()
+
+
+def test_admin_pool_purge_is_dry_run_by_default_and_sweeps_orphans(tmp_path):
+    tg = FakeTelegramBotAPI()
+
+    class NoSourceProxy:
+        def stop(self):
+            pass
+
+    core = Core(Settings(data_dir=tmp_path / "pool-host", admin_port=8788,
+                         admin_token="test-admin-token", pool_enabled=True,
+                         pool_read_key=READ_KEY, pool_write_key=WRITE_KEY,
+                         telegram_bot_token="123456:test", telegram_channel_id="-100123"),
+                pool_storage=TelegramBotStore("123456:test", "-100123", opener=tg.urlopen),
+                proxy=NoSourceProxy())
+
+    async def purge(body):
+        async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=create_admin_app(core), client=("127.0.0.1", 45000)),
+                base_url="http://127.0.0.1:8788") as client:
+            return await client.post("/admin/pool/purge", headers={"X-OpenSeek-Admin": core.admin_token},
+                                     json=body)
+
+    try:
+        now = time.time()
+        live_tile = jpeg()
+        tg.files["live-tile"] = live_tile
+        stale_tile_fp = hashlib.sha256(b"stale tile").hexdigest()
+        live_tile_fp = hashlib.sha256(b"live tile").hexdigest()
+        stale_package_fp = hashlib.sha256(b"stale package").hexdigest()
+        core.db.x("INSERT INTO pool_tiles VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                  (stale_tile_fp, PROFILE, 0, 0, 10_000, 1, 100, "0" * 64, "missing-tile", 101, now))
+        core.db.x("INSERT INTO pool_tiles VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                  (live_tile_fp, PROFILE, 0, 0, 10_000, 1, len(live_tile),
+                   hashlib.sha256(live_tile).hexdigest(), "live-tile", 102, now))
+        core.db.x("INSERT INTO pool_packages VALUES(?,?,?,?,?,?,?,?,?,?)",
+                  (stale_package_fp, "nvmt-v1-g10", 10_000, 1, 1, 200, "1" * 64,
+                   "missing-package", 103, now))
+        core.db.x("INSERT INTO pool_episode_packages VALUES(?,?,?,?,?)",
+                  ("2" * 64, stale_package_fp, "nvmt-v1-g10", 10_000, now))
+        core.db.x("INSERT INTO pool_episode_packages VALUES(?,?,?,?,?)",
+                  ("3" * 64, live_tile_fp, "nvmt-v1-g10", 10_000, now))
+        core.db.x("INSERT INTO pool_outbox VALUES(?,?,?,?,?,?,?,?)",
+                  ("4" * 64, 0, 0, 10_000, 1, now - 60 * 86400, 6, 0))
+        core.db.x("INSERT INTO pool_outbox VALUES(?,?,?,?,?,?,?,?)",
+                  ("5" * 64, 0, 0, 10_000, 1, now - 60 * 86400, 5, 0))
+        for i in range(128):
+            core.db.x("INSERT INTO pool_outbox VALUES(?,?,?,?,?,?,?,?)",
+                      (f"{i + 6:064x}", 0, 0, 10_000, 1, now - 60 * 86400, 8, 0))
+        core.db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        before_size = core.db.path.stat().st_size
+
+        dry = asyncio.run(purge({}))
+        assert dry.status_code == 200
+        assert dry.json()["dry_run"] is True
+        assert dry.json()["pool_tiles"] == 1
+        assert dry.json()["pool_packages"] == 1
+        assert dry.json()["pool_episode_packages"] == 2
+        assert dry.json()["pool_outbox"] == 129
+        assert core.db.q("SELECT COUNT(*) FROM pool_packages")[0][0] == 1
+
+        done = asyncio.run(purge({"dry_run": False, "vacuum": True}))
+        assert done.status_code == 200
+        result = done.json()
+        assert result["dry_run"] is False and result["vacuumed"] is True
+        assert result["pool_packages"] == 1 and result["pool_outbox"] == 129
+        assert core.db.q("SELECT COUNT(*) FROM pool_tiles")[0][0] == 1
+        assert core.db.q("SELECT COUNT(*) FROM pool_packages")[0][0] == 0
+        assert core.db.q("SELECT COUNT(*) FROM pool_episode_packages")[0][0] == 0
+        assert core.db.q("SELECT COUNT(*) FROM pool_outbox")[0][0] == 1
+        assert set(tg.deleted_messages) == {101, 103}
+        assert core.db.path.stat().st_size < before_size
+    finally:
+        core.stop()
+
+
 def test_real_sample_decode_to_telegram_pool_and_second_instance(tmp_path, monkeypatch):
     """Optional real-media smoke test for /home/yat/sample.mkv through the pool HTTP routes."""
     sample = Path("/home/yat/sample.mkv")
