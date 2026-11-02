@@ -874,6 +874,22 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
         return JSONResponse(result, status_code=200 if result["duplicate"] else 201,
                             headers={"Cache-Control": "no-store"})
 
+    @app.get("/v1/pool/episodes/{episode_key}")
+    async def pool_episode_candidates(request: Request, episode_key: str):
+        pool = core.pool
+        if pool is None:
+            return err(404, "not_found")
+        if not pool_allowed(request, pool):
+            return err(403, "forbidden")
+        try:
+            duration_ms = int(request.query_params.get("duration_ms", ""))
+            candidates = await asyncio.to_thread(pool.episode_candidates, episode_key, duration_ms)
+        except ValueError:
+            return err(400, "bad_request")
+        except PoolError as exc:
+            return err(exc.status, exc.code)
+        return JSONResponse({"candidates": candidates}, headers={"Cache-Control": "no-store"})
+
     @app.get("/v1/pool/{fp}/nvmt")
     async def pool_nvmt(request: Request, fp: str):
         pool = core.pool
@@ -883,7 +899,14 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
             return err(403, "forbidden")
         profile = request.query_params.get("profile", "")
         try:
-            got = await asyncio.to_thread(pool.package, fp, profile)
+            slots_text = request.query_params.get("slots")
+            if slots_text is None:
+                got = await asyncio.to_thread(pool.package, fp, profile)
+            else:
+                parts = slots_text.split(",")
+                if not 1 <= len(parts) <= 12 or any(not p.isdigit() for p in parts):
+                    return err(400, "bad_slots")
+                got = await asyncio.to_thread(pool.package_slots, fp, profile, [int(p) for p in parts])
         except PoolError as exc:
             return err(exc.status, exc.code)
         if got is None:
@@ -909,8 +932,9 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
         try:
             profile = request.query_params.get("profile", "")
             duration_ms = int(request.query_params.get("duration_ms", ""))
+            episode_key = request.query_params.get("episode_key")
             data = await request.body()
-            result = await asyncio.to_thread(pool.upload_package, fp, profile, duration_ms, data)
+            result = await asyncio.to_thread(pool.upload_package, fp, profile, duration_ms, data, episode_key)
         except ValueError:
             return err(400, "bad_request")
         except PoolError as exc:

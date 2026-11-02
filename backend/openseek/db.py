@@ -1,8 +1,9 @@
 """Small SQLite store for non-secret metadata (SR-15).
 
 Persisted: hashed device tokens + device names, preview_id <-> (device, fingerprint),
-per-fingerprint media metadata (duration, tile pts) and timestamps. NEVER persisted: source
-URLs, forwarded headers, titles, IMDb ids or any client hint, pairing codes, raw tokens.
+per-fingerprint media metadata (duration, tile pts), timestamps, and an optional hashed
+episode key for NVMT cross-encode discovery. NEVER persisted: source URLs, forwarded headers,
+titles, raw IMDb/TMDB ids, pairing codes, or raw tokens.
 """
 from __future__ import annotations
 
@@ -39,6 +40,13 @@ CREATE TABLE IF NOT EXISTS pool_packages (
   n_slots INTEGER NOT NULL, n_tiles INTEGER NOT NULL, size INTEGER NOT NULL,
   sha256 TEXT NOT NULL, file_id TEXT NOT NULL, message_id INTEGER NOT NULL, created REAL NOT NULL,
   PRIMARY KEY (fp, profile));
+-- A stable, client-computed episode key lets a different encode find candidate
+-- NVMT packages. It is a hash of catalog episode identity, never a title or URL.
+CREATE TABLE IF NOT EXISTS pool_episode_packages (
+  episode_key TEXT NOT NULL, fp TEXT NOT NULL, profile TEXT NOT NULL,
+  duration_ms INTEGER NOT NULL, updated REAL NOT NULL,
+  PRIMARY KEY (episode_key, fp, profile));
+CREATE INDEX IF NOT EXISTS pool_episode_lookup ON pool_episode_packages(episode_key, duration_ms);
 -- Durable upload queue: only keys/metadata are stored here; the JPEG remains in the normal cache.
 CREATE TABLE IF NOT EXISTS pool_outbox (
   fp TEXT NOT NULL, k INTEGER NOT NULL, pts_ms INTEGER NOT NULL, duration_ms INTEGER NOT NULL,

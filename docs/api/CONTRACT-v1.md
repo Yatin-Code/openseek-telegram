@@ -106,12 +106,22 @@ the tile API.
 response includes `X-OpenSeek-Duration-Ms`, `X-OpenSeek-N-Tiles`, `X-OpenSeek-Profile`, and `X-OpenSeek-Sha256`.
 Clients should validate the header and fingerprint before applying the package locally.
 
-`PUT /v1/pool/{fp}/nvmt?profile=nvmt-v1-g5|nvmt-v1-g10&duration_ms=…` accepts raw NVMT v1 bytes with
+The optional `slots=1,2,...` query returns only those available NVMT records in a valid partial package (up to 12
+slots). This lets a client fetch nearby images before downloading the full package.
+
+`PUT /v1/pool/{fp}/nvmt?profile=nvmt-v1-g5|nvmt-v1-g10&duration_ms=…&episode_key=…` accepts raw NVMT v1 bytes with
 `Content-Type: application/vnd.openseek.nvmt` (or `application/octet-stream`), up to 16 MiB. The server checks
 the profile, grid, duration, slot count, duplicate/out-of-range slots, and decodes each JPEG to verify 320×180
 dimensions. It stores the merged package as one Telegram document. The first accepted JPEG for each slot stays;
 later uploads add only missing slots. New coverage: 201; unchanged retry: 200; duration conflict for the same
 fingerprint/profile: 409; malformed data: 400.
+
+For TV episode sharing, clients may include a 64-character SHA-256 `episode_key` derived from the catalog ID,
+season, and episode. The server stores only this hash, not the catalog ID or title. `GET
+/v1/pool/episodes/{episode_key}?duration_ms=…` returns up to eight nearby package candidates. Runtime is only a
+coarse filter: clients must compare sample frames before accepting a different fingerprint. A client can request
+those sample records with the `slots` query above, then fetch the full package after verification. This index is
+optional; exact fingerprint lookup continues to work without it.
 
 Profiles map `nvmt-v1-g5` to a 5-second grid and `nvmt-v1-g10` to a 10-second grid. Different file versions
 have different fingerprints and separate pool entries.

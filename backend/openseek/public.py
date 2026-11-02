@@ -17,6 +17,7 @@ _ID32 = r"[0-9a-f]{32}"
 _CAP = r"[A-Za-z0-9_-]{16,64}"
 _NAME = r"[0-9A-Za-z_.-]{1,40}"
 _FP = r"[0-9a-f]{64}"
+_EPISODE_KEY = r"[0-9a-f]{64}"
 _INDEX = r"[0-9]{1,6}"
 
 # what needs no token: the entrance (health, invitation pairing) and the borrowed-content URLs, whose HMAC capability
@@ -32,6 +33,7 @@ OPEN_ROUTES = (
     ("pool_read", "GET", re.compile(rf"/v1/pool/{_FP}/tiles/{_INDEX}\.jpg")),
     ("pool_write", "PUT", re.compile(rf"/v1/pool/{_FP}/tiles/{_INDEX}\.jpg")),
     ("pool_read", "GET", re.compile(rf"/v1/pool/{_FP}/nvmt")),
+    ("pool_read", "GET", re.compile(rf"/v1/pool/episodes/{_EPISODE_KEY}")),
     ("pool_write", "PUT", re.compile(rf"/v1/pool/{_FP}/nvmt")),
 )
 

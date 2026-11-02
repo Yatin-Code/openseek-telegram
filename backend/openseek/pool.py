@@ -11,6 +11,7 @@ import http.client
 import io
 import json
 import logging
+import re
 import secrets
 import socket
 import threading
@@ -34,6 +35,7 @@ MAX_NVMT_BYTES = 16 * 1024 * 1024
 MAX_DURATION_MS = 12 * 60 * 60 * 1000
 TILE_INTERVAL_MS = 10_000
 NVMT_PROFILES = {"nvmt-v1-g5": 5_000, "nvmt-v1-g10": 10_000}
+_EPISODE_KEY = re.compile(r"[0-9a-f]{64}\Z")
 
 
 class _DualStackHTTPSConnection(http.client.HTTPSConnection):
@@ -388,8 +390,47 @@ class PoolService:
         return data, {"duration_ms": duration_ms, "n_slots": n_slots, "n_tiles": n_tiles,
                       "sha256": digest, "profile": profile}
 
-    def upload_package(self, fp: str, profile: str, duration_ms: int, data: bytes) -> dict:
+    def episode_candidates(self, episode_key: str, duration_ms: int, limit: int = 8) -> list[dict]:
+        """Return bounded, duration-near package variants for client-side visual verification."""
+        if not _EPISODE_KEY.fullmatch(episode_key) or not isinstance(duration_ms, int) or duration_ms <= 0:
+            raise PoolError(400, "bad_episode_key")
+        # Runtime is only a coarse filter. The TV must compare sample frames before accepting a candidate.
+        tolerance = max(90_000, int(duration_ms * 0.15))
+        rows = self.db.q(
+            "SELECT p.fp,p.profile,p.duration_ms,p.n_slots,p.n_tiles "
+            "FROM pool_episode_packages p JOIN pool_packages n ON n.fp=p.fp AND n.profile=p.profile "
+            "WHERE p.episode_key=? AND ABS(p.duration_ms-?)<=? "
+            "ORDER BY ABS(p.duration_ms-?) ASC,p.updated DESC LIMIT ?",
+            (episode_key, duration_ms, tolerance, duration_ms, max(1, min(limit, 8))))
+        return [{"fp": fp, "profile": profile, "duration_ms": dur, "n_slots": slots, "n_tiles": tiles}
+                for fp, profile, dur, slots, tiles in rows]
+
+    def package_slots(self, fp: str, profile: str, slots: list[int]) -> tuple[bytes, dict] | None:
+        """Return a small NVMT subset for the TV to verify visually before downloading the full pack."""
+        if not slots or len(slots) > 12 or any(not isinstance(k, int) or k < 0 for k in slots):
+            raise PoolError(400, "bad_slots")
+        got = self.package(fp, profile)
+        if got is None:
+            return None
+        data, meta = got
+        grid, n_slots, tiles = decode_nvmt(fp, profile, meta["duration_ms"], data)
+        selected = {k: tiles[k] for k in dict.fromkeys(slots) if k in tiles}
+        if not selected:
+            return None
+        partial = encode_nvmt(grid, n_slots, selected)
+        return partial, {**meta, "n_tiles": len(selected), "sha256": hashlib.sha256(partial).hexdigest()}
+
+    def _index_episode_package(self, episode_key: str | None, fp: str, profile: str, duration_ms: int) -> None:
+        if episode_key:
+            self.db.x("INSERT INTO pool_episode_packages(episode_key,fp,profile,duration_ms,updated) VALUES(?,?,?,?,?) "
+                       "ON CONFLICT(episode_key,fp,profile) DO UPDATE SET duration_ms=excluded.duration_ms,updated=excluded.updated",
+                       (episode_key, fp, profile, duration_ms, time.time()))
+
+    def upload_package(self, fp: str, profile: str, duration_ms: int, data: bytes,
+                       episode_key: str | None = None) -> dict:
         grid, n_slots, incoming = decode_nvmt(fp, profile, duration_ms, data)
+        if episode_key is not None and not _EPISODE_KEY.fullmatch(episode_key):
+            raise PoolError(400, "bad_episode_key")
         with self._lock:
             rows = self.db.q("SELECT duration_ms,n_slots,n_tiles,size,sha256,file_id,message_id "
                              "FROM pool_packages WHERE fp=? AND profile=?", (fp, profile))
@@ -416,6 +457,7 @@ class PoolService:
                 raise PoolError(413, "package_too_large")
             digest = hashlib.sha256(package).hexdigest()
             if previous and digest == previous[4]:
+                self._index_episode_package(episode_key, fp, profile, duration_ms)
                 return {"stored": False, "duplicate": True, "tiles": len(merged), "sha256": digest}
             caption = f"openseek:nvmt:v1:{fp}:{profile}:{digest}"
             try:
@@ -429,6 +471,7 @@ class PoolService:
                       "size=excluded.size,sha256=excluded.sha256,file_id=excluded.file_id," 
                       "message_id=excluded.message_id,created=excluded.created",
                       (fp, profile, duration_ms, n_slots, len(merged), len(package), digest, file_id, message_id, time.time()))
+            self._index_episode_package(episode_key, fp, profile, duration_ms)
             self._package_cache.put((fp, profile, digest), package)
             if previous:
                 try:
