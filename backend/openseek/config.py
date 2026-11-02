@@ -435,10 +435,14 @@ class Settings:
             if self.contribution and not (self.telegram_bot_token or self.telegram_session or self.telegram_session_file):
                 raise ConfigError("OPENSEEK_CONTRIBUTION requires a Telegram identity")
             if self.librarian and not (re.fullmatch(r"@[A-Za-z0-9_]{5,32}", self.librarian) or
-                                       (urlsplit(self.librarian).scheme == "https" and urlsplit(self.librarian).hostname)):
+                                       (urlsplit(self.librarian).scheme == "https" and urlsplit(self.librarian).hostname and
+                                        not urlsplit(self.librarian).username and not urlsplit(self.librarian).password and
+                                        not urlsplit(self.librarian).query and not urlsplit(self.librarian).fragment)):
                 raise ConfigError("OPENSEEK_LIBRARIAN must be a bot username or HTTPS URL")
             if self.librarian_key and not self.librarian:
                 raise ConfigError("OPENSEEK_LIBRARIAN_KEY requires OPENSEEK_LIBRARIAN")
+            if self.librarian_key and len(self.librarian_key) < 24:
+                raise ConfigError("OPENSEEK_LIBRARIAN_KEY must be at least 24 characters")
         if mode == "channel" and self.librarian_enabled:
             if not self.telegram_bot_token or not self.telegram_channel_id:
                 raise ConfigError("OPENSEEK_LIBRARIAN_ENABLED requires a bot token and channel ID")

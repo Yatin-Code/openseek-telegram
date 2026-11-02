@@ -10,9 +10,10 @@ import time
 from .cache import PROFILE
 from .db import DB
 from .ids import is_fingerprint
-from .pool import (MAX_TILE_BYTES, NVMT_PROFILES, PoolError,
+from .pool import (MAX_DURATION_MS, MAX_TILE_BYTES, NVMT_PROFILES, PoolError,
                    TILE_INTERVAL_MS, _EPISODE_KEY, _tile_metadata_from_filename,
                    encode_nvmt, validate_tile)
+from .scheduler import tile_count
 
 log = logging.getLogger("openseek.channel_index")
 _CAPTION = re.compile(r"^openseek:v1:([0-9a-f]{64}):([^:]+):(\d+):([0-9a-f]{64})$")
@@ -29,13 +30,20 @@ class ChannelIndex:
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self.last_error = ""
 
     def refresh(self, force: bool = False) -> dict:
         with self._lock:
             state = self._state()
             if not force and state and self.clock() - state[1] < self.refresh_s:
                 return {"scanned": 0, "indexed": 0, "last_message_id": state[0], "skipped": True}
-            return self._refresh_once(state[0] if state else 0)
+            try:
+                result = self._refresh_once(state[0] if state else 0)
+                self.last_error = ""
+                return result
+            except Exception as exc:
+                self.last_error = getattr(exc, "code", type(exc).__name__)
+                raise
 
     def _refresh_once(self, last_message_id: int) -> dict:
         messages = self.store.scan(last_message_id, self.scan_limit)
@@ -43,13 +51,39 @@ class ChannelIndex:
         newest = max((int(message.message_id) for message in messages), default=last_message_id)
         now = self.clock()
         indexed = 0
+        candidates = []
+        seen = set()
+        for message in messages:
+            tile = self._parse_message(message)
+            if tile is None:
+                continue
+            fp, profile, k, pts_ms, duration_ms, n_tiles, size, digest, message_id = tile
+            key = (fp, profile, k)
+            if key in seen:
+                continue
+            existing = self.db.q(
+                "SELECT sha256,duration_ms FROM pool_channel_tiles WHERE fp=? AND profile=? AND k=?", key)
+            if existing:
+                seen.add(key)
+                if existing[0][0] == digest and existing[0][1] == 0 and duration_ms > 0:
+                    candidates.append(tile)
+                continue
+            try:
+                data = self.store.get_tile(message_id)
+                valid_duration = duration_ms or MAX_DURATION_MS
+                valid_count = n_tiles or tile_count(valid_duration)
+                if len(data) != size or validate_tile(
+                        fp, profile, k, pts_ms, valid_duration, valid_count, data) != digest:
+                    continue
+            except Exception as exc:
+                log.debug("ignoring invalid Telegram tile message %d (%s)", message_id, type(exc).__name__)
+                continue
+            seen.add(key)
+            candidates.append(tile)
         with self.db._lock:
             self.db.conn.execute("BEGIN IMMEDIATE")
             try:
-                for message in messages:
-                    tile = self._parse_message(message)
-                    if tile is None:
-                        continue
+                for tile in candidates:
                     fp, profile, k, pts_ms, duration_ms, n_tiles, size, digest, message_id = tile
                     existing = self.db.conn.execute(
                         "SELECT sha256,duration_ms,n_tiles FROM pool_channel_tiles "
@@ -93,7 +127,12 @@ class ChannelIndex:
             total_scanned = total_indexed = 0
             last_message_id = 0
             while True:
-                result = self._refresh_once(last_message_id)
+                try:
+                    result = self._refresh_once(last_message_id)
+                    self.last_error = ""
+                except Exception as exc:
+                    self.last_error = getattr(exc, "code", type(exc).__name__)
+                    raise
                 total_scanned += result["scanned"]
                 total_indexed += result["indexed"]
                 last_message_id = result["last_message_id"]
@@ -170,6 +209,38 @@ class ChannelIndex:
         return self.db.x("DELETE FROM pool_channel_tiles WHERE fp=? AND profile=? AND k=? AND message_id=?",
                          (fp, profile, k, int(message_id))) > 0
 
+    def record_message(self, message) -> bool:
+        """Index a just-reposted librarian tile while preserving the first digest."""
+        tile = self._parse_message(message)
+        if tile is None:
+            return False
+        fp, profile, k, pts_ms, duration_ms, n_tiles, size, digest, message_id = tile
+        with self.db._lock:
+            self.db.conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = self.db.conn.execute(
+                    "SELECT sha256,duration_ms FROM pool_channel_tiles WHERE fp=? AND profile=? AND k=?",
+                    (fp, profile, k)).fetchone()
+                if existing is None:
+                    self.db.conn.execute(
+                        "INSERT INTO pool_channel_tiles "
+                        "(fp,profile,k,pts_ms,duration_ms,n_tiles,size,sha256,message_id,created) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                        (fp, profile, k, pts_ms, duration_ms, n_tiles, size, digest, message_id, self.clock()))
+                    accepted = True
+                else:
+                    accepted = existing[0] == digest
+                    if accepted and existing[1] == 0 and duration_ms > 0:
+                        self.db.conn.execute(
+                            "UPDATE pool_channel_tiles SET pts_ms=?,duration_ms=?,n_tiles=?,size=? "
+                            "WHERE fp=? AND profile=? AND k=? AND sha256=? AND duration_ms=0",
+                            (pts_ms, duration_ms, n_tiles, size, fp, profile, k, digest))
+                self.db.conn.execute("COMMIT")
+                return accepted
+            except BaseException:
+                self.db.conn.execute("ROLLBACK")
+                raise
+
     def manifest(self, fp: str, profile: str) -> dict | None:
         if not is_fingerprint(fp) or profile != PROFILE:
             raise PoolError(400, "bad_key")
@@ -234,4 +305,5 @@ class ChannelIndex:
         state = self._state()
         count = self.db.q("SELECT COUNT(*) FROM pool_channel_tiles")
         return {"channel_id": self.channel_id, "last_message_id": state[0] if state else 0,
-                "scanned_at": state[1] if state else 0, "tiles": int(count[0][0]) if count else 0}
+                "scanned_at": state[1] if state else 0, "tiles": int(count[0][0]) if count else 0,
+                "last_error": self.last_error}

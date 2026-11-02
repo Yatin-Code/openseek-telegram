@@ -737,6 +737,7 @@ class PoolSync:
         self._wake = threading.Event()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self.last_error = ""
 
     def start(self) -> None:
         if self._thread is None or not self._thread.is_alive():
@@ -784,10 +785,14 @@ class PoolSync:
                 ok = self.client.publish(fp, k, pts, duration, n_tiles, data)
             except Exception as exc:  # network/outbox failures must not stop local extraction
                 log.warning("pool upload failed (%s)", type(exc).__name__)
+                self.last_error = type(exc).__name__
                 ok = False
             if ok:
+                self.last_error = ""
                 self.db.x("DELETE FROM pool_outbox WHERE fp=? AND k=?", (fp, k))
             else:
+                if not self.last_error:
+                    self.last_error = "pool_upload_failed"
                 attempts += 1
                 delay = min(300, 2 ** min(attempts, 8))
                 self.db.x("UPDATE pool_outbox SET attempts=?,retry_after=? WHERE fp=? AND k=?",
@@ -899,6 +904,7 @@ class ChannelPoolSync:
         self._wake = threading.Event()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self.last_error = ""
 
     def start(self) -> None:
         if self._thread is None or not self._thread.is_alive():
@@ -941,7 +947,9 @@ class ChannelPoolSync:
                 continue
             try:
                 self._publish(fp, int(k), int(pts_ms), int(duration_ms), int(n_tiles))
+                self.last_error = ""
             except Exception as exc:
+                self.last_error = getattr(exc, "code", type(exc).__name__)
                 attempts = int(attempts) + 1
                 delay = min(300, 2 ** min(attempts, 8))
                 self.db.x("UPDATE pool_channel_outbox SET attempts=?,retry_after=? WHERE fp=? AND k=?",
@@ -949,15 +957,25 @@ class ChannelPoolSync:
                 log.info("channel upload deferred fp=%s tile=%d retry_s=%d (%s)",
                          fp[:8], k, delay, type(exc).__name__)
 
+    def status(self) -> dict:
+        return {"pending": self.pending(), "last_error": self.last_error}
+
     def _publish(self, fp: str, k: int, pts_ms: int, duration_ms: int, n_tiles: int) -> None:
         rows = self.db.q("SELECT message_id FROM pool_channel_outbox WHERE fp=? AND k=?", (fp, k))
         message_id = int(rows[0][0]) if rows else 0
+        librarian = str(getattr(getattr(self.store, "settings", None), "librarian", "") or "")
+        librarian_bot = librarian.startswith("@")
         if message_id:
             self.index.refresh(force=True)
             winner = self.index.lookup(fp, PROFILE, k)
             if winner is None:
                 raise PoolError(503, "telegram_index_not_updated")
-            if winner["message_id"] != message_id:
+            if winner["message_id"] != message_id and librarian_bot:
+                try:
+                    self.store.delete_message(message_id, target=librarian)
+                except TypeError:
+                    pass
+            elif winner["message_id"] != message_id and not librarian:
                 self.store.delete_message(message_id)
             self.db.x("DELETE FROM pool_channel_outbox WHERE fp=? AND k=?", (fp, k))
             return
@@ -974,10 +992,18 @@ class ChannelPoolSync:
             return
         caption = f"openseek:v1:{fp}:{PROFILE}:{k}:{digest}"
         metadata = {"pts_ms": pts_ms, "duration_ms": duration_ms, "n_tiles": n_tiles}
-        try:
-            message_id = self.store.put_tile(data, caption, metadata)
-        except TypeError:
-            message_id = self.store.put_tile(data, caption)
+        if librarian.startswith("https://"):
+            message_id = self._upload_to_http_librarian(librarian, data, caption, metadata)
+        elif librarian_bot:
+            try:
+                message_id = self.store.put_tile(data, caption, metadata, target=librarian)
+            except TypeError:
+                message_id = self.store.put_tile(data, caption, metadata)
+        else:
+            try:
+                message_id = self.store.put_tile(data, caption, metadata)
+            except TypeError:
+                message_id = self.store.put_tile(data, caption)
         self.db.x("UPDATE pool_channel_outbox SET message_id=? WHERE fp=? AND k=?", (message_id, fp, k))
         # Scan once so concurrent publishers are resolved by Telegram's
         # ascending message IDs. If this post loses, best-effort delete ours.
@@ -985,7 +1011,39 @@ class ChannelPoolSync:
         winner = self.index.lookup(fp, PROFILE, k)
         if winner is None:
             raise PoolError(503, "telegram_index_not_updated")
-        if winner["sha256"] != digest and winner["message_id"] != message_id:
+        if winner["sha256"] != digest and winner["message_id"] != message_id and not librarian:
             self.store.delete_message(message_id)
         self.db.x("DELETE FROM pool_channel_outbox WHERE fp=? AND k=?", (fp, k))
+
+    def _upload_to_http_librarian(self, base: str, data: bytes, caption: str, metadata: dict) -> int:
+        match = re.fullmatch(r"openseek:v1:([0-9a-f]{64}):([^:]+):(\d+):([0-9a-f]{64})", caption)
+        if not match:
+            raise PoolError(400, "bad_tile")
+        query = urllib.parse.urlencode({"pts_ms": metadata["pts_ms"],
+                                        "duration_ms": metadata["duration_ms"],
+                                        "n_tiles": metadata["n_tiles"]})
+        url = f"{base.rstrip('/')}/v1/tiles/{match.group(1)}/{match.group(3)}.jpg?{query}"
+        headers = {"Content-Type": "image/jpeg", "X-OpenSeek-Caption": caption}
+        key = str(getattr(getattr(self.store, "settings", None), "librarian_key", "") or "")
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        request = urllib.request.Request(url, data=data, headers=headers, method="PUT")
+        try:
+            with _urlopen(request, timeout=5.0) as response:
+                result = json.loads(response.read(1024 * 1024))
+        except urllib.error.HTTPError as exc:
+            if exc.code != 409:
+                raise PoolError(503, "librarian_unavailable") from exc
+            try:
+                result = json.loads(exc.read(1024 * 1024))
+            except (OSError, ValueError) as parse_exc:
+                raise PoolError(503, "librarian_unavailable") from parse_exc
+            finally:
+                exc.close()
+        except (OSError, urllib.error.URLError, TimeoutError, ValueError) as exc:
+            raise PoolError(503, "librarian_unavailable") from exc
+        message_id = result.get("message_id") if isinstance(result, dict) else None
+        if not isinstance(message_id, int) or message_id <= 0:
+            raise PoolError(502, "bad_librarian_response")
+        return message_id
 

@@ -12,6 +12,7 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
+from urllib.parse import urlsplit
 
 from .cache import PROFILE, jpeg_ok
 from .config import Settings
@@ -45,6 +46,8 @@ class TelegramMTProtoStore:
         self._client = None
         self._entity = None
         self._connected = False
+        self._message_handler = None
+        self._handler_attached = False
         self._session_file: Path | None = None
         self._lock = threading.RLock()
 
@@ -120,6 +123,12 @@ class TelegramMTProtoStore:
     @staticmethod
     def _secure_session_path(path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if not path.exists():
+            try:
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                os.close(fd)
+            except FileExistsError:
+                pass
         if os.name == "posix":
             os.chmod(path.parent, 0o700)
             if path.exists():
@@ -136,6 +145,11 @@ class TelegramMTProtoStore:
                                                         self.settings.telegram_api_hash)
                 else:
                     self._client = session
+            if self._message_handler is not None and not self._handler_attached:
+                from telethon import events
+
+                self._client.add_event_handler(self._dispatch_message, events.NewMessage(incoming=True))
+                self._handler_attached = True
             await self._client.connect()
             if self.settings.telegram_bot_token:
                 await self._client.sign_in(bot_token=self.settings.telegram_bot_token)
@@ -172,7 +186,19 @@ class TelegramMTProtoStore:
 
     async def _start_async(self) -> None:
         await self._ensure_connected()
-        await self._verify_entity(bool(self.settings.pool_upload or self.settings.librarian_enabled))
+        await self._verify_entity(bool(self.settings.librarian_enabled or
+                                       (self.settings.pool_upload and not self.settings.librarian)))
+
+    def set_message_handler(self, handler) -> None:
+        self._message_handler = handler
+
+    async def _dispatch_message(self, event) -> None:
+        try:
+            result = self._message_handler(event, self)
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception as exc:
+            log.warning("Telegram librarian message failed (%s)", type(exc).__name__)
 
     def login(self, phone: str | None = None, input_fn: Callable[[str], str] = input,
               password_fn: Callable[[str], str] = getpass.getpass) -> None:
@@ -200,13 +226,42 @@ class TelegramMTProtoStore:
                     await self._client.sign_in(password=password_fn("Telegram 2-step password: "))
                 else:
                     raise
-            await self._verify_entity(bool(self.settings.pool_upload))
+            if self._session_file and self._session_file.exists() and os.name == "posix":
+                os.chmod(self._session_file, 0o600)
         except PoolError:
             raise
         except Exception as exc:
             raise _pool_error(exc) from exc
 
-    def put_tile(self, data: bytes, caption: str, metadata: dict | None = None) -> int:
+    def join_invite(self, invite: str) -> str:
+        if self.settings.telegram_bot_token:
+            raise PoolError(400, "bot_cannot_join_invite")
+        invite_hash = _invite_hash(invite)
+        return self._submit(self._join_invite(invite_hash))
+
+    async def _join_invite(self, invite_hash: str) -> str:
+        await self._ensure_connected()
+        try:
+            from telethon.tl.functions.messages import ImportChatInviteRequest
+            from telethon import utils
+
+            try:
+                updates = await self._client(ImportChatInviteRequest(invite_hash))
+                entity = (getattr(updates, "chats", None) or [None])[0]
+            except Exception as exc:
+                if type(exc).__name__ != "UserAlreadyParticipantError":
+                    raise
+                entity = await self._client.get_entity(self.channel_id)
+            if entity is None:
+                entity = await self._client.get_entity(self.channel_id)
+            return str(utils.get_peer_id(entity))
+        except PoolError:
+            raise
+        except Exception as exc:
+            raise _pool_error(exc) from exc
+
+    def put_tile(self, data: bytes, caption: str, metadata: dict | None = None,
+                 target: str | None = None) -> int:
         match = _CAPTION.fullmatch(caption or "")
         if (not match or not is_fingerprint(match.group(1)) or match.group(2) != PROFILE or
                 len(data) > MAX_TILE_BYTES or not jpeg_ok(data) or
@@ -218,15 +273,20 @@ class TelegramMTProtoStore:
                                       int(metadata["n_tiles"]))
             if _tile_metadata_from_filename(filename, int(match.group(3))) is None:
                 raise PoolError(400, "bad_tile_metadata")
-        return self._submit(self._put_tile(bytes(data), caption, filename))
+        return self._submit(self._put_tile(bytes(data), caption, filename, target))
 
-    async def _put_tile(self, data: bytes, caption: str, filename: str) -> int:
+    async def _put_tile(self, data: bytes, caption: str, filename: str, target: str | None) -> int:
         await self._ensure_connected()
-        if self._entity is None:
+        if target:
+            entity = await self._client.get_entity(target)
+        elif self._entity is None:
             await self._verify_entity(True)
+            entity = self._entity
+        else:
+            entity = self._entity
         try:
             message = await self._retry(lambda: self._client.send_file(
-                self._entity, (io.BytesIO(data), filename), caption=caption,
+                entity, (io.BytesIO(data), filename), caption=caption,
                 force_document=True, mime_type="image/jpeg"))
             return int(message.id)
         except PoolError:
@@ -294,18 +354,23 @@ class TelegramMTProtoStore:
         except Exception as exc:
             raise _pool_error(exc) from exc
 
-    def delete_message(self, message_id: int) -> bool:
+    def delete_message(self, message_id: int, target: str | None = None) -> bool:
         try:
-            return bool(self._submit(self._delete_message(message_id)))
+            return bool(self._submit(self._delete_message(message_id, target)))
         except Exception as exc:
             log.info("Telegram duplicate cleanup failed (%s)", type(exc).__name__)
             return False
 
-    async def _delete_message(self, message_id: int) -> bool:
+    async def _delete_message(self, message_id: int, target: str | None) -> bool:
         await self._ensure_connected()
-        if self._entity is None:
+        if target:
+            entity = await self._client.get_entity(target)
+        elif self._entity is None:
             await self._verify_entity(True)
-        await self._retry(lambda: self._client.delete_messages(self._entity, [message_id]))
+            entity = self._entity
+        else:
+            entity = self._entity
+        await self._retry(lambda: self._client.delete_messages(entity, [message_id]))
         return True
 
     async def _retry(self, operation):
@@ -353,6 +418,7 @@ class TelegramMTProtoStore:
         self._loop = None
         self._client = None
         self._entity = None
+        self._handler_attached = False
 
     def __enter__(self):
         self.start()
@@ -365,6 +431,21 @@ class TelegramMTProtoStore:
 def _looks_like_path(value: str) -> bool:
     path = Path(value).expanduser()
     return path.exists() or value.endswith(".session") or "/" in value or "\\" in value
+
+
+def _invite_hash(invite: str) -> str:
+    value = invite.strip()
+    if not value:
+        raise PoolError(400, "bad_invite_link")
+    parsed = urlsplit(value if "://" in value else "https://t.me/" + value.lstrip("/"))
+    if parsed.hostname not in ("t.me", "telegram.me", "www.t.me", "www.telegram.me"):
+        raise PoolError(400, "bad_invite_link")
+    parts = [part for part in parsed.path.split("/") if part]
+    if parts and parts[0].startswith("+") and len(parts[0]) > 1:
+        return parts[0][1:]
+    if len(parts) >= 2 and parts[0] == "joinchat":
+        return parts[1]
+    raise PoolError(400, "bad_invite_link")
 
 
 def _retry_delay(exc: Exception, attempt: int) -> float | None:
