@@ -606,6 +606,43 @@ def test_cold_g10_sparse_request_fetches_tile_documents_not_merged_package(tmp_p
         core.stop()
 
 
+def test_sparse_request_falls_back_to_the_merged_package_on_bad_tile_rows(tmp_path, monkeypatch):
+    tg = FakeTelegramBotAPI()
+
+    class NoSourceProxy:
+        def stop(self):
+            pass
+
+    core = Core(Settings(data_dir=tmp_path / "pool-host", pool_enabled=True,
+                         pool_read_key=READ_KEY, pool_write_key=WRITE_KEY,
+                         telegram_bot_token="123456:test", telegram_channel_id="-100123"),
+                pool_storage=TelegramBotStore("123456:test", "-100123", opener=tg.urlopen),
+                proxy=NoSourceProxy())
+    api = ASGIPoolAPI(create_api_app(core))
+    fp = hashlib.sha256(b"sparse fallback over bad tile rows").hexdigest()
+    duration_ms, grid = 40_000, 10_000
+    tiles = {k: (k * grid, jpeg((40 + k, 60 + k, 90 + k))) for k in range(4)}
+    try:
+        assert core.pool.upload_package(fp, "nvmt-v1-g10", duration_ms,
+                                        nvmt_package(grid, duration_ms, tiles))["stored"]
+        # A stale tile row (wrong sha) must not hard-fail the sparse route.
+        core.db.x("INSERT INTO pool_tiles VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                  (fp, PROFILE, 0, 0, duration_ms, 4, 99, "f" * 64, "fake-blob", 201, time.time()))
+        with core.pool._package_cache.lock:
+            core.pool._package_cache.items.clear()
+            core.pool._package_cache.bytes = 0
+        before_get, before_download = tg.get_file_calls, tg.download_calls
+        sparse = api(f"https://pool.test/v1/pool/{fp}/nvmt?profile=nvmt-v1-g10&slots=0,1,2,3",
+                     None, {"Authorization": f"Bearer {READ_KEY}"}, 2)
+        assert sparse.status == 200
+        assert decode_nvmt(fp, "nvmt-v1-g10", duration_ms, sparse.data)[2] == tiles
+        # Fallback path: one failed tile getFile + one merged-package fetch.
+        assert tg.get_file_calls - before_get == 2
+        assert tg.download_calls - before_download == 1
+    finally:
+        core.stop()
+
+
 def test_admin_pool_purge_is_dry_run_by_default_and_sweeps_orphans(tmp_path):
     tg = FakeTelegramBotAPI()
 

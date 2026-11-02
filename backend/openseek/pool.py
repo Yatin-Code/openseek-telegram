@@ -36,6 +36,24 @@ MAX_DURATION_MS = 12 * 60 * 60 * 1000
 TILE_INTERVAL_MS = 10_000
 NVMT_PROFILES = {"nvmt-v1-g5": 5_000, "nvmt-v1-g10": 10_000}
 _EPISODE_KEY = re.compile(r"[0-9a-f]{64}\Z")
+_TILE_FILENAME = re.compile(r"^openseek-tile-v1-(\d+)-(\d+)-(\d+)\.jpg$")
+
+
+def _tile_filename(pts_ms: int, duration_ms: int, n_tiles: int) -> str:
+    """Carry metadata beside the stable caption so channel-only readers can rebuild it."""
+    return f"openseek-tile-v1-{pts_ms}-{duration_ms}-{n_tiles}.jpg"
+
+
+def _tile_metadata_from_filename(filename: str, k: int) -> tuple[int, int, int] | None:
+    match = _TILE_FILENAME.fullmatch(filename or "")
+    if not match:
+        return None
+    pts_ms, duration_ms, n_tiles = map(int, match.groups())
+    if (not 0 < duration_ms <= MAX_DURATION_MS or n_tiles != tile_count(duration_ms) or
+            not 0 <= k < n_tiles or not 0 <= pts_ms <= duration_ms or
+            abs(pts_ms - k * TILE_INTERVAL_MS) > 5000):
+        return None
+    return pts_ms, duration_ms, n_tiles
 
 
 class _DualStackHTTPSConnection(http.client.HTTPSConnection):
@@ -175,8 +193,12 @@ class TelegramBotStore:
                 return False
             raise
 
-    def put(self, data: bytes, caption: str) -> tuple[str, int]:
-        return self.put_document(data, caption, "tile.jpg", "image/jpeg")
+    def put(self, data: bytes, caption: str, metadata: dict | None = None) -> tuple[str, int]:
+        filename = "tile.jpg"
+        if metadata:
+            filename = _tile_filename(int(metadata["pts_ms"]), int(metadata["duration_ms"]),
+                                      int(metadata["n_tiles"]))
+        return self.put_document(data, caption, filename, "image/jpeg")
 
     def put_document(self, data: bytes, caption: str, filename: str,
                      content_type: str = "application/octet-stream") -> tuple[str, int]:
@@ -354,7 +376,11 @@ class PoolService:
             if media and (media[0][0] != duration_ms or media[0][1] != n_tiles):
                 raise PoolError(409, "media_metadata_conflict")
             caption = f"openseek:v1:{fp}:{profile}:{k}:{digest}"
-            file_id, message_id = self.storage.put(data, caption)
+            if isinstance(self.storage, TelegramBotStore):
+                file_id, message_id = self.storage.put(data, caption, {
+                    "pts_ms": pts_ms, "duration_ms": duration_ms, "n_tiles": n_tiles})
+            else:
+                file_id, message_id = self.storage.put(data, caption)
             self.db.x("INSERT INTO pool_tiles(fp,profile,k,pts_ms,duration_ms,n_tiles,size,sha256,file_id,message_id,created) "
                       "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                       (fp, profile, k, pts_ms, duration_ms, n_tiles, len(data), digest, file_id, message_id, time.time()))
@@ -483,9 +509,14 @@ class PoolService:
                                  (fp, profile))
             grid = NVMT_PROFILES[profile]
             expected_slots = (int(tile_rows[0][2]) + grid - 1) // grid
-            if packages and (packages[0][0] != tile_rows[0][2] or packages[0][1] != expected_slots):
-                raise PoolError(502, "stored_tile_corrupt")
-            return self._package_slots_from_tiles(fp, profile, slots, tile_rows)
+            match = not packages or (packages[0][0] == tile_rows[0][2] and packages[0][1] == expected_slots)
+            if match:
+                try:
+                    return self._package_slots_from_tiles(fp, profile, slots, tile_rows)
+                except PoolError as exc:
+                    if exc.code not in ("stored_tile_corrupt", "telegram_file_not_found"):
+                        raise
+                    log.warning("pool tile rows unusable for %s; serving sparse from the package", fp[:12])
         got = self.package(fp, profile)
         if got is None:
             return None
