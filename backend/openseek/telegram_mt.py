@@ -16,7 +16,8 @@ from typing import Callable
 from .cache import PROFILE, jpeg_ok
 from .config import Settings
 from .ids import is_fingerprint
-from .pool import MAX_TILE_BYTES, PoolError
+from .pool import (MAX_TILE_BYTES, PoolError, _tile_filename,
+                   _tile_metadata_from_filename)
 
 log = logging.getLogger("openseek.telegram_mt")
 _CAPTION = re.compile(r"^openseek:v1:([0-9a-f]{64}):([^:]+):(\d+):([0-9a-f]{64})$")
@@ -27,6 +28,7 @@ class ChannelMessage:
     message_id: int
     caption: str
     document_size: int
+    file_name: str = ""
 
 
 class TelegramMTProtoStore:
@@ -204,21 +206,27 @@ class TelegramMTProtoStore:
         except Exception as exc:
             raise _pool_error(exc) from exc
 
-    def put_tile(self, data: bytes, caption: str) -> int:
+    def put_tile(self, data: bytes, caption: str, metadata: dict | None = None) -> int:
         match = _CAPTION.fullmatch(caption or "")
         if (not match or not is_fingerprint(match.group(1)) or match.group(2) != PROFILE or
                 len(data) > MAX_TILE_BYTES or not jpeg_ok(data) or
                 hashlib.sha256(data).hexdigest() != match.group(4)):
             raise PoolError(400, "bad_tile")
-        return self._submit(self._put_tile(bytes(data), caption))
+        filename = "tile.jpg"
+        if metadata:
+            filename = _tile_filename(int(metadata["pts_ms"]), int(metadata["duration_ms"]),
+                                      int(metadata["n_tiles"]))
+            if _tile_metadata_from_filename(filename, int(match.group(3))) is None:
+                raise PoolError(400, "bad_tile_metadata")
+        return self._submit(self._put_tile(bytes(data), caption, filename))
 
-    async def _put_tile(self, data: bytes, caption: str) -> int:
+    async def _put_tile(self, data: bytes, caption: str, filename: str) -> int:
         await self._ensure_connected()
         if self._entity is None:
             await self._verify_entity(True)
         try:
             message = await self._retry(lambda: self._client.send_file(
-                self._entity, (io.BytesIO(data), "tile.jpg"), caption=caption,
+                self._entity, (io.BytesIO(data), filename), caption=caption,
                 force_document=True, mime_type="image/jpeg"))
             return int(message.id)
         except PoolError:
@@ -269,11 +277,12 @@ class TelegramMTProtoStore:
                     async for message in self._client.iter_messages(
                             self._entity, min_id=min_id, limit=limit, reverse=True):
                         document = getattr(message, "document", None)
-                        if not document:
-                            continue
                         caption = getattr(message, "message", None) or getattr(message, "text", "") or ""
+                        attributes = getattr(document, "attributes", ()) if document else ()
+                        file_name = next((getattr(attr, "file_name", "") for attr in attributes
+                                          if getattr(attr, "file_name", "")), "")
                         messages.append(ChannelMessage(int(message.id), caption,
-                                                       int(getattr(document, "size", 0) or 0)))
+                                                       int(getattr(document, "size", 0) or 0), file_name))
                     return messages
                 except Exception as exc:
                     delay = _retry_delay(exc, attempt)
