@@ -73,8 +73,9 @@ Latest-wins; `at_ms=null` = scrubbing ended. Client sends ≤ 8/s. Never awaited
 ### Optional shared tile pool
 
 Pool endpoints are available only on a pool host configured with `OPENSEEK_POOL_MODE=host` and Telegram host
-credentials, or with the legacy `OPENSEEK_POOL_ENABLED=1` setting. An unset mode is local-only; `channel` mode
-has no HTTP pool endpoints and reads Telegram through MTProto. OpenSeek-to-OpenSeek sync may use the separate read
+credentials, or with the legacy `OPENSEEK_POOL_ENABLED=1` setting. An unset mode is local-only. A `channel` node
+serves the read endpoints from its local Telegram index and needs no central host; writes are accepted only when
+the node has post rights. OpenSeek-to-OpenSeek sync may use the separate read
 and write bearer keys (`OPENSEEK_POOL_READ_KEY`, `OPENSEEK_POOL_WRITE_KEY`). Paired app clients use
 their revocable device token for reads; a guest can write only when its invitation grants contribution and the
 host's contribution switch is on. The public listener may serve anonymous reads under its per-IP `pool_read`
@@ -114,20 +115,24 @@ The optional `slots=1,2,...` query returns those NVMT records, or the nearest av
 in a valid partial package (up to 12 requested slots). This lets a client fetch nearby images before downloading
 the full package.
 
-`PUT /v1/pool/{fp}/nvmt?profile=nvmt-v1-g5|nvmt-v1-g10&duration_ms=…&episode_key=…` accepts raw NVMT v1 bytes with
+`PUT /v1/pool/{fp}/nvmt?profile=nvmt-v1-g5|nvmt-v1-g10&duration_ms=…&imdb=…&season=…&episode=…&size_bytes=…&filename=…&episode_key=…` accepts raw NVMT v1 bytes with
 `Content-Type: application/vnd.openseek.nvmt` (or `application/octet-stream`), up to 16 MiB. The server checks
 the profile, grid, duration, slot count, duplicate/out-of-range slots, and decodes each JPEG to verify 320×180
 dimensions. It stores the merged package as one Telegram document. The first accepted JPEG for each slot stays;
 later uploads add only missing slots. New coverage: 201; unchanged retry: 200; duration conflict for the same
 fingerprint/profile: 409; malformed data: 400.
 
-For TV episode sharing, clients may include a 64-character SHA-256 `episode_key` derived from the catalog ID,
-season, and episode. The server stores only this pseudonymous hash, not the catalog ID or title; because catalog
-IDs are guessable, this hash is not encryption or a privacy guarantee. `GET
-/v1/pool/episodes/{episode_key}?duration_ms=…` returns up to eight nearby package candidates. Runtime is only a
-coarse filter: clients must compare sample frames before accepting a different fingerprint. A client can request
-those sample records with the `slots` query above, then fetch the full package after verification. This index is
-optional; exact fingerprint lookup continues to work without it.
+On a channel node without post rights the write is refused with
+`403 {"error":"read_only_channel","contribute_url":"https://…"}`; `contribute_url` is optional. Hints, ranking,
+and the Telegram manifest are specified in `docs/api/HINTS-v2.md`.
+
+For legacy TV episode sharing, clients may include a 64-character SHA-256 `episode_key` derived from the catalog
+ID, season, and episode. The server stores only this pseudonymous hash, not the catalog ID or title; because
+catalog IDs are guessable, this hash is not encryption or a privacy guarantee. `GET
+/v1/pool/episodes/{episode_key}?duration_ms=…` returns up to eight nearby package candidates for older clients.
+New clients use `GET /v1/pool/candidates` with raw hints: `imdb`, `season`, `episode`, `duration_ms`,
+`size_bytes`, and `filename`. The server ranks by those hints and the client accepts the best candidate without
+decoding sample frames. Either index is optional; exact fingerprint lookup continues to work without it.
 
 Profiles map `nvmt-v1-g5` to a 5-second grid and `nvmt-v1-g10` to a 10-second grid. Different file versions
 have different fingerprints and separate pool entries.
