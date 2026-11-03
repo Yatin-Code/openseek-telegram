@@ -91,7 +91,7 @@ client never enters the sample-verification loop.
 **Why:** the server cannot index what the client does not send.
 **Scope:** `backend/openseek/pool.py` (`upload_package`, `index_episode_package`), `app.py` (`PUT /v1/pool/{fp}/nvmt`).
 **Do:**
-- Accept a bounded `X-OpenSeek-Hints` header: base64url JSON, <= 1024 bytes decoded, validated strictly.
+- Accept the raw hint query parameters defined in `docs/api/HINTS-v2.md`; validate them strictly. The frozen API uses query parameters, not a second header encoding.
 - Validate: IMDb `tt\d{1,10}`, season/episode 0..9999, duration 1..12h, size >= 0,
   filename normalized server-side, no control chars. Reject unknown keys (`extra=forbid` equivalent).
 - Upsert `pool_hints` in the same transaction as the package; a duplicate package may update hints.
@@ -350,8 +350,9 @@ client never enters the sample-verification loop.
 - Serve the same dashboard and owner operations in local/VPS and Vercel profiles, backed by profile-specific storage/runtime adapters.
 - Keep OpenSeek as the product name across both deployments; this is not a SeekDB rebrand.
 - Keep the local per-install admin secret. Protect the Vercel dashboard with one owner-configured secret; do not add user accounts, sign-up, or Supabase Auth.
+- Show a first-run browser setup wizard before the dashboard. On local/VPS, collect and validate Telegram settings, save them in the protected per-install `.env`, verify channel history/posting access, and start the initial scan. On Vercel, guide the owner to set project environment variables and validate them after redeployment.
 - Preserve the existing dashboard operations (status, pairing/sharing, pool scan/rebuild, and settings) in both profiles.
-**Acceptance:** the same dashboard workflows work against local/VPS and Vercel deployments; unauthenticated admin calls fail; Nuvio pool pairing/auth remains separate from owner access.
+**Acceptance:** a new owner can finish the setup wizard and reach the same dashboard in local/VPS and Vercel deployments; channel permission failures are explained before the first scan; unauthenticated admin calls fail; Nuvio pool pairing/auth remains separate from owner access.
 **Depends:** F1. **Size:** L.
 
 ### F3 — Generate NVMT only from an explicit dashboard action

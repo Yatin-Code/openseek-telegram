@@ -170,8 +170,12 @@ Telegram is the source of truth for shared pool bytes and hints. SQLite or Postg
 Read-only access to a foreign Telegram channel is a node permission/contribution mode, not a separate deployment
 profile. Local filesystem package storage is not a durable shared-pool backend.
 
-v1 is environment-only: `.env` plus env vars, no setup wizard. `doctor` reports mode, entity, history access,
-index counts, write capability, and librarian status. See `docs/INSTALL.md` and `docs/TELEGRAM-POOL.md`.
+The admin website starts with a browser setup wizard when an installation is not configured. On local/VPS it
+collects and validates Telegram pool settings, writes them to the protected per-install `.env`, checks channel
+history and posting access, and starts the first scan. On Vercel it guides the owner through setting project
+environment variables and validates them after deployment; a function cannot write Vercel project settings.
+`doctor` remains available for later diagnostics and reports mode, entity, history access, index counts, write
+capability, and librarian status. See `docs/INSTALL.md` and `docs/TELEGRAM-POOL.md`.
 
 Vercel uploads require a client transport for short-lived signed staging and asynchronous Telegram publication.
 The existing direct PUT remains the local/VPS path. Vercel downloads continue through OpenSeek as a direct

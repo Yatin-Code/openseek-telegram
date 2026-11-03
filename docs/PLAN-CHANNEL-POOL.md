@@ -588,10 +588,3 @@ Add `backend/tests/test_pool_channel.py`:
    second contribution flag.
 6. **Config output:** setup should write `openseek.env` and print a `source`
    line, not edit an existing `.env`.
-
-
-
-
-
-
-
