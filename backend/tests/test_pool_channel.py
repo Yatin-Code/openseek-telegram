@@ -45,12 +45,18 @@ class MemoryChannel:
         self.data: dict[int, bytes] = {}
         self.next_id = 1
         self.fail_next_upload = False
+        self.fail_after_uploads: int | None = None
         self.deleted: list[int] = []
 
     def put_tile(self, data, caption, metadata=None, target=None):
         if self.fail_next_upload:
             self.fail_next_upload = False
             raise PoolError(503, "telegram_unavailable")
+        if self.fail_after_uploads is not None:
+            if self.fail_after_uploads == 0:
+                self.fail_after_uploads = None
+                raise PoolError(503, "telegram_unavailable")
+            self.fail_after_uploads -= 1
         name = "tile.jpg"
         if metadata:
             name = _tile_filename(metadata["pts_ms"], metadata["duration_ms"], metadata["n_tiles"])
@@ -204,11 +210,13 @@ def test_channel_mode_uploads_nvmt_tiles_and_retry_keeps_first_writer(tmp_path):
                                           "Content-Type": "application/vnd.openseek.nvmt"})
 
     try:
-        store.fail_next_upload = True
+        store.fail_after_uploads = 1
         with pytest.raises(PoolError, match="telegram_unavailable"):
             core.pool.upload_package(fp, "nvmt-v1-g5", 20_000, package, imdb="tt1234567",
                                      size_bytes=1_000_000, filename="Film.Name.2024.mkv")
         assert core.db.q("SELECT COUNT(*) FROM pool_channel_tiles")[0][0] == 0
+        assert sum(bool(message.document_size) for message in store.messages) == 1
+        assert sum(message.caption.startswith("openseek:hints:v1:") for message in store.messages) == 0
 
         # The retry indexes the first Telegram tile, publishes the missing one,
         # and only then records the manifest and complete local hint row.
