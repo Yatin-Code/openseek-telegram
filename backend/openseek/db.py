@@ -1,9 +1,9 @@
-"""Small SQLite store for non-secret metadata (SR-15).
+"""Small SQLite store for service metadata (SR-15).
 
 Persisted: hashed device tokens + device names, preview_id <-> (device, fingerprint),
-per-fingerprint media metadata (duration, tile pts), timestamps, and an optional hashed
-episode key for NVMT cross-encode discovery. NEVER persisted: source URLs, forwarded headers,
-titles, raw IMDb/TMDB ids, pairing codes, or raw tokens.
+per-fingerprint media metadata (duration, tile pts), timestamps, optional hashed episode keys,
+and normalized catalog hints attached to shared-pool packages. NEVER persisted: source URLs,
+forwarded headers, raw titles, pairing codes, or raw tokens.
 """
 from __future__ import annotations
 
@@ -63,6 +63,16 @@ CREATE TABLE IF NOT EXISTS pool_episode_packages (
   duration_ms INTEGER NOT NULL, updated REAL NOT NULL,
   PRIMARY KEY (episode_key, fp, profile));
 CREATE INDEX IF NOT EXISTS pool_episode_lookup ON pool_episode_packages(episode_key, duration_ms);
+-- Rebuildable matching metadata for NVMT packages. Telegram manifests are the durable source
+-- in channel mode; values are normalized and bounded before insertion.
+CREATE TABLE IF NOT EXISTS pool_hints (
+  fp TEXT NOT NULL, profile TEXT NOT NULL, imdb TEXT, season INTEGER NOT NULL DEFAULT 0,
+  episode INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL, size_bytes INTEGER,
+  filename_norm TEXT, n_tiles INTEGER NOT NULL, grid INTEGER NOT NULL, created REAL NOT NULL,
+  PRIMARY KEY (fp, profile));
+CREATE INDEX IF NOT EXISTS pool_hints_imdb_episode ON pool_hints(imdb, season, episode);
+CREATE INDEX IF NOT EXISTS pool_hints_filename ON pool_hints(filename_norm);
+CREATE INDEX IF NOT EXISTS pool_hints_duration ON pool_hints(duration_ms);
 -- Durable upload queue: only keys/metadata are stored here; the JPEG remains in the normal cache.
 CREATE TABLE IF NOT EXISTS pool_outbox (
   fp TEXT NOT NULL, k INTEGER NOT NULL, pts_ms INTEGER NOT NULL, duration_ms INTEGER NOT NULL,
@@ -164,21 +174,25 @@ class DB:
         with self._lock:
             tile_rows = self.conn.execute("SELECT fp,profile,k FROM pool_tiles").fetchall()
             package_rows = self.conn.execute("SELECT fp,profile FROM pool_packages").fetchall()
+            channel_package_rows = self.conn.execute("SELECT DISTINCT fp,profile FROM pool_channel_tiles").fetchall()
             episode_rows = self.conn.execute("SELECT episode_key,fp,profile FROM pool_episode_packages").fetchall()
+            hint_rows = self.conn.execute("SELECT fp,profile FROM pool_hints").fetchall()
             outbox_rows = self.conn.execute(
                 "SELECT fp,k FROM pool_outbox WHERE created<? AND attempts>?", (outbox_before, max_attempts)
             ).fetchall()
             invalid_tile_keys = set(invalid_tiles)
             invalid_package_keys = set(invalid_packages)
             current_packages = set(package_rows)
-            surviving_packages = current_packages - invalid_package_keys
+            surviving_packages = (current_packages - invalid_package_keys) | set(channel_package_rows)
             orphan_episodes = [row for row in episode_rows if (row[1], row[2]) not in surviving_packages]
+            orphan_hints = [row for row in hint_rows if row not in surviving_packages]
             tile_targets = [row for row in tile_rows if row in invalid_tile_keys]
             package_targets = [row for row in package_rows if row in invalid_package_keys]
             counts = {
                 "pool_tiles": len(tile_targets),
                 "pool_packages": len(package_targets),
                 "pool_episode_packages": len(orphan_episodes),
+                "pool_hints": len(orphan_hints),
                 "pool_outbox": len(outbox_rows),
             }
             if dry_run:
@@ -193,6 +207,8 @@ class DB:
                     self.conn.execute(
                         "DELETE FROM pool_episode_packages WHERE episode_key=? AND fp=? AND profile=?",
                         (episode_key, fp, profile))
+                for fp, profile in orphan_hints:
+                    self.conn.execute("DELETE FROM pool_hints WHERE fp=? AND profile=?", (fp, profile))
                 for fp, k in outbox_rows:
                     self.conn.execute("DELETE FROM pool_outbox WHERE fp=? AND k=?", (fp, k))
                 self.conn.execute("COMMIT")
