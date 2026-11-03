@@ -199,7 +199,7 @@ class ChannelPoolService:
             if post is None:
                 raise PoolError(503, "telegram_manifest_unavailable")
             post(caption)
-        now = time.time()
+        now = float(created)
         with self.index.db._lock:
             self.index.db.conn.execute("BEGIN IMMEDIATE")
             try:

@@ -344,6 +344,49 @@ def test_channel_candidates_rank_movies_and_series_from_manifest_hints(tmp_path)
         db.close()
 
 
+def test_two_channel_nodes_converge_on_package_bytes_and_candidate_order(tmp_path):
+    store = MemoryChannel()
+    settings_a = Settings(data_dir=tmp_path / "node-a", pool_mode="channel", contribution=True,
+                          telegram_api_id=123, telegram_api_hash="a" * 32,
+                          telegram_bot_token="123456:test", telegram_channel_id=store.channel_id)
+    settings_b = settings_a.with_(data_dir=tmp_path / "node-b")
+    node_a = Core(settings_a, pool_storage=store)
+    node_b = Core(settings_b, pool_storage=store)
+    first_fp, second_fp = "a" * 64, "f" * 64
+    package = encode_nvmt(5_000, 4, {0: (0, jpeg((1, 2, 3))), 2: (10_000, jpeg((3, 2, 1)))})
+    try:
+        for fp in (first_fp, second_fp):
+            result = node_a.pool.upload_package(
+                fp, "nvmt-v1-g5", 20_000, package, imdb="tt1234567", season=0, episode=0,
+                size_bytes=1_000_000, filename="Movie.Title.2024.mkv")
+            assert result["stored"] is True
+
+        refresh = node_b.channel_index.refresh(force=True)
+        assert refresh["indexed"] == 4
+
+        def package_and_candidates(core):
+            nvmt, _meta = core.pool.package(first_fp, "nvmt-v1-g5")
+            candidates = core.pool.candidates(
+                duration_ms=20_000, imdb="tt1234567", season=0, episode=0,
+                size_bytes=1_000_000, filename="Movie.Title.2024.mkv")
+            return nvmt, candidates
+
+        source_nvmt, source_candidates = package_and_candidates(node_a)
+        replica_nvmt, replica_candidates = package_and_candidates(node_b)
+        assert replica_nvmt == source_nvmt
+        assert [item["fp"] for item in replica_candidates] == [item["fp"] for item in source_candidates]
+
+        rebuilt = node_b.channel_index.rebuild()
+        assert rebuilt["indexed"] == 4
+        rebuilt_nvmt, rebuilt_candidates = package_and_candidates(node_b)
+        assert rebuilt_nvmt == source_nvmt
+        assert rebuilt_candidates == source_candidates
+        assert node_a.jobs.running_sources() == node_b.jobs.running_sources() == []
+    finally:
+        node_a.stop()
+        node_b.stop()
+
+
 def test_first_writer_wins_and_losing_outbox_is_cleared(tmp_path):
     fp = "b" * 64
     store = MemoryChannel()
@@ -561,6 +604,13 @@ class FakeTelethonClient:
     async def delete_messages(self, _entity, ids):
         for mid in ids:
             self.messages.pop(mid, None)
+
+    async def send_message(self, entity, text, **_kw):
+        mid = self.next_id
+        self.next_id += 1
+        msg = SimpleNamespace(id=mid, message=text, text=text, entity=entity)
+        self.messages[mid] = msg
+        return msg
 
 
 def test_mtproto_store_sync_facade_upload_scan_download(tmp_path):
