@@ -68,6 +68,11 @@ If the channel cannot use a bot, configure `OPENSEEK_TELEGRAM_SESSION_FILE` and 
 same environment. The session file is private to the data directory and must remain available to the server process. The user account
 also needs channel history access; `doctor` reports whether the node can read and post.
 
+For a node that reads a shared channel but cannot post, set `OPENSEEK_POOL_CONTRIB_URL` to the HTTPS origin of a writable OpenSeek
+node, `OPENSEEK_POOL_WRITE_KEY` to that node's write key, and enable `OPENSEEK_CONTRIBUTION=1`. Authorized NVMT contributions are streamed to that intake node and
+appear here after the next channel scan. Without an intake URL, uploads return `read_only_channel` and include the configured
+`OPENSEEK_LIBRARIAN` value when available.
+
 ### Admin secret
 
 The loopback admin API (port 8788) requires a per-install secret in the `X-OpenSeek-Admin` header. By default the server creates a random one in

@@ -85,6 +85,8 @@ def main(argv: list[str] | None = None) -> int:
         if status == 200 and body:
             report["daemon"] = "running"
             report["pool"] = body
+            if isinstance(body, dict) and "contribution_path" in body:
+                report["contribution_path"] = body["contribution_path"]
             print(json.dumps(report, indent=2, sort_keys=True))
             return 0
         print(json.dumps({**report, "daemon": f"HTTP {status}"}, indent=2, sort_keys=True))

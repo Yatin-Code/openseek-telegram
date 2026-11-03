@@ -6,3 +6,4 @@ av==18.1.0
 Pillow==12.2.0
 numpy==2.5.3
 telethon==1.45.0
+httpx==0.28.1

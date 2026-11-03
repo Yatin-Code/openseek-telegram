@@ -19,6 +19,8 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Literal
 
+import httpx
+
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, Response
@@ -35,7 +37,7 @@ from .cache import Cache, secure_mkdir
 from .config import Settings
 from .db import DB
 from .fetch import RangeProxy
-from .ids import is_cap, is_device_id, is_preview_id, parse_index
+from .ids import is_cap, is_device_id, is_fingerprint, is_preview_id, parse_index
 from .jobs import Busy, Job, JobManager, SourceForbidden
 from .logutil import plain, setup_logging
 from .netpolicy import DestinationPolicy, filter_forwarded_headers
@@ -187,6 +189,13 @@ def _engine_available() -> bool:
 # ===================================================================== helpers
 def err(status: int, code: str, headers: dict | None = None) -> JSONResponse:
     return JSONResponse({"error": code}, status_code=status, headers=headers)
+
+
+def _librarian_url(settings: Settings) -> str | None:
+    value = settings.librarian.strip()
+    if value.startswith("@"):
+        return f"https://t.me/{value[1:]}"
+    return value or None
 
 
 def client_ip_allowed(host: str | None, allow_public: bool) -> bool:
@@ -627,6 +636,43 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
             return err(403, "not_contribute")
         return err(403, "forbidden")
 
+    def read_only_channel_response() -> JSONResponse:
+        return JSONResponse({"error": "read_only_channel",
+                             "contribute_url": _librarian_url(core.settings)}, status_code=403)
+
+    async def proxy_channel_upload(request: Request, fp: str) -> Response:
+        if not is_fingerprint(fp):
+            return err(400, "bad_key")
+        target = f"{core.settings.pool_contrib_url.rstrip('/')}/v1/pool/{fp}/nvmt"
+        if request.url.query:
+            target += "?" + request.url.query
+        headers = {
+            "Authorization": f"Bearer {core.settings.pool_write_key}",
+            "Content-Type": request.headers.get("content-type", "application/vnd.openseek.nvmt"),
+        }
+        try:
+            async with httpx.AsyncClient(follow_redirects=False, trust_env=False,
+                                         timeout=core.settings.pool_timeout_s) as client:
+                async with client.stream("PUT", target, headers=headers, content=request.stream()) as upstream:
+                    if 300 <= upstream.status_code < 400:
+                        return err(502, "contribute_redirect_refused")
+                    chunks = []
+                    body_size = 0
+                    async for chunk in upstream.aiter_bytes():
+                        body_size += len(chunk)
+                        if body_size > 64 * 1024:
+                            return err(502, "contribute_response_too_large")
+                        chunks.append(chunk)
+                    relay_headers = {name: upstream.headers[name] for name in
+                                     ("content-type", "x-openseek-duration-ms", "retry-after")
+                                     if name in upstream.headers}
+                    return Response(b"".join(chunks), status_code=upstream.status_code,
+                                    headers=relay_headers)
+        except httpx.TimeoutException:
+            return err(504, "contribute_timeout")
+        except httpx.HTTPError:
+            return err(502, "contribute_unavailable")
+
     @app.get("/v1/health")
     async def health(request: Request):
         if request.scope.get("openseek.public"):
@@ -911,6 +957,9 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
         denied = pool_write_denial(request, pool)
         if denied is not None:
             return denied
+        if (core.settings.effective_pool_mode == "channel" and
+                getattr(core.channel_store, "can_post", None) is not True):
+            return read_only_channel_response()
         k = parse_index(name[:-4], 999_999) if name.endswith(".jpg") else None
         if k is None or request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "image/jpeg":
             return err(400, "bad_request")
@@ -1014,6 +1063,11 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
         media_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
         if media_type not in ("application/vnd.openseek.nvmt", "application/octet-stream"):
             return err(400, "bad_request")
+        if (core.settings.effective_pool_mode == "channel" and
+                getattr(core.channel_store, "can_post", None) is not True):
+            if core.settings.pool_contrib_url:
+                return await proxy_channel_upload(request, fp)
+            return read_only_channel_response()
         try:
             profile = request.query_params.get("profile", "")
             duration_ms = int(request.query_params.get("duration_ms", ""))
@@ -1438,7 +1492,10 @@ def create_admin_app(core: Core) -> FastAPI:
                                 getattr(core.channel_store, "_handler_attached", True) else
                                 "disabled" if not core.settings.librarian_enabled else "unavailable")
             result = {"mode": mode, **core.channel_index.status(),
-                      "librarian_status": librarian_status}
+                      "librarian_status": librarian_status,
+                      "contribution_path": ("direct" if getattr(core.channel_store, "can_post", None) is True else
+                                            "proxy" if core.settings.pool_contrib_url else
+                                            _librarian_url(core.settings) or "unavailable")}
         elif mode == "host" and core.pool is not None:
             result = {"mode": mode, "api_enabled": True,
                       "api_url": f"https://{core.settings.public_host}" if core.settings.public_host else None,

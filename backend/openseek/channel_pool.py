@@ -115,7 +115,7 @@ class ChannelPoolService:
 
     def upload(self, *args, **kwargs) -> dict:
         fp, profile, k, pts_ms, duration_ms, n_tiles, data = args[:7]
-        if not getattr(self.store, "can_post", True):
+        if getattr(self.store, "can_post", None) is not True:
             raise PoolError(403, "read_only_channel")
         digest = validate_tile(fp, profile, k, pts_ms, duration_ms, n_tiles, data)
         existing = self.index.lookup(fp, profile, k)
@@ -136,7 +136,7 @@ class ChannelPoolService:
                        episode_key: str | None = None, *, imdb: str | None = None,
                        season: int = 0, episode: int = 0, size_bytes: int | None = None,
                        filename: str | None = None) -> dict:
-        if not getattr(self.store, "can_post", True):
+        if getattr(self.store, "can_post", None) is not True:
             raise PoolError(403, "read_only_channel")
         hints = validate_pool_hints(imdb, season, episode, duration_ms, size_bytes, filename)
         grid, n_slots, source_tiles = decode_nvmt(fp, profile, duration_ms, data)

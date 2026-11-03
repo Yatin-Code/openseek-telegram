@@ -19,6 +19,7 @@ from openseek.cache import Cache, PROFILE
 from openseek.channel_pool import ChannelPoolService
 from openseek.channel_index import ChannelIndex
 from openseek import cli
+import openseek.app as app_module
 from openseek.config import ConfigError, MiB, Settings
 from openseek.contribution import TelegramLibrarian
 from openseek.db import DB
@@ -225,6 +226,198 @@ def test_channel_mode_uploads_nvmt_tiles_and_retry_keeps_first_writer(tmp_path):
         assert duplicate.status_code == 200 and duplicate.json()["duplicate"] is True
         assert sum(bool(message.document_size) for message in store.messages) == 2
         assert sum(message.caption.startswith("openseek:hints:v1:") for message in store.messages) == 1
+    finally:
+        core.stop()
+
+
+class FakeProxyTransport(httpx.AsyncBaseTransport):
+    def __init__(self, status=201, body=None, *, error=False):
+        self.status, self.body, self.error = status, body, error
+        self.requests = []
+
+    async def handle_async_request(self, request):
+        data = await request.aread()
+        self.requests.append((request, data))
+        if self.error:
+            raise httpx.ConnectError("proxy test failure", request=request)
+        payload = self.body if self.body is not None else {"stored": True, "duplicate": False}
+        content = json.dumps(payload).encode("utf-8")
+        return httpx.Response(self.status, headers={"content-type": "application/json",
+                                                    "x-openseek-duration-ms": "20000"},
+                              content=content, request=request)
+
+
+def make_read_only_proxy_core(tmp_path, *, proxy_url="https://pool.example", librarian=""):
+    store = MemoryChannel()
+    store.can_post = False
+    settings = Settings(data_dir=tmp_path, pool_mode="channel", contribution=True,
+                        pool_contrib_url=proxy_url, pool_write_key="w" * 32, pool_timeout_s=2,
+                        librarian=librarian, telegram_api_id=123, telegram_api_hash="a" * 32,
+                        telegram_bot_token="123456:test", telegram_channel_id=store.channel_id)
+    core = Core(settings, pool_storage=store)
+    token = "B" * 43
+    core.auth.register("Proxy tester", hashlib.sha256(token.encode()).hexdigest())
+    return core, token
+
+
+def patch_pool_proxy_transport(monkeypatch, transport):
+    real_httpx = httpx
+    monkeypatch.setattr(app_module, "httpx", SimpleNamespace(
+        AsyncClient=lambda **kwargs: real_httpx.AsyncClient(transport=transport, **kwargs),
+        TimeoutException=real_httpx.TimeoutException,
+        HTTPError=real_httpx.HTTPError))
+
+
+def test_read_only_channel_streams_upload_to_configured_intake(monkeypatch, tmp_path):
+    transport = FakeProxyTransport()
+    patch_pool_proxy_transport(monkeypatch, transport)
+    core, token = make_read_only_proxy_core(tmp_path)
+    fp = hashlib.sha256(b"proxy upload").hexdigest()
+    payload = b"bounded nvmt package bytes"
+    app = create_api_app(core)
+
+    async def put():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                     base_url="https://openseek.test") as client:
+            return await client.put(
+                f"/v1/pool/{fp}/nvmt?profile=nvmt-v1-g5&duration_ms=20000&imdb=tt1234567",
+                content=payload,
+                headers={"Authorization": f"Bearer {token}",
+                         "Content-Type": "application/vnd.openseek.nvmt"})
+
+    try:
+        response = asyncio.run(put())
+        assert response.status_code == 201
+        assert response.json()["stored"] is True
+        assert len(transport.requests) == 1
+        proxied, proxied_body = transport.requests[0]
+        assert proxied.url.host == "pool.example"
+        assert proxied.url.path == f"/v1/pool/{fp}/nvmt"
+        assert proxied.url.params["profile"] == "nvmt-v1-g5"
+        assert proxied.headers["authorization"] == f"Bearer {'w' * 32}"
+        assert proxied.headers["content-type"] == "application/vnd.openseek.nvmt"
+        assert "content-length" not in proxied.headers
+        assert proxied_body == payload
+        assert core.db.q("SELECT COUNT(*) FROM pool_channel_tiles")[0][0] == 0
+        assert core.db.q("SELECT COUNT(*) FROM pool_hints")[0][0] == 0
+    finally:
+        core.stop()
+
+
+def test_read_only_proxy_upload_appears_after_shared_channel_refresh(monkeypatch, tmp_path):
+    host_store = MemoryChannel()
+    read_store = MemoryChannel()
+    read_store.messages = host_store.messages
+    read_store.data = host_store.data
+    read_store.can_post = False
+    host_settings = Settings(data_dir=tmp_path / "host", pool_mode="channel", contribution=True,
+                             pool_write_key="w" * 32, telegram_api_id=123,
+                             telegram_api_hash="a" * 32, telegram_bot_token="123456:host",
+                             telegram_channel_id=host_store.channel_id)
+    read_settings = Settings(data_dir=tmp_path / "reader", pool_mode="channel", contribution=True,
+                             pool_contrib_url="https://host.example", pool_write_key="w" * 32,
+                             telegram_api_id=123, telegram_api_hash="a" * 32,
+                             telegram_bot_token="123456:reader", telegram_channel_id=read_store.channel_id)
+    host = Core(host_settings, pool_storage=host_store)
+    reader = Core(read_settings, pool_storage=read_store)
+    host_app = create_api_app(host)
+    reader_app = create_api_app(reader)
+    real_httpx = httpx
+    monkeypatch.setattr(app_module, "httpx", SimpleNamespace(
+        AsyncClient=lambda **kwargs: real_httpx.AsyncClient(
+            transport=real_httpx.ASGITransport(app=host_app), **kwargs),
+        TimeoutException=real_httpx.TimeoutException,
+        HTTPError=real_httpx.HTTPError))
+    token = "C" * 43
+    reader.auth.register("Read-only contributor", hashlib.sha256(token.encode()).hexdigest())
+    fp = hashlib.sha256(b"proxied channel contribution").hexdigest()
+    image_a, image_b = jpeg((4, 5, 6)), jpeg((6, 5, 4))
+    package = encode_nvmt(5_000, 4, {0: (0, image_a), 2: (10_000, image_b)})
+
+    async def put():
+        async with real_httpx.AsyncClient(transport=real_httpx.ASGITransport(app=reader_app),
+                                          base_url="https://reader.example") as client:
+            return await client.put(
+                f"/v1/pool/{fp}/nvmt?profile=nvmt-v1-g5&duration_ms=20000&imdb=tt1234567"
+                "&season=0&episode=0&size_bytes=1000000&filename=Movie.Title.2024.mkv",
+                content=package, headers={"Authorization": f"Bearer {token}",
+                                          "Content-Type": "application/vnd.openseek.nvmt"})
+
+    try:
+        response = asyncio.run(put())
+        assert response.status_code == 201, response.text
+        assert reader.db.q("SELECT COUNT(*) FROM pool_channel_tiles")[0][0] == 0
+        assert reader.channel_index.refresh(force=True)["indexed"] == 2
+        read_package, _meta = reader.pool.package(fp, "nvmt-v1-g5")
+        assert read_package == package
+        candidates = reader.pool.candidates(duration_ms=20_000, imdb="tt1234567", season=0,
+                                           episode=0, filename="Movie.Title.2024.mkv")
+        assert [candidate["fp"] for candidate in candidates] == [fp]
+    finally:
+        host.stop()
+        reader.stop()
+
+
+@pytest.mark.parametrize("status,error_code", [(307, "contribute_redirect_refused"),
+                                                 (503, None), (0, "contribute_unavailable")])
+def test_read_only_proxy_relays_failures_without_following_redirects(
+        monkeypatch, tmp_path, status, error_code):
+    transport = FakeProxyTransport(status=status or 500, error=status == 0,
+                                   body={"error": "intake_failed"})
+    patch_pool_proxy_transport(monkeypatch, transport)
+    core, token = make_read_only_proxy_core(tmp_path)
+    fp = hashlib.sha256(f"proxy-failure-{status}".encode()).hexdigest()
+    app = create_api_app(core)
+
+    async def put():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                     base_url="https://openseek.test") as client:
+            return await client.put(f"/v1/pool/{fp}/nvmt?profile=nvmt-v1-g5&duration_ms=20000",
+                                    content=b"package", headers={
+                                        "Authorization": f"Bearer {token}",
+                                        "Content-Type": "application/vnd.openseek.nvmt"})
+
+    try:
+        response = asyncio.run(put())
+        if status == 503:
+            assert response.status_code == 503
+            assert response.json() == {"error": "intake_failed"}
+        else:
+            assert response.status_code == 502
+            assert response.json()["error"] == error_code
+        assert len(transport.requests) == 1
+        assert core.db.q("SELECT COUNT(*) FROM pool_channel_tiles")[0][0] == 0
+    finally:
+        core.stop()
+
+
+def test_read_only_channel_without_intake_returns_librarian_url(tmp_path):
+    core, token = make_read_only_proxy_core(tmp_path, proxy_url="",
+                                             librarian="https://t.me/openseek_librarian")
+    fp = hashlib.sha256(b"read-only no intake").hexdigest()
+    tile_data = jpeg()
+    digest = hashlib.sha256(tile_data).hexdigest()
+    core.channel_store.put_tile(tile_data, f"openseek:v1:{fp}:{PROFILE}:0:{digest}",
+                                {"pts_ms": 0, "duration_ms": 20_000, "n_tiles": 2})
+    core.channel_index.refresh(force=True)
+    app = create_api_app(core)
+
+    async def requests():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                     base_url="https://openseek.test") as client:
+            headers = {"Authorization": f"Bearer {token}"}
+            read = await client.get(f"/v1/pool/{fp}/tiles/0.jpg?profile={PROFILE}", headers=headers)
+            write = await client.put(f"/v1/pool/{fp}/nvmt?profile=nvmt-v1-g5&duration_ms=20000",
+                                     content=b"package", headers={
+                                         **headers, "Content-Type": "application/vnd.openseek.nvmt"})
+            return read, write
+
+    try:
+        read, response = asyncio.run(requests())
+        assert read.status_code == 200 and read.content == tile_data
+        assert response.status_code == 403
+        assert response.json() == {"error": "read_only_channel", "contribute_url": "https://t.me/openseek_librarian"}
+        assert core.db.q("SELECT COUNT(*) FROM pool_channel_tiles")[0][0] == 1
     finally:
         core.stop()
 
@@ -512,6 +705,20 @@ def test_pool_channel_writable_override_validation():
         Settings.from_env({"OPENSEEK_POOL_MODE": "channel", "OPENSEEK_POOL_CHANNEL_WRITABLE": "sometimes"})
 
 
+def test_channel_contribution_proxy_config_requires_https_and_write_key():
+    base = {"OPENSEEK_POOL_MODE": "channel", "OPENSEEK_TELEGRAM_API_ID": "123",
+            "OPENSEEK_TELEGRAM_API_HASH": "a" * 32, "OPENSEEK_TELEGRAM_BOT_TOKEN": "123456:test",
+            "OPENSEEK_TELEGRAM_CHANNEL_ID": "-100123"}
+    valid = Settings.from_env({**base, "OPENSEEK_POOL_CONTRIB_URL": "https://pool.example",
+                               "OPENSEEK_POOL_WRITE_KEY": "w" * 32})
+    assert valid.pool_contrib_url == "https://pool.example"
+    with pytest.raises(ConfigError, match="POOL_WRITE_KEY"):
+        Settings.from_env({**base, "OPENSEEK_POOL_CONTRIB_URL": "https://pool.example"})
+    with pytest.raises(ConfigError, match="POOL_CONTRIB_URL"):
+        Settings.from_env({**base, "OPENSEEK_POOL_CONTRIB_URL": "http://pool.example",
+                           "OPENSEEK_POOL_WRITE_KEY": "w" * 32})
+
+
 def test_channel_pool_status_reports_history_permissions_and_index_counts(tmp_path):
     store = MemoryChannel()
     store.entity_type = "broadcast"
@@ -540,7 +747,7 @@ def test_doctor_reports_live_channel_identity_and_permissions(monkeypatch, capsy
         "mode": "channel", "entity_resolved": True, "history_readable": True,
         "entity_type": "broadcast", "last_message_id": 17, "tiles": 3, "hints": 2,
         "librarian_status": "disabled", "detected_channel_writable": False,
-        "channel_writable": False,
+        "channel_writable": False, "contribution_path": "proxy",
     }))
 
     assert cli.main(["doctor"]) == 0
@@ -551,6 +758,7 @@ def test_doctor_reports_live_channel_identity_and_permissions(monkeypatch, capsy
     assert report["pool"]["detected_channel_writable"] is False
     assert report["pool"]["last_message_id"] == 17
     assert report["pool"]["librarian_status"] == "disabled"
+    assert report["contribution_path"] == "proxy"
 
 
 class FakeTelethonClient:
@@ -632,18 +840,20 @@ def test_mtproto_store_sync_facade_upload_scan_download(tmp_path):
         store.close()
 
 
-@pytest.mark.parametrize("override,expected", [("auto", False), ("1", True), ("0", False)])
-def test_mtproto_store_allows_read_only_channel_and_reports_write_override(tmp_path, override, expected):
+@pytest.mark.parametrize("override,detected,expected", [("auto", True, True), ("auto", False, False),
+                                                          ("1", False, True), ("0", True, False)])
+def test_mtproto_store_reports_detected_and_effective_write_permissions(
+        tmp_path, override, detected, expected):
     settings = Settings(data_dir=tmp_path, pool_mode="channel", contribution=True,
                         telegram_api_id=123, telegram_api_hash="a" * 32,
                         telegram_bot_token="123456:test", telegram_channel_id="-100123",
                         pool_channel_writable=override)
     fake = FakeTelethonClient()
-    fake.can_send = False
+    fake.can_send = detected
     store = TelegramMTProtoStore(settings, client_factory=lambda *_args, **_kwargs: fake)
     try:
         store.start()
-        assert store.detected_can_post is False
+        assert store.detected_can_post is detected
         assert store.can_post is expected
         assert store.entity_type == "megagroup"
         assert store.entity_resolved is True

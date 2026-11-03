@@ -174,6 +174,7 @@ class Settings:
     pool_enabled: bool = False
     pool_mode: str = ""                    # host | channel; empty is local-only except legacy POOL_ENABLED
     pool_url: str = ""
+    pool_contrib_url: str = ""
     pool_read_key: str = ""
     pool_write_key: str = ""
     pool_share: bool = False
@@ -276,6 +277,7 @@ class Settings:
             "POOL_ENABLED": ("pool_enabled", _bool),
             "POOL_MODE": ("pool_mode", str),
             "POOL_URL": ("pool_url", str),
+            "POOL_CONTRIB_URL": ("pool_contrib_url", str),
             "POOL_READ_KEY": ("pool_read_key", str),
             "POOL_WRITE_KEY": ("pool_write_key", str),
             "POOL_SHARE": ("pool_share", _bool),
@@ -303,11 +305,13 @@ class Settings:
                 mode_hint = "host" if _bool(env.get("OPENSEEK_POOL_ENABLED", "")) else "local"
             except ConfigError:
                 mode_hint = "host"       # the converter below reports the invalid legacy flag
-        host_only = {"POOL_ENABLED", "POOL_URL", "POOL_READ_KEY", "POOL_WRITE_KEY", "POOL_SHARE", "POOL_TIMEOUT_S"}
+        host_only = {"POOL_ENABLED", "POOL_URL", "POOL_READ_KEY", "POOL_SHARE"}
         channel_only = {"TELEGRAM_API_ID", "TELEGRAM_API_HASH", "TELEGRAM_SESSION", "TELEGRAM_SESSION_FILE",
                         "POOL_CHANNEL_SCAN_LIMIT", "POOL_INDEX_REFRESH_S", "CONTRIBUTION", "LIBRARIAN",
-                        "LIBRARIAN_KEY", "LIBRARIAN_ENABLED", "POOL_CHANNEL_WRITABLE"}
-        skip = host_only if mode_hint == "channel" else channel_only if mode_hint == "host" else host_only | channel_only
+                        "LIBRARIAN_KEY", "LIBRARIAN_ENABLED", "POOL_CHANNEL_WRITABLE", "POOL_CONTRIB_URL"}
+        shared_pool_only = {"POOL_WRITE_KEY", "POOL_TIMEOUT_S"}
+        skip = (host_only if mode_hint == "channel" else channel_only if mode_hint == "host" else
+                host_only | channel_only | shared_pool_only)
         kw = {}
         for suffix, (name, fn) in conv.items():
             if suffix in skip:
@@ -340,7 +344,7 @@ class Settings:
         s.validate()
         mode = s.effective_pool_mode
         if mode == "channel":
-            ignored = [key for key in ("POOL_URL", "POOL_READ_KEY", "POOL_WRITE_KEY", "POOL_SHARE", "POOL_ENABLED")
+            ignored = [key for key in ("POOL_URL", "POOL_READ_KEY", "POOL_SHARE", "POOL_ENABLED")
                        if env.get("OPENSEEK_" + key)]
             if ignored:
                 log.warning("channel pool mode ignores legacy host settings: %s", ", ".join(ignored))
@@ -348,7 +352,8 @@ class Settings:
             ignored = [key for key in ("POOL_URL", "POOL_READ_KEY", "POOL_WRITE_KEY", "POOL_SHARE", "POOL_ENABLED",
                                        "TELEGRAM_API_ID", "TELEGRAM_API_HASH", "TELEGRAM_SESSION",
                                        "TELEGRAM_SESSION_FILE", "POOL_CHANNEL_SCAN_LIMIT", "POOL_INDEX_REFRESH_S",
-                                       "CONTRIBUTION", "LIBRARIAN", "LIBRARIAN_KEY", "LIBRARIAN_ENABLED")
+                                       "POOL_CONTRIB_URL", "POOL_TIMEOUT_S", "CONTRIBUTION", "LIBRARIAN",
+                                       "LIBRARIAN_KEY", "LIBRARIAN_ENABLED")
                        if env.get("OPENSEEK_" + key)]
             if ignored:
                 log.warning("local-only mode ignores pool settings: %s", ", ".join(ignored))
@@ -406,6 +411,21 @@ class Settings:
                 raise ConfigError("OPENSEEK_POOL_URL must use HTTPS (HTTP is allowed only for loopback testing)")
             if parsed_pool.query or parsed_pool.fragment:
                 raise ConfigError("OPENSEEK_POOL_URL must not include a query or fragment")
+        if mode == "channel" and self.pool_contrib_url:
+            parsed_contrib = urlsplit(self.pool_contrib_url)
+            loopback_http = parsed_contrib.scheme == "http" and parsed_contrib.hostname in ("127.0.0.1", "localhost", "::1")
+            if ((parsed_contrib.scheme != "https" and not loopback_http) or not parsed_contrib.hostname or
+                    parsed_contrib.username or parsed_contrib.password or parsed_contrib.path not in ("", "/") or
+                    parsed_contrib.query or parsed_contrib.fragment):
+                raise ConfigError("OPENSEEK_POOL_CONTRIB_URL must be an HTTPS origin (HTTP is allowed only for loopback testing)")
+            try:
+                parsed_contrib.port
+            except ValueError:
+                raise ConfigError("OPENSEEK_POOL_CONTRIB_URL has an invalid port") from None
+            if len(self.pool_write_key) < 24:
+                raise ConfigError("OPENSEEK_POOL_CONTRIB_URL requires an OPENSEEK_POOL_WRITE_KEY of at least 24 characters")
+            if not 0.25 <= self.pool_timeout_s <= 15.0:
+                raise ConfigError("OPENSEEK_POOL_TIMEOUT_S must be 0.25..15 for contribution proxying")
         if mode == "host" and self.pool_url and (not self.pool_read_key or len(self.pool_read_key) < 24):
             raise ConfigError("OPENSEEK_POOL_URL requires an OPENSEEK_POOL_READ_KEY of at least 24 characters")
         if mode == "host" and self.pool_share and (not self.pool_url or len(self.pool_write_key) < 24):

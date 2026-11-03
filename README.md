@@ -148,8 +148,9 @@ All settings are environment variables read at start-up. Invalid values stop the
 | `OPENSEEK_POOL_MODE` | unset | `host` or `channel`; unset means local-only, except legacy `POOL_ENABLED=1` selects host mode |
 | `OPENSEEK_POOL_ENABLED` | `0` | Serve the existing shared-pool API (host mode); requires Telegram credentials and both keys |
 | `OPENSEEK_POOL_URL` | empty | Host-mode shared pool URL; HTTPS except loopback tests |
+| `OPENSEEK_POOL_CONTRIB_URL` | empty | Read-only channel upload proxy target; HTTPS origin plus `POOL_WRITE_KEY` |
 | `OPENSEEK_POOL_READ_KEY` | empty | Pool read secret, at least 24 characters |
-| `OPENSEEK_POOL_WRITE_KEY` | empty | Pool upload secret, at least 24 characters |
+| `OPENSEEK_POOL_WRITE_KEY` | empty | Pool upload or contribution proxy secret, at least 24 characters |
 | `OPENSEEK_POOL_SHARE` | `0` | Publish this instance's already-generated tiles to `POOL_URL` in host mode |
 | `OPENSEEK_POOL_TIMEOUT_S` | `2` | Per-request timeout for shared tile access |
 | `OPENSEEK_TELEGRAM_BOT_TOKEN` | empty | Telegram bot identity; secret |
@@ -159,6 +160,7 @@ All settings are environment variables read at start-up. Invalid values stop the
 | `OPENSEEK_TELEGRAM_SESSION_FILE` | `<data>/telegram/openseek.session` | Explicit mode-0600 user session file |
 | `OPENSEEK_POOL_CHANNEL_SCAN_LIMIT` | `2000` | Maximum Telegram messages scanned per pass |
 | `OPENSEEK_POOL_INDEX_REFRESH_S` | `300` | Channel index refresh interval in seconds |
+| `OPENSEEK_POOL_CHANNEL_WRITABLE` | `auto` | Detect channel post rights or override with `1` / `0` |
 | `OPENSEEK_CONTRIBUTION` | `0` | Opt in to channel-mode uploads |
 | `OPENSEEK_LIBRARIAN` | empty | `@bot` or HTTPS upload relay for channel contributions |
 | `OPENSEEK_LIBRARIAN_KEY` | empty | Optional bearer key for an HTTPS upload relay |
