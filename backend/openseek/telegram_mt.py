@@ -50,6 +50,8 @@ class TelegramMTProtoStore:
         self.can_post: bool | None = None
         self.post_permission_error = ""
         self.entity_type = "unknown"
+        self.entity_resolved = False
+        self.history_readable = False
         self._connected = False
         self._message_handler = None
         self._handler_attached = False
@@ -171,12 +173,17 @@ class TelegramMTProtoStore:
             raise _pool_error(exc) from exc
 
     async def _verify_entity(self, check_post: bool) -> None:
+        self.entity_resolved = False
+        self.history_readable = False
+        self.entity_type = "unknown"
         try:
             self._entity = await self._client.get_entity(self.channel_id)
+            self.entity_resolved = True
             is_broadcast = bool(getattr(self._entity, "broadcast", False))
             self.entity_type = "broadcast" if is_broadcast else "megagroup"
             async for _message in self._client.iter_messages(self._entity, limit=1):
                 break
+            self.history_readable = True
             try:
                 permissions = await self._client.get_permissions(self._entity, "me")
                 allowed = (getattr(permissions, "post_messages", False) if is_broadcast else

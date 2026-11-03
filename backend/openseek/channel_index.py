@@ -464,10 +464,16 @@ class ChannelIndex:
     def status(self) -> dict:
         state = self._state()
         count = self.db.q("SELECT COUNT(*) FROM pool_channel_tiles")
+        hint_count = self.db.q("SELECT COUNT(*) FROM pool_hints")
+        episode_count = self.db.q("SELECT COUNT(*) FROM pool_episode_packages")
         return {"channel_id": self.channel_id, "last_message_id": state[0] if state else 0,
                 "scanned_at": state[1] if state else 0, "tiles": int(count[0][0]) if count else 0,
+                "hints": int(hint_count[0][0]) if hint_count else 0,
+                "episode_packages": int(episode_count[0][0]) if episode_count else 0,
                 "last_error": self.last_error,
                 "entity_type": getattr(self.store, "entity_type", "unknown"),
+                "entity_resolved": getattr(self.store, "entity_resolved", None),
+                "history_readable": getattr(self.store, "history_readable", None),
                 "channel_writable": getattr(self.store, "can_post", None),
                 "detected_channel_writable": getattr(self.store, "detected_can_post", None),
                 "post_permission_error": getattr(self.store, "post_permission_error", "")}

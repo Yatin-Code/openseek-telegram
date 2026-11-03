@@ -49,6 +49,25 @@ New-NetFirewallRule -DisplayName "OpenSeek API (LAN only)" -Direction Inbound -A
 
 The router must not forward 8787 or 8788.
 
+### Optional: Telegram channel pool node
+
+A channel node reads shared JPEG tiles from a Telegram channel and serves them as NVMT packages. Create a Telegram bot, add it to the
+channel, and make sure it can read channel history. For a broadcast channel, grant post permission only if this node should publish
+contributions directly. Obtain the Telegram API ID and hash from `my.telegram.org`.
+
+Configure the server with `OPENSEEK_POOL_MODE=channel`, `OPENSEEK_TELEGRAM_API_ID`, `OPENSEEK_TELEGRAM_API_HASH`,
+`OPENSEEK_TELEGRAM_BOT_TOKEN`, and `OPENSEEK_TELEGRAM_CHANNEL_ID`, then start it normally. `OPENSEEK_POOL_CHANNEL_WRITABLE=auto`
+(the default) detects post permission; `1` or `0` overrides the detected value. Check the resolved entity, history access, indexed rows,
+and write capability with:
+
+```powershell
+python -m openseek doctor
+```
+
+If the channel cannot use a bot, configure `OPENSEEK_TELEGRAM_SESSION_FILE` and run `python -m openseek pool login` once from the
+same environment. The session file is private to the data directory and must remain available to the server process. The user account
+also needs channel history access; `doctor` reports whether the node can read and post.
+
 ### Admin secret
 
 The loopback admin API (port 8788) requires a per-install secret in the `X-OpenSeek-Admin` header. By default the server creates a random one in

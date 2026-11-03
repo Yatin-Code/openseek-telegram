@@ -1434,7 +1434,11 @@ def create_admin_app(core: Core) -> FastAPI:
     async def pool_status():
         mode = core.settings.effective_pool_mode
         if mode == "channel" and core.channel_index is not None:
-            result = {"mode": mode, **core.channel_index.status()}
+            librarian_status = ("attached" if core.librarian is not None and
+                                getattr(core.channel_store, "_handler_attached", True) else
+                                "disabled" if not core.settings.librarian_enabled else "unavailable")
+            result = {"mode": mode, **core.channel_index.status(),
+                      "librarian_status": librarian_status}
         elif mode == "host" and core.pool is not None:
             result = {"mode": mode, "api_enabled": True,
                       "api_url": f"https://{core.settings.public_host}" if core.settings.public_host else None,

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import io
 import json
@@ -17,6 +18,7 @@ from openseek.app import Core, create_api_app
 from openseek.cache import Cache, PROFILE
 from openseek.channel_pool import ChannelPoolService
 from openseek.channel_index import ChannelIndex
+from openseek import cli
 from openseek.config import ConfigError, MiB, Settings
 from openseek.contribution import TelegramLibrarian
 from openseek.db import DB
@@ -467,6 +469,47 @@ def test_pool_channel_writable_override_validation():
         Settings.from_env({"OPENSEEK_POOL_MODE": "channel", "OPENSEEK_POOL_CHANNEL_WRITABLE": "sometimes"})
 
 
+def test_channel_pool_status_reports_history_permissions_and_index_counts(tmp_path):
+    store = MemoryChannel()
+    store.entity_type = "broadcast"
+    store.entity_resolved = True
+    store.history_readable = True
+    store.detected_can_post = False
+    db, _cache = make_db_cache(tmp_path / "node")
+    try:
+        index = ChannelIndex(db, store)
+        status = index.status()
+        assert status["entity_type"] == "broadcast"
+        assert status["entity_resolved"] is True
+        assert status["history_readable"] is True
+        assert status["channel_writable"] is True
+        assert status["detected_channel_writable"] is False
+        assert status["tiles"] == status["hints"] == status["episode_packages"] == 0
+    finally:
+        db.close()
+
+
+def test_doctor_reports_live_channel_identity_and_permissions(monkeypatch, capsys, tmp_path):
+    settings = Settings(data_dir=tmp_path, pool_mode="channel", telegram_bot_token="123456:test",
+                        telegram_channel_id="-100123", pool_channel_writable="auto")
+    monkeypatch.setattr(cli.Settings, "from_env", lambda _env: settings)
+    monkeypatch.setattr(cli, "_admin", lambda *_args: (200, {
+        "mode": "channel", "entity_resolved": True, "history_readable": True,
+        "entity_type": "broadcast", "last_message_id": 17, "tiles": 3, "hints": 2,
+        "librarian_status": "disabled", "detected_channel_writable": False,
+        "channel_writable": False,
+    }))
+
+    assert cli.main(["doctor"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["telegram_identity"] == "bot"
+    assert report["pool"]["entity_resolved"] is True
+    assert report["pool"]["history_readable"] is True
+    assert report["pool"]["detected_channel_writable"] is False
+    assert report["pool"]["last_message_id"] == 17
+    assert report["pool"]["librarian_status"] == "disabled"
+
+
 class FakeTelethonClient:
     def __init__(self):
         self.messages = {}
@@ -553,6 +596,8 @@ def test_mtproto_store_allows_read_only_channel_and_reports_write_override(tmp_p
         assert store.detected_can_post is False
         assert store.can_post is expected
         assert store.entity_type == "megagroup"
+        assert store.entity_resolved is True
+        assert store.history_readable is True
     finally:
         store.close()
 
