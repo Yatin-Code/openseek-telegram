@@ -299,7 +299,11 @@ class ChannelIndex:
             inserted = self.db.x(
                 "INSERT INTO pool_hints(fp,profile,imdb,season,episode,duration_ms,size_bytes,filename_norm,n_tiles,grid,created) "
                 "VALUES(?,?,?,?,?,?,?,?,?,?,?) "
-                "ON CONFLICT(fp,profile) DO NOTHING",
+                "ON CONFLICT(fp,profile) DO UPDATE SET "
+                "imdb=excluded.imdb,season=excluded.season,episode=excluded.episode,"
+                "duration_ms=excluded.duration_ms,size_bytes=excluded.size_bytes,"
+                "filename_norm=excluded.filename_norm,n_tiles=excluded.n_tiles,"
+                "grid=excluded.grid,created=excluded.created",
                 (fp, profile, validated["imdb"], validated["season"], validated["episode"],
                  validated["duration_ms"], validated["size_bytes"], validated["filename_norm"],
                  n_tiles, grid, manifest_created))

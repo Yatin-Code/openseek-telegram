@@ -17,6 +17,45 @@ from .pool import (MAX_DURATION_MS, MAX_NVMT_BYTES, NVMT_PROFILES, PoolError,
 from .scheduler import tile_count
 
 
+class PoolWritePolicy:
+    """Choose the write path from pool mode and the channel's post rights."""
+
+    def __init__(self, mode: str, *, can_post: bool = False,
+                 store=None, proxy_url: str = "", librarian_url: str = ""):
+        self.mode = mode
+        self.can_post = can_post
+        self.store = store
+        self.proxy_url = proxy_url
+        self.librarian_url = librarian_url
+
+    def _can_post(self) -> bool:
+        if self.store is not None:
+            return getattr(self.store, "can_post", None) is True
+        return self.can_post
+
+    def path(self, *, package: bool = False) -> str:
+        if self.mode != "channel" or self._can_post():
+            return "direct"
+        if package and self.proxy_url:
+            return "proxy"
+        return "read_only"
+
+    def contribution_path(self) -> str:
+        if self.mode != "channel":
+            return "unavailable"
+        if self._can_post():
+            return "direct"
+        return "proxy" if self.proxy_url else self.librarian_url or "unavailable"
+
+    def allows_device_write(self, *, role: str | None, contribution_enabled: bool,
+                            can_contribute: bool) -> bool:
+        if self.mode != "channel":
+            return False
+        if role == "owner" and contribution_enabled:
+            return True
+        return can_contribute
+
+
 class ChannelPoolService:
     """Expose the same read contract as PoolService over channel-indexed tile documents."""
 
@@ -59,13 +98,26 @@ class ChannelPoolService:
         return data, {"pts_ms": row["pts_ms"], "duration_ms": row["duration_ms"],
                       "n_tiles": row["n_tiles"], "sha256": row["sha256"], "profile": profile}
 
-    def package(self, fp: str, profile: str) -> tuple[bytes, dict] | None:
+    def package(self, fp: str, profile: str, duration_ms: int | None = None) -> tuple[bytes, dict] | None:
         if not is_fingerprint(fp) or profile not in NVMT_PROFILES:
             raise PoolError(400, "bad_key")
         manifest = self.index.manifest(fp, PROFILE)
-        if manifest is None or manifest["duration_ms"] <= 0 or manifest["n_tiles"] <= 0:
+        if manifest is None:
             return None
-        duration = int(manifest["duration_ms"])
+        manifest_duration = int(manifest["duration_ms"])
+        if duration_ms is not None and (type(duration_ms) is not int or
+                                        not 0 < duration_ms <= MAX_DURATION_MS):
+            raise PoolError(400, "bad_duration")
+        if manifest_duration > 0:
+            if duration_ms is not None and duration_ms != manifest_duration:
+                return None
+            duration = manifest_duration
+        elif duration_ms is not None:
+            # Older Telegram posts don't carry duration in the document name.
+            # The exact-fp client already knows the source media duration.
+            duration = duration_ms
+        else:
+            return None
         grid = NVMT_PROFILES[profile]
         n_slots = (duration + grid - 1) // grid
         tile_step = TILE_INTERVAL_MS // grid
@@ -73,13 +125,13 @@ class ChannelPoolService:
         for item in manifest["tiles"]:
             k = int(item["k"])
             slot = k * tile_step
+            if slot >= n_slots:
+                continue
             got = self.tile(fp, PROFILE, k)
             if got is None:
                 continue
             data, meta = got
-            if meta["duration_ms"] == 0:
-                continue
-            if meta["duration_ms"] != duration or slot >= n_slots:
+            if (meta["duration_ms"] not in (0, duration) or meta["pts_ms"] > duration):
                 raise PoolError(502, "stored_tile_corrupt")
             tiles[slot] = (int(meta["pts_ms"]), data)
         if not tiles:
@@ -236,4 +288,3 @@ class ChannelPoolService:
             if not filename:
                 raise PoolError(400, "manifest_too_large")
             manifest["filename"] = filename[:max(0, len(filename) - 20)]
-

@@ -17,7 +17,7 @@ import httpx
 
 from openseek.app import Core, create_api_app
 from openseek.cache import Cache, PROFILE
-from openseek.channel_pool import ChannelPoolService
+from openseek.channel_pool import ChannelPoolService, PoolWritePolicy
 from openseek.channel_index import ChannelIndex
 from openseek import cli
 import openseek.app as app_module
@@ -148,12 +148,16 @@ def test_channel_mode_serves_pool_routes_from_index(tmp_path):
                         telegram_bot_token="123456:test", telegram_channel_id=store.channel_id)
     core = Core(settings, pool_storage=store)
     fp = hashlib.sha256(b"channel mode nvmt source").hexdigest()
+    legacy_fp = hashlib.sha256(b"metadata-less channel mode nvmt source").hexdigest()
     episode_key = hashlib.sha256(b"channel mode episode key").hexdigest()
     tiles = [jpeg((12, 34, 56)), jpeg((56, 34, 12))]
     for k, data in enumerate(tiles):
         digest = hashlib.sha256(data).hexdigest()
         store.put_tile(data, f"openseek:v1:{fp}:{PROFILE}:{k}:{digest}",
                        {"pts_ms": k * 10_000, "duration_ms": 20_000, "n_tiles": 2})
+    legacy_tile = jpeg((90, 80, 70))
+    legacy_digest = hashlib.sha256(legacy_tile).hexdigest()
+    store.put_tile(legacy_tile, f"openseek:v1:{legacy_fp}:{PROFILE}:0:{legacy_digest}")
     core.channel_index.refresh(force=True)
 
     device_token = "A" * 43
@@ -168,17 +172,24 @@ def test_channel_mode_serves_pool_routes_from_index(tmp_path):
             tile = await client.get(f"/v1/pool/{fp}/tiles/1.jpg?profile={PROFILE}", headers=headers)
             full = await client.get(f"/v1/pool/{fp}/nvmt?profile=nvmt-v1-g5&episode_key={episode_key}",
                                     headers=headers)
+            legacy = await client.get(
+                f"/v1/pool/{legacy_fp}/nvmt?profile=nvmt-v1-g5&duration_ms=20000", headers=headers)
+            legacy_without_duration = await client.get(
+                f"/v1/pool/{legacy_fp}/nvmt?profile=nvmt-v1-g5", headers=headers)
             sparse = await client.get(f"/v1/pool/{fp}/nvmt?profile=nvmt-v1-g5&slots=0,2", headers=headers)
             candidates = await client.get(f"/v1/pool/episodes/{episode_key}?duration_ms=20000", headers=headers)
             missing = await client.get(f"/v1/pool/{'f' * 64}/nvmt?profile=nvmt-v1-g5", headers=headers)
-        return manifest, tile, full, sparse, candidates, missing
+        return manifest, tile, full, legacy, legacy_without_duration, sparse, candidates, missing
 
     try:
-        manifest, tile, full, sparse, candidates, missing = asyncio.run(requests())
+        manifest, tile, full, legacy, legacy_without_duration, sparse, candidates, missing = asyncio.run(requests())
         assert manifest.status_code == 200
         assert [item["k"] for item in manifest.json()["tiles"]] == [0, 1]
         assert tile.status_code == 200 and tile.content == tiles[1]
         assert full.status_code == 200
+        assert legacy.status_code == 200
+        assert decode_nvmt(legacy_fp, "nvmt-v1-g5", 20_000, legacy.content)[2] == {0: (0, legacy_tile)}
+        assert legacy_without_duration.status_code == 404
         assert sparse.status_code == 200
         assert full.content == sparse.content
         assert candidates.status_code == 200
@@ -187,6 +198,22 @@ def test_channel_mode_serves_pool_routes_from_index(tmp_path):
         assert core.jobs.running_sources() == []
     finally:
         core.stop()
+
+
+def test_pool_write_policy_keeps_device_writes_channel_only():
+    host = PoolWritePolicy("host")
+    channel_read_only = PoolWritePolicy("channel", can_post=False)
+    channel_writable = PoolWritePolicy("channel", can_post=True)
+    assert host.path() == "direct"
+    assert not host.allows_device_write(role="guest", contribution_enabled=True, can_contribute=True)
+    assert channel_read_only.path() == "read_only"
+    assert not channel_read_only.allows_device_write(
+        role="owner", contribution_enabled=False, can_contribute=False)
+    assert channel_read_only.allows_device_write(
+        role="guest", contribution_enabled=True, can_contribute=True)
+    assert channel_writable.path() == "direct"
+    assert channel_writable.allows_device_write(
+        role="owner", contribution_enabled=True, can_contribute=False)
 
 
 def test_channel_mode_uploads_nvmt_tiles_and_retry_keeps_first_writer(tmp_path):
@@ -960,20 +987,27 @@ def test_librarian_accepts_nvmt_package_and_reposts_tiles(tmp_path):
         db.close()
 
 
-def test_manifest_first_writer_preserves_original_catalog_hints(tmp_path):
-    db, _ = make_db_cache(tmp_path / "first_manifest")
+def test_latest_manifest_wins_and_updated_hints_survive_rebuild(tmp_path):
+    db, _ = make_db_cache(tmp_path / "latest_manifest")
+    store = MemoryChannel()
     try:
-        index = ChannelIndex(db, MemoryChannel())
+        index = ChannelIndex(db, store)
         first = {
             "v": 1, "fp": "f" * 64, "profile": "nvmt-v1-g10", "imdb": "tt1234567",
             "season": 1, "episode": 2, "duration_ms": 20_000, "size_bytes": 100_000,
             "filename": "first.s01e02.mkv", "n_tiles": 2, "grid": 10_000, "created": 1,
         }
         conflicting = {**first, "imdb": "tt7654321", "filename": "other.mkv", "created": 2}
-        assert index.record_manifest(first)
-        assert not index.record_manifest(conflicting)
+        store.post_message(ChannelPoolService._manifest_caption(first))
+        assert index.refresh(force=True)["scanned"] == 1
+        store.post_message(ChannelPoolService._manifest_caption(conflicting))
+        assert index.refresh(force=True)["scanned"] == 1
         stored = db.q("SELECT imdb,filename_norm FROM pool_hints WHERE fp=?", (first["fp"],))[0]
-        assert stored == ("tt1234567", "first.s01e02")
+        assert stored == ("tt7654321", "other")
+        index.rebuild()
+        stored_after_rebuild = db.q(
+            "SELECT imdb,filename_norm FROM pool_hints WHERE fp=?", (first["fp"],))[0]
+        assert stored_after_rebuild == stored
     finally:
         db.close()
 

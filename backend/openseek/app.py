@@ -46,7 +46,7 @@ from .public import PublicLimiter, classify
 from .pool import (MAX_NVMT_BYTES, ChannelPoolClient, ChannelPoolSync, PoolClient,
                    PoolError, PoolService, PoolSync, TelegramBotStore)
 from .channel_index import ChannelIndex
-from .channel_pool import ChannelPoolService
+from .channel_pool import ChannelPoolService, PoolWritePolicy
 from .telegram_mt import TelegramMTProtoStore
 from .contribution import TelegramLibrarian
 from .contrib import ContributionPolicy, Spacing, clean_hosts
@@ -87,12 +87,18 @@ class Core:
         self.channel_index = None
         self.librarian = None
         mode = settings.effective_pool_mode
+        self.pool_write_policy = PoolWritePolicy(mode)
         if settings.pool_host_enabled:
             storage = pool_storage or TelegramBotStore(settings.telegram_bot_token, settings.telegram_channel_id,
                                                        settings.upstream_timeout_s)
             self.pool = PoolService(self.db, storage, settings.pool_read_key, settings.pool_write_key)
         if mode == "channel":
             self.channel_store = pool_storage or TelegramMTProtoStore(settings)
+            self.pool_write_policy = PoolWritePolicy(
+                mode,
+                store=self.channel_store,
+                proxy_url=settings.pool_contrib_url,
+                librarian_url=_librarian_url(settings) or "")
             self.channel_index = ChannelIndex(
                 self.db, self.channel_store, channel_id=settings.telegram_channel_id,
                 scan_limit=settings.pool_channel_scan_limit, refresh_s=settings.pool_index_refresh_s)
@@ -628,10 +634,11 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
         if pool.authorize(pool_key(request), write=True):
             return None
         device_id = request.state.device_id
-        if core.settings.effective_pool_mode == "channel":
-            role = core.auth.role_of(device_id) if device_id is not None else None
-            if ((role == "owner" and core.settings.contribution) or core.can_contribute(device_id)):
-                return None
+        role = core.auth.role_of(device_id) if device_id is not None else None
+        if core.pool_write_policy.allows_device_write(
+                role=role, contribution_enabled=core.settings.contribution,
+                can_contribute=core.can_contribute(device_id)):
+            return None
         if device_id is not None and core.auth.role_of(device_id) == "guest":
             return err(403, "not_contribute")
         return err(403, "forbidden")
@@ -957,8 +964,7 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
         denied = pool_write_denial(request, pool)
         if denied is not None:
             return denied
-        if (core.settings.effective_pool_mode == "channel" and
-                getattr(core.channel_store, "can_post", None) is not True):
+        if core.pool_write_policy.path() != "direct":
             return read_only_channel_response()
         k = parse_index(name[:-4], 999_999) if name.endswith(".jpg") else None
         if k is None or request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "image/jpeg":
@@ -1125,7 +1131,11 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
         try:
             slots_text = request.query_params.get("slots")
             if slots_text is None:
-                got = await asyncio.to_thread(pool.package, fp, profile)
+                if isinstance(pool, ChannelPoolService) and "duration_ms" in request.query_params:
+                    duration_ms = int(request.query_params["duration_ms"])
+                    got = await asyncio.to_thread(pool.package, fp, profile, duration_ms)
+                else:
+                    got = await asyncio.to_thread(pool.package, fp, profile)
             else:
                 parts = slots_text.split(",")
                 if not 1 <= len(parts) <= 12 or any(not p.isdigit() for p in parts):
@@ -1160,10 +1170,10 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
         media_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
         if media_type not in ("application/vnd.openseek.nvmt", "application/octet-stream"):
             return err(400, "bad_request")
-        if (core.settings.effective_pool_mode == "channel" and
-                getattr(core.channel_store, "can_post", None) is not True):
-            if core.settings.pool_contrib_url:
-                return await proxy_channel_upload(request, fp)
+        write_path = core.pool_write_policy.path(package=True)
+        if write_path == "proxy":
+            return await proxy_channel_upload(request, fp)
+        if write_path == "read_only":
             return read_only_channel_response()
         try:
             profile = request.query_params.get("profile", "")
@@ -1590,9 +1600,7 @@ def create_admin_app(core: Core) -> FastAPI:
                                 "disabled" if not core.settings.librarian_enabled else "unavailable")
             result = {"mode": mode, **core.channel_index.status(),
                       "librarian_status": librarian_status,
-                      "contribution_path": ("direct" if getattr(core.channel_store, "can_post", None) is True else
-                                            "proxy" if core.settings.pool_contrib_url else
-                                            _librarian_url(core.settings) or "unavailable")}
+                      "contribution_path": core.pool_write_policy.contribution_path()}
         elif mode == "host" and core.pool is not None:
             result = {"mode": mode, "api_enabled": True,
                       "api_url": f"https://{core.settings.public_host}" if core.settings.public_host else None,
