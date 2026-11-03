@@ -123,7 +123,7 @@ class TelegramLibrarian:
                 await self._delete(event)
                 return
             await self._delete(event)
-            log.info("librarian reposted tile fp=%s tile=%d", fp[:8], k)
+            log.info("librarian reposted tile=%d", k)
         except Exception as exc:
             log.warning("librarian repost failed (%s)", type(exc).__name__)
 
@@ -279,7 +279,7 @@ class TelegramLibrarian:
 
         await self._delete(event)
         await self._reply_sender(store, sender_id, f"Accepted package for {fp[:8]} ({len(posted_messages)} tiles)")
-        log.info("librarian accepted and reposted package fp=%s (%d tiles)", fp[:8], len(posted_messages))
+        log.info("librarian accepted and reposted package (%d tiles)", len(posted_messages))
 
     @staticmethod
     def _compute_work_key(imdb: str | None, season: int, episode: int) -> str:

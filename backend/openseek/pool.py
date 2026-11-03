@@ -671,7 +671,7 @@ class PoolService:
                 except PoolError as exc:
                     if exc.code not in ("stored_tile_corrupt", "telegram_file_not_found"):
                         raise
-                    log.warning("pool tile rows unusable for %s; serving sparse from the package", fp[:12])
+                    log.warning("pool tile rows unusable; serving sparse from the package")
         got = self.package(fp, profile)
         if got is None:
             return None
@@ -984,7 +984,7 @@ class PoolSync:
                 delay = min(300, 2 ** min(attempts, 8))
                 self.db.x("UPDATE pool_outbox SET attempts=?,retry_after=? WHERE fp=? AND k=?",
                           (attempts, time.time() + delay, fp, k))
-                log.info("pool upload deferred fp=%s tile=%d retry_s=%d", fp[:8], k, delay)
+                log.info("pool upload deferred tile=%d retry_s=%d", k, delay)
 
 
 class ChannelPoolClient:
@@ -1141,8 +1141,8 @@ class ChannelPoolSync:
                 delay = min(300, 2 ** min(attempts, 8))
                 self.db.x("UPDATE pool_channel_outbox SET attempts=?,retry_after=? WHERE fp=? AND k=?",
                           (attempts, time.time() + delay, fp, k))
-                log.info("channel upload deferred fp=%s tile=%d retry_s=%d (%s)",
-                         fp[:8], k, delay, type(exc).__name__)
+                log.info("channel upload deferred tile=%d retry_s=%d (%s)",
+                         k, delay, type(exc).__name__)
 
     def status(self) -> dict:
         return {"pending": self.pending(), "last_error": self.last_error}
@@ -1174,7 +1174,7 @@ class ChannelPoolSync:
         current = self.index.lookup(fp, PROFILE, k)
         if current is not None:
             if current["sha256"] != digest:
-                log.info("channel tile conflict fp=%s tile=%d; existing tile kept", fp[:8], k)
+                log.info("channel tile conflict at tile=%d; existing tile kept", k)
             self.db.x("DELETE FROM pool_channel_outbox WHERE fp=? AND k=?", (fp, k))
             return
         caption = f"openseek:v1:{fp}:{PROFILE}:{k}:{digest}"
