@@ -11,7 +11,7 @@ from .cache import PROFILE
 from .db import DB
 from .ids import is_fingerprint
 from .pool import (MAX_DURATION_MS, MAX_TILE_BYTES, NVMT_PROFILES, PoolError,
-                   TILE_INTERVAL_MS, _EPISODE_KEY, _tile_metadata_from_filename,
+                   TILE_INTERVAL_MS, _EPISODE_KEY, _timing_relation, _tile_metadata_from_filename,
                    encode_nvmt, validate_tile)
 from .scheduler import tile_count
 
@@ -257,7 +257,30 @@ class ChannelIndex:
     def episode_candidates(self, episode_key: str, duration_ms: int, limit: int = 8) -> list[dict]:
         if not _EPISODE_KEY.fullmatch(episode_key or "") or not isinstance(duration_ms, int) or duration_ms <= 0:
             raise PoolError(400, "bad_episode_key")
-        return []
+        tolerance = max(90_000, int(duration_ms * 0.15))
+        rows = self.db.q(
+            "SELECT e.fp,e.profile,e.duration_ms,e.updated,COUNT(c.k) "
+            "FROM pool_episode_packages e JOIN pool_channel_tiles c ON c.fp=e.fp AND c.profile=? "
+            "WHERE e.episode_key=? AND e.duration_ms>0 AND ABS(e.duration_ms-?)<=? "
+            "GROUP BY e.fp,e.profile,e.duration_ms,e.updated "
+            "ORDER BY ABS(e.duration_ms-?) ASC,e.updated DESC LIMIT ?",
+            (PROFILE, episode_key, duration_ms, tolerance, duration_ms, max(1, min(limit, 8))))
+        candidates = []
+        for fp, profile, source_ms, updated, n_tiles in rows:
+            grid = NVMT_PROFILES.get(profile)
+            timing = _timing_relation(duration_ms, int(source_ms))
+            if grid is None or timing is None:
+                continue
+            relation, a_num, a_den = timing
+            candidates.append({
+                "fp": fp, "profile": profile, "duration_ms": int(source_ms),
+                "duration_delta_ms": abs(int(source_ms) - duration_ms),
+                "n_slots": (int(source_ms) + grid - 1) // grid, "n_tiles": int(n_tiles),
+                "score": {"same_length": 100, "speed_24_25": 95, "length_differs": 90}[relation],
+                "match": "episode_key+duration", "relation": relation, "approximate": True,
+                "a_num": a_num, "a_den": a_den, "b_ms": 0, "source_duration_ms": int(source_ms),
+            })
+        return candidates
 
     def package_slots(self, fp: str, profile: str, slots: list[int]) -> tuple[bytes, dict] | None:
         if not slots or len(slots) > 12 or any(not isinstance(slot, int) or slot < 0 for slot in slots):

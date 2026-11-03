@@ -44,6 +44,7 @@ from .public import PublicLimiter, classify
 from .pool import (MAX_NVMT_BYTES, ChannelPoolClient, ChannelPoolSync, PoolClient,
                    PoolError, PoolService, PoolSync, TelegramBotStore)
 from .channel_index import ChannelIndex
+from .channel_pool import ChannelPoolService
 from .telegram_mt import TelegramMTProtoStore
 from .contribution import TelegramLibrarian
 from .contrib import ContributionPolicy, Spacing, clean_hosts
@@ -93,6 +94,7 @@ class Core:
             self.channel_index = ChannelIndex(
                 self.db, self.channel_store, channel_id=settings.telegram_channel_id,
                 scan_limit=settings.pool_channel_scan_limit, refresh_s=settings.pool_index_refresh_s)
+            self.pool = ChannelPoolService(self.channel_index)
             if settings.librarian_enabled and hasattr(self.channel_store, "set_message_handler"):
                 self.librarian = TelegramLibrarian(self.channel_store, self.channel_index)
                 self.librarian.attach()
@@ -1414,7 +1416,7 @@ def create_admin_app(core: Core) -> FastAPI:
 
     @app.post("/admin/pool/purge")
     async def pool_purge(body: PoolPurgeIn):
-        if core.pool is None:
+        if core.pool is None or core.settings.effective_pool_mode != "host":
             return err(404, "not_found")
         try:
             return await asyncio.to_thread(

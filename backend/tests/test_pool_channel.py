@@ -4,15 +4,18 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import io
+import json
 import stat
 from pathlib import Path
 from types import SimpleNamespace
 
 from PIL import Image
 import pytest
+import httpx
 
-from openseek.app import Core
+from openseek.app import Core, create_api_app
 from openseek.cache import Cache, PROFILE
+from openseek.channel_pool import ChannelPoolService
 from openseek.channel_index import ChannelIndex
 from openseek.config import ConfigError, MiB, Settings
 from openseek.contribution import TelegramLibrarian
@@ -119,6 +122,54 @@ def test_two_independent_channel_instances_share_a_tile_and_rebuild(tmp_path):
     finally:
         db_a.close()
         db_b.close()
+
+
+def test_channel_mode_serves_pool_routes_from_index(tmp_path):
+    store = MemoryChannel()
+    settings = Settings(data_dir=tmp_path, pool_mode="channel", contribution=True,
+                        telegram_api_id=123, telegram_api_hash="a" * 32,
+                        telegram_bot_token="123456:test", telegram_channel_id=store.channel_id)
+    core = Core(settings, pool_storage=store)
+    fp = hashlib.sha256(b"channel mode nvmt source").hexdigest()
+    episode_key = hashlib.sha256(b"channel mode episode key").hexdigest()
+    tiles = [jpeg((12, 34, 56)), jpeg((56, 34, 12))]
+    for k, data in enumerate(tiles):
+        digest = hashlib.sha256(data).hexdigest()
+        store.put_tile(data, f"openseek:v1:{fp}:{PROFILE}:{k}:{digest}",
+                       {"pts_ms": k * 10_000, "duration_ms": 20_000, "n_tiles": 2})
+    core.channel_index.refresh(force=True)
+
+    device_token = "A" * 43
+    core.auth.register("Channel TV", hashlib.sha256(device_token.encode()).hexdigest())
+    app = create_api_app(core)
+
+    async def requests():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                     base_url="https://openseek.test") as client:
+            headers = {"Authorization": f"Bearer {device_token}"}
+            manifest = await client.get(f"/v1/pool/{fp}/manifest?profile={PROFILE}", headers=headers)
+            tile = await client.get(f"/v1/pool/{fp}/tiles/1.jpg?profile={PROFILE}", headers=headers)
+            full = await client.get(f"/v1/pool/{fp}/nvmt?profile=nvmt-v1-g5&episode_key={episode_key}",
+                                    headers=headers)
+            sparse = await client.get(f"/v1/pool/{fp}/nvmt?profile=nvmt-v1-g5&slots=0,2", headers=headers)
+            candidates = await client.get(f"/v1/pool/episodes/{episode_key}?duration_ms=20000", headers=headers)
+            missing = await client.get(f"/v1/pool/{'f' * 64}/nvmt?profile=nvmt-v1-g5", headers=headers)
+        return manifest, tile, full, sparse, candidates, missing
+
+    try:
+        manifest, tile, full, sparse, candidates, missing = asyncio.run(requests())
+        assert manifest.status_code == 200
+        assert [item["k"] for item in manifest.json()["tiles"]] == [0, 1]
+        assert tile.status_code == 200 and tile.content == tiles[1]
+        assert full.status_code == 200
+        assert sparse.status_code == 200
+        assert full.content == sparse.content
+        assert candidates.status_code == 200
+        assert [item["fp"] for item in candidates.json()["candidates"]] == [fp]
+        assert missing.status_code == 404 and missing.json()["error"] == "not_found"
+        assert core.jobs.running_sources() == []
+    finally:
+        core.stop()
 
 
 def test_first_writer_wins_and_losing_outbox_is_cleared(tmp_path):
@@ -235,7 +286,7 @@ def test_pool_mode_compatibility_and_local_only(tmp_path):
 
     channel_core = Core(channel.with_(data_dir=tmp_path / "channel"), pool_storage=MemoryChannel())
     try:
-        assert channel_core.pool is None
+        assert isinstance(channel_core.pool, ChannelPoolService)
         assert isinstance(channel_core.pool_client, ChannelPoolClient)
     finally:
         channel_core.stop()
