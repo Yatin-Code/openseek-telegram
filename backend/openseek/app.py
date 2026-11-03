@@ -923,6 +923,29 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
         return JSONResponse(result, status_code=200 if result["duplicate"] else 201,
                             headers={"Cache-Control": "no-store"})
 
+    @app.get("/v1/pool/candidates")
+    async def pool_candidates(request: Request):
+        pool = core.pool
+        if pool is None:
+            return err(404, "not_found")
+        if not pool_allowed(request, pool):
+            return err(403, "forbidden")
+        try:
+            q = request.query_params
+            size_text = q.get("size_bytes")
+            candidates = await asyncio.to_thread(
+                pool.candidates,
+                duration_ms=int(q.get("duration_ms", "")),
+                imdb=q.get("imdb"), season=int(q.get("season", "0")),
+                episode=int(q.get("episode", "0")),
+                size_bytes=int(size_text) if size_text is not None else None,
+                filename=q.get("filename"), exclude_fp=q.get("exclude_fp"))
+        except ValueError:
+            return err(400, "bad_request")
+        except PoolError as exc:
+            return err(exc.status, exc.code)
+        return JSONResponse({"candidates": candidates}, headers={"Cache-Control": "no-store"})
+
     @app.get("/v1/pool/episodes/{episode_key}")
     async def pool_episode_candidates(request: Request, episode_key: str):
         pool = core.pool
@@ -989,8 +1012,16 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
             profile = request.query_params.get("profile", "")
             duration_ms = int(request.query_params.get("duration_ms", ""))
             episode_key = request.query_params.get("episode_key")
+            imdb = request.query_params.get("imdb")
+            season = int(request.query_params.get("season", "0"))
+            episode = int(request.query_params.get("episode", "0"))
+            size_text = request.query_params.get("size_bytes")
+            size_bytes = int(size_text) if size_text is not None else None
+            filename = request.query_params.get("filename")
             data = await request.body()
-            result = await asyncio.to_thread(pool.upload_package, fp, profile, duration_ms, data, episode_key)
+            result = await asyncio.to_thread(
+                pool.upload_package, fp, profile, duration_ms, data, episode_key,
+                imdb=imdb, season=season, episode=episode, size_bytes=size_bytes, filename=filename)
         except ValueError:
             return err(400, "bad_request")
         except PoolError as exc:

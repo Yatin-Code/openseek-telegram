@@ -11,11 +11,13 @@ import http.client
 import io
 import json
 import logging
+import math
 import re
 import secrets
 import socket
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -36,7 +38,56 @@ MAX_DURATION_MS = 12 * 60 * 60 * 1000
 TILE_INTERVAL_MS = 10_000
 NVMT_PROFILES = {"nvmt-v1-g5": 5_000, "nvmt-v1-g10": 10_000}
 _EPISODE_KEY = re.compile(r"[0-9a-f]{64}\Z")
+_IMDB_ID = re.compile(r"tt\d{1,10}\Z")
 _TILE_FILENAME = re.compile(r"^openseek-tile-v1-(\d+)-(\d+)-(\d+)\.jpg$")
+
+
+def normalize_hint_filename(filename: str | None) -> str | None:
+    """Reduce a supplied basename to a bounded, title-like lookup hint."""
+    if filename is None:
+        return None
+    if not isinstance(filename, str) or len(filename.encode("utf-8")) > 200:
+        raise PoolError(400, "bad_hints")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in filename):
+        raise PoolError(400, "bad_hints")
+    basename = filename.replace("\\", "/").rsplit("/", 1)[-1]
+    suffix = basename.rsplit(".", 1)[-1].lower() if "." in basename else ""
+    video_extensions = {"mkv", "mp4", "avi", "mov", "webm", "m4v", "ts", "wmv", "mpg", "mpeg"}
+    stem = basename[:-(len(suffix) + 1)] if suffix in video_extensions else basename
+    normalized = unicodedata.normalize("NFKC", stem).lower()
+    normalized = re.sub(r"[^a-z0-9]+", ".", normalized).strip(".")[:200].strip(".")
+    return normalized or None
+
+
+def validate_pool_hints(imdb: str | None, season: int, episode: int, duration_ms: int,
+                        size_bytes: int | None, filename: str | None) -> dict:
+    if imdb is not None and not _IMDB_ID.fullmatch(imdb):
+        raise PoolError(400, "bad_hints")
+    if (not isinstance(season, int) or not 0 <= season <= 9999 or
+            not isinstance(episode, int) or not 0 <= episode <= 9999):
+        raise PoolError(400, "bad_hints")
+    if not isinstance(duration_ms, int) or not 1 <= duration_ms <= MAX_DURATION_MS:
+        raise PoolError(400, "bad_hints")
+    if size_bytes is not None and (not isinstance(size_bytes, int) or size_bytes < 0):
+        raise PoolError(400, "bad_hints")
+    filename_norm = normalize_hint_filename(filename)
+    return {"imdb": imdb, "season": season, "episode": episode, "duration_ms": duration_ms,
+            "size_bytes": size_bytes, "filename_norm": filename_norm}
+
+
+def _timing_relation(target_ms: int, source_ms: int) -> tuple[str, int, int] | None:
+    delta = abs(target_ms - source_ms)
+    if delta > max(90_000, int(target_ms * 0.15)):
+        return None
+    ratio = target_ms / source_ms
+    if delta <= 1000:
+        relation = "same_length"
+    elif min(abs(ratio - 25 / 24), abs(ratio - 24 / 25)) <= 0.0015 * (25 / 24):
+        relation = "speed_24_25"
+    else:
+        relation = "length_differs"
+    divisor = math.gcd(target_ms, source_ms)
+    return relation, target_ms // divisor, source_ms // divisor
 
 
 def _tile_filename(pts_ms: int, duration_ms: int, n_tiles: int) -> str:
@@ -440,7 +491,7 @@ class PoolService:
                       "sha256": digest, "profile": profile}
 
     def episode_candidates(self, episode_key: str, duration_ms: int, limit: int = 8) -> list[dict]:
-        """Return bounded, duration-near package variants for client-side visual verification."""
+        """Return the legacy episode-key candidates with the v2 ranking metadata added."""
         if not _EPISODE_KEY.fullmatch(episode_key) or not isinstance(duration_ms, int) or duration_ms <= 0:
             raise PoolError(400, "bad_episode_key")
         # Runtime is only a coarse filter. The TV must compare sample frames before accepting a candidate.
@@ -451,9 +502,85 @@ class PoolService:
             "WHERE p.episode_key=? AND ABS(p.duration_ms-?)<=? "
             "ORDER BY ABS(p.duration_ms-?) ASC,p.updated DESC LIMIT ?",
             (episode_key, duration_ms, tolerance, duration_ms, max(1, min(limit, 8))))
-        return [{"fp": fp, "profile": profile, "duration_ms": dur, "duration_delta_ms": abs(dur - duration_ms),
-                 "n_slots": slots, "n_tiles": tiles}
-                for fp, profile, dur, slots, tiles in rows]
+        candidates = []
+        for fp, profile, dur, slots, tiles in rows:
+            relation_data = _timing_relation(duration_ms, int(dur))
+            if relation_data is None:
+                continue
+            relation, a_num, a_den = relation_data
+            candidates.append({"fp": fp, "profile": profile, "duration_ms": dur,
+                               "duration_delta_ms": abs(dur - duration_ms), "n_slots": slots,
+                               "n_tiles": tiles, "score": {"same_length": 100, "speed_24_25": 95,
+                                                              "length_differs": 90}[relation],
+                               "match": "episode_key+duration", "relation": relation,
+                               "approximate": True, "a_num": a_num, "a_den": a_den,
+                               "b_ms": 0, "source_duration_ms": dur})
+        return candidates
+
+    def candidates(self, *, duration_ms: int, imdb: str | None = None, season: int = 0,
+                   episode: int = 0, size_bytes: int | None = None, filename: str | None = None,
+                   exclude_fp: str | None = None, limit: int = 8) -> list[dict]:
+        """Rank bounded NVMT reuse candidates using only the declared catalog hints."""
+        query = validate_pool_hints(imdb, season, episode, duration_ms, size_bytes, filename)
+        filename_norm = query["filename_norm"]
+        if not imdb and not filename_norm:
+            raise PoolError(400, "missing_hints")
+        if exclude_fp is not None and not is_fingerprint(exclude_fp):
+            raise PoolError(400, "bad_key")
+        rows = self.db.q(
+            "SELECT h.fp,h.profile,h.imdb,h.season,h.episode,h.duration_ms,h.size_bytes,h.filename_norm,"
+            "h.n_tiles,h.grid,h.created,p.n_slots "
+            "FROM pool_hints h JOIN pool_packages p ON p.fp=h.fp AND p.profile=h.profile "
+            "WHERE ABS(h.duration_ms-?)<=? AND (? IS NULL OR h.fp<>?)",
+            (duration_ms, max(90_000, int(duration_ms * 0.15)), exclude_fp, exclude_fp))
+        qtokens = set((filename_norm or "").split(".")) - {""}
+        ranked = []
+        for (fp, profile, row_imdb, row_season, row_episode, source_ms, row_size,
+             row_filename, n_tiles, grid, created, n_slots) in rows:
+            relation_data = _timing_relation(duration_ms, int(source_ms))
+            if relation_data is None:
+                continue
+            relation, a_num, a_den = relation_data
+            match_parts = []
+            score = 0
+            same_catalog = bool(imdb and row_imdb == imdb)
+            same_episode = same_catalog and int(row_season) == season and int(row_episode) == episode
+            if same_episode:
+                match_parts.extend(("imdb", "season", "episode", "duration"))
+                score = {"same_length": 100, "speed_24_25": 95, "length_differs": 90}[relation]
+            elif same_catalog and season == episode == int(row_season) == int(row_episode) == 0:
+                match_parts.extend(("imdb", "duration"))
+                score = 85
+            elif filename_norm and row_filename:
+                if filename_norm == row_filename and relation == "same_length":
+                    match_parts.extend(("filename", "duration"))
+                    score = 75
+                else:
+                    ctokens = set(str(row_filename).split(".")) - {""}
+                    overlap = len(qtokens & ctokens) / max(1, len(qtokens | ctokens))
+                    if overlap >= 0.6 and relation == "same_length":
+                        match_parts.extend(("filename", "duration"))
+                        score = 65
+            if score < 65:
+                continue
+            size_delta = (abs(int(row_size) - size_bytes) / max(1, size_bytes)
+                          if row_size is not None and size_bytes is not None else None)
+            ranked.append({
+                "fp": fp, "profile": profile, "duration_ms": int(source_ms), "n_slots": int(n_slots),
+                "n_tiles": int(n_tiles), "score": score, "match": "+".join(match_parts),
+                "relation": relation, "approximate": True, "a_num": a_num, "a_den": a_den,
+                "b_ms": 0, "source_duration_ms": int(source_ms),
+                "_size_delta": size_delta if size_delta is not None and size_delta <= 0.01 else None,
+                "_delta": abs(int(source_ms) - duration_ms), "_created": float(created),
+            })
+        ranked.sort(key=lambda c: (-c["score"], c["_size_delta"] is None,
+                                   c["_size_delta"] if c["_size_delta"] is not None else 0,
+                                   c["_delta"], -c["_created"], c["fp"], c["profile"]))
+        result = ranked[:max(1, min(int(limit), 8))]
+        for candidate in result:
+            for key in ("_size_delta", "_delta", "_created"):
+                candidate.pop(key, None)
+        return result
 
     def _package_slots_from_tiles(self, fp: str, profile: str, slots: list[int],
                                   tile_rows: list[tuple]) -> tuple[bytes, dict] | None:
@@ -551,7 +678,10 @@ class PoolService:
         return True
 
     def upload_package(self, fp: str, profile: str, duration_ms: int, data: bytes,
-                       episode_key: str | None = None) -> dict:
+                       episode_key: str | None = None, *, imdb: str | None = None,
+                       season: int = 0, episode: int = 0, size_bytes: int | None = None,
+                       filename: str | None = None) -> dict:
+        hints = validate_pool_hints(imdb, season, episode, duration_ms, size_bytes, filename)
         grid, n_slots, incoming = decode_nvmt(fp, profile, duration_ms, data)
         if episode_key is not None and not _EPISODE_KEY.fullmatch(episode_key):
             raise PoolError(400, "bad_episode_key")
@@ -581,7 +711,8 @@ class PoolService:
                 raise PoolError(413, "package_too_large")
             digest = hashlib.sha256(package).hexdigest()
             if previous and digest == previous[4]:
-                self._index_episode_package(episode_key, fp, profile, duration_ms)
+                self._store_package_metadata(fp, profile, duration_ms, n_slots, len(merged), len(package),
+                                             digest, previous[5], previous[6], episode_key, hints, grid)
                 return {"stored": False, "duplicate": True, "tiles": len(merged), "sha256": digest}
             caption = f"openseek:nvmt:v1:{fp}:{profile}:{digest}"
             try:
@@ -589,13 +720,8 @@ class PoolService:
                     package, caption, f"{fp}.{profile}.nvmt", "application/octet-stream")
             except AttributeError as exc:
                 raise PoolError(503, "package_storage_unavailable") from exc
-            self.db.x("INSERT INTO pool_packages(fp,profile,duration_ms,n_slots,n_tiles,size,sha256,file_id,message_id,created) "
-                      "VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(fp,profile) DO UPDATE SET "
-                      "duration_ms=excluded.duration_ms,n_slots=excluded.n_slots,n_tiles=excluded.n_tiles," 
-                      "size=excluded.size,sha256=excluded.sha256,file_id=excluded.file_id," 
-                      "message_id=excluded.message_id,created=excluded.created",
-                      (fp, profile, duration_ms, n_slots, len(merged), len(package), digest, file_id, message_id, time.time()))
-            self._index_episode_package(episode_key, fp, profile, duration_ms)
+            self._store_package_metadata(fp, profile, duration_ms, n_slots, len(merged), len(package),
+                                         digest, file_id, message_id, episode_key, hints, grid)
             self._package_cache.put((fp, profile, digest), package)
             if previous:
                 try:
@@ -603,6 +729,39 @@ class PoolService:
                 except (AttributeError, PoolError):
                     pass
         return {"stored": True, "duplicate": False, "tiles": len(merged), "sha256": digest}
+
+    def _store_package_metadata(self, fp: str, profile: str, duration_ms: int, n_slots: int, n_tiles: int,
+                                size: int, digest: str, file_id: str, message_id: int,
+                                episode_key: str | None, hints: dict, grid: int) -> None:
+        """Commit the exact-package row and its optional lookup rows atomically."""
+        now = time.time()
+        with self.db._lock:
+            self.db.conn.execute("BEGIN IMMEDIATE")
+            try:
+                self.db.conn.execute(
+                    "INSERT INTO pool_packages(fp,profile,duration_ms,n_slots,n_tiles,size,sha256,file_id,message_id,created) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(fp,profile) DO UPDATE SET "
+                    "duration_ms=excluded.duration_ms,n_slots=excluded.n_slots,n_tiles=excluded.n_tiles,"
+                    "size=excluded.size,sha256=excluded.sha256,file_id=excluded.file_id,"
+                    "message_id=excluded.message_id,created=excluded.created",
+                    (fp, profile, duration_ms, n_slots, n_tiles, size, digest, file_id, message_id, now))
+                if episode_key:
+                    self.db.conn.execute(
+                        "INSERT INTO pool_episode_packages(episode_key,fp,profile,duration_ms,updated) VALUES(?,?,?,?,?) "
+                        "ON CONFLICT(episode_key,fp,profile) DO UPDATE SET duration_ms=excluded.duration_ms,updated=excluded.updated",
+                        (episode_key, fp, profile, duration_ms, now))
+                self.db.conn.execute(
+                    "INSERT INTO pool_hints(fp,profile,imdb,season,episode,duration_ms,size_bytes,filename_norm,n_tiles,grid,created) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(fp,profile) DO UPDATE SET "
+                    "imdb=excluded.imdb,season=excluded.season,episode=excluded.episode,duration_ms=excluded.duration_ms,"
+                    "size_bytes=excluded.size_bytes,filename_norm=excluded.filename_norm,n_tiles=excluded.n_tiles,"
+                    "grid=excluded.grid,created=excluded.created",
+                    (fp, profile, hints["imdb"], hints["season"], hints["episode"], duration_ms,
+                     hints["size_bytes"], hints["filename_norm"], n_tiles, grid, now))
+                self.db.conn.execute("COMMIT")
+            except BaseException:
+                self.db.conn.execute("ROLLBACK")
+                raise
 
     def purge(self, *, dry_run: bool = True, outbox_older_than_days: int = 30,
               outbox_attempts: int = 5, vacuum: bool = False) -> dict:

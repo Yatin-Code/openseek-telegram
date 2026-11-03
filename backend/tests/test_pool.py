@@ -483,6 +483,63 @@ def test_nvmt_package_validation_merge_and_asgi_download(tmp_path, monkeypatch):
         core.stop()
 
 
+def test_nvmt_hints_upload_and_ranked_candidate_route(tmp_path, monkeypatch):
+    tg = FakeTelegramBotAPI()
+
+    class NoSourceProxy:
+        def stop(self):
+            pass
+
+    async def inline_to_thread(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(app_module.asyncio, "to_thread", inline_to_thread)
+    storage = TelegramBotStore("123456:test", "-100123", opener=tg.urlopen)
+    core = Core(Settings(data_dir=tmp_path / "pool-hints", pool_enabled=True,
+                         pool_read_key=READ_KEY, pool_write_key=WRITE_KEY,
+                         telegram_bot_token="123456:test", telegram_channel_id="-100123"),
+                pool_storage=storage, proxy=NoSourceProxy())
+    api = ASGIPoolAPI(create_api_app(core))
+    first_fp = hashlib.sha256(b"film encode one").hexdigest()
+    other_fp = hashlib.sha256(b"film encode two").hexdigest()
+    wrong_fp = hashlib.sha256(b"different film").hexdigest()
+    image = jpeg()
+    duration = 20_000
+    try:
+        for fp, imdb, filename in (
+            (first_fp, "tt1234567", "Film.Name.2024.1080p.mkv"),
+            (other_fp, "tt1234567", "Film.Name.2024.2160p.mp4"),
+            (wrong_fp, "tt7654321", "Other.Film.2024.mkv"),
+        ):
+            result = api(
+                f"https://pool.test/v1/pool/{fp}/nvmt?profile=nvmt-v1-g5&duration_ms={duration}"
+                f"&imdb={imdb}&season=0&episode=0&size_bytes=1000000&filename={filename}",
+                nvmt_package(5_000, duration, {0: (0, image)}),
+                {"Authorization": f"Bearer {WRITE_KEY}", "Content-Type": "application/vnd.openseek.nvmt"}, 2)
+            assert result.status == 201, result.read()
+
+        assert core.db.q("SELECT filename_norm FROM pool_hints WHERE fp=?", (first_fp,))[0][0] == "film.name.2024.1080p"
+        found = api(
+            "https://pool.test/v1/pool/candidates?imdb=tt1234567&season=0&episode=0&duration_ms=20500"
+            "&size_bytes=1000000&filename=Film.Name.2024.2160p.mkv",
+            None, {"Authorization": f"Bearer {READ_KEY}"}, 2)
+        assert found.status == 200
+        candidates = json.loads(found.data)["candidates"]
+        assert [candidate["fp"] for candidate in candidates] == [other_fp, first_fp]
+        assert candidates[0]["score"] == 100
+        assert candidates[0]["relation"] == "same_length"
+        assert candidates[0]["approximate"] is True
+        assert candidates[0]["a_num"] == 41 and candidates[0]["a_den"] == 40
+
+        excluded = api(
+            f"https://pool.test/v1/pool/candidates?imdb=tt1234567&season=0&episode=0"
+            f"&duration_ms=20500&exclude_fp={first_fp}",
+            None, {"Authorization": f"Bearer {READ_KEY}"}, 2)
+        assert [candidate["fp"] for candidate in json.loads(excluded.data)["candidates"]] == [other_fp]
+    finally:
+        core.stop()
+
+
 def test_episode_variant_index_and_sparse_sample_routes(tmp_path, monkeypatch):
     """Different encodes can be discovered by episode key and sampled before full reuse."""
     tg = FakeTelegramBotAPI()
