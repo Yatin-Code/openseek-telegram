@@ -1,16 +1,17 @@
-# Tickets: hint-based shared pool (NVMT, Telegram-first)
+# Tickets: OpenSeek shared pool (NVMT, Telegram-first)
 
 Status: backlog, supersedes the hint-related parts of `PLAN-SEEKDB.md`.
-Branches: server `openseek-telegram@openseek-thumbnil`; client `Nuvio-native-tizen-fixes@openseek-thumbnil`.
-Scope rule: `pool.py` routes stay the only client contract.
+Branches: server `openseek-telegram@integration/hints-pool`; client `Nuvio-native-tizen-fixes@integration/hints-pool`.
+Scope rule: `/v1/pool/*` and the Vercel upload lifecycle are the client contract.
 
 ## Hard invariants
 
-1. **NVMT always, VTT never.** The pool path speaks only `application/vnd.openseek.nvmt` and
-   JPEG tiles wrapped in it. No VTT endpoint, no WebVTT parsing, no sprite-sheet URL protocol,
-   no `/v1/previews` or `/v1/lookup` dependency. The existing OpenSeek preview/VTT code may
-   remain for its own desktop clients, but it is never on the pool path and no pool ticket may
-   introduce a VTT branch.
+1. **NVMT always, VTT never.** The shared-pool path speaks only `application/vnd.openseek.nvmt` and
+   JPEG tiles wrapped in it. No VTT endpoint, WebVTT parsing, sprite-sheet URL protocol, or
+   `/v1/previews` or `/v1/lookup` dependency. Nuvio generates NVMT on a playback miss. OpenSeek may
+   generate NVMT only after an owner starts that action in the admin dashboard; it never generates
+   on a player request. F4 retires the desktop app and legacy preview/VTT product paths while
+   preserving only the generation code needed by the dashboard.
 2. `fp` is the exact blob key. Hints never replace it.
 3. No full-file hash, no hash of hints, no video URL or header ever reaches the pool.
 4. No request-time frame/sample verification.
@@ -19,11 +20,15 @@ Scope rule: `pool.py` routes stay the only client contract.
 
 - `fp` remains the exact blob key (size + first/last 64 KiB). It is never replaced by a hint key.
 - Reuse is driven by **raw hints**: IMDb, season, episode, duration, size, filename. No hash of hints.
-- Hints are persisted in Telegram; the local SQLite index is rebuildable from the channel.
+- Telegram is the canonical durable store for packages and manifests. Local/VPS SQLite and Vercel Supabase PostgreSQL are rebuildable indexes.
+- Supabase Storage is temporary upload staging only; it is not a second pool or durable package store.
+- Vercel is a required hosting profile. Local/VPS deployments remain first-class and do not require Supabase.
+- The same browser dashboard serves local/VPS and Vercel. Vercel has one owner-configured secret; no multi-user sign-in service is in scope.
+- Downloads stream from Telegram through OpenSeek to Nuvio. No temporary download staging.
+- Vercel uploads stage in Supabase Storage, queue publication to Telegram, and complete only after Telegram accepts the package.
 - `POOL_MODE=channel` is the primary shared-pool path. A central `host` is optional.
 - No request-time frame/sample verification. The server ranks; the client accepts the best candidate and applies a timing mapping.
 - Old v1 packages stay exact-`fp`-only. No forced backfill.
-- Serverless is deferred until the Nuvio client can do CA TLS, redirects, and presigned/multipart upload.
 
 ## Contribution topologies
 
@@ -250,14 +255,15 @@ client never enters the sample-verification loop.
 **Acceptance:** a film with a valid IMDb produces a key; a film without IMDb produces 0 and the client falls back to hints-only lookup.
 **Tests:** unit cases: movie, series, id-with-suffix, no IMDb, invalid IMDb. **Depends:** D0. **Size:** S.
 
-### D2 — Send raw hints on lookup and upload
+### D2 — Send raw hints on lookup and local/VPS upload
 **Why:** the server has nothing to match on today; `minipool_enviar` sends only `duration_ms` + `episode_key` (`src/minipool.c:539-575`).
 **Scope:** `src/minipool.c`, `src/minipool.h`.
 **Do:**
-- Add URL-encoded `imdb`, `season`, `episode`, `duration_ms`, `size_bytes`, `filename` to the candidate GET and the NVMT PUT.
+- Add URL-encoded `imdb`, `season`, `episode`, `duration_ms`, `size_bytes`, `filename` to the candidate GET and local/VPS NVMT PUT.
 - Source them from `MiniMeta` (`imdb`, `temporada`, `episodio`, `durMs`) and the work item (`w->nome`, `w->bytes`/`l->total`).
 - Add a bounded percent-encoder; cap filename at 200 bytes.
 - Keep the old request as fallback when the server returns 404/400 for unknown params.
+- Vercel carries the same hints through D8's signed upload creation/finalization flow; never send the NVMT body through a Vercel function.
 **Acceptance:** a captured request shows the full hint set; a server without the new route still works.
 **Tests:** request-builder unit tests with spaces/UTF-8/special chars. **Depends:** D1, A1. **Size:** M.
 
@@ -293,21 +299,27 @@ client never enters the sample-verification loop.
 **Do:** extract pure helpers (key derivation, URL build, mapping) behind `#ifdef` test hooks; add a `make test-minipool` target.
 **Acceptance:** `make test-minipool` runs without a TV. **Depends:** D1, D2. **Size:** M.
 
+### D8 — Vercel staged upload and Telegram acceptance polling
+**Why:** Vercel cannot accept the full NVMT package in a function request body, and Nuvio must know when Telegram—not temporary staging—has accepted its contribution.
+**Scope:** `src/minipool.c`, `src/minipool.h`, HTTP/TLS helpers.
+**Do:** request a short-lived signed upload target, upload directly to temporary Supabase Storage using CA-validated TLS, finalize with OpenSeek, then poll the upload ID. Keep D2's direct PUT for local/VPS. Never forward pool credentials to storage or report success before Telegram accepts the package.
+**Acceptance:** a package larger than the Vercel function body limit reaches Telegram through staging; the client reports success only after acceptance; local/VPS direct PUT is unchanged. **External:** Nuvio `.scratch/hints-pool/issues/09-d8-vercel-staged-upload.md`; server F1. **Size:** L.
+
 ---
 
 ## Epic E — Docs and migration
 
-### E1 — Rewrite `PLAN-SEEKDB.md`
-**Why:** the current plan says to leave `library.py` behind, treats `episode_key` as solved, and makes Telegram cold storage. All three are now wrong.
+### E1 — Initial rewrite of `PLAN-SEEKDB.md` (completed)
+**Why:** the initial plan treated Telegram as cold storage and omitted the hint/reuse layer.
 **Scope:** `docs/PLAN-SEEKDB.md`.
-**Do:** replace with the channel-first spec: hints manifest, candidate ranking, no hash, NVMT-only, central host optional, serverless deferred. Link this ticket file.
-**Acceptance:** no statement contradicts A1–B7; the "leave behind" list no longer includes the hints layer.
+**Do:** established the initial channel-first spec. Current Vercel, dashboard, and generation decisions are tracked in Epic F.
+**Acceptance:** historical completion; future plan changes remain aligned with the current product decisions in issue #1.
 **Depends:** A1. **Size:** M.
 
-### E2 — Operator docs for channel mode
+### E2 — Operator docs for local/VPS and Vercel
 **Scope:** `docs/INSTALL.md`, `docs/TELEGRAM-POOL.md`, `.env.example`.
-**Do:** env-only setup, bot membership, first scan, doctor output, librarian contribution rules, quota defaults.
-**Acceptance:** a new operator can go from empty env to a serving node without reading code. **Depends:** B5. **Size:** M.
+**Do:** document local/VPS setup, Vercel/Supabase setup, Telegram membership, first scan, doctor/status output, owner secret, librarian contribution rules, temporary upload staging, and quota defaults.
+**Acceptance:** a new operator can deploy either profile and reach the same dashboard without reading code. **Depends:** B5, F1, F2. **Size:** M.
 
 ### E3 — Migration and backfill note
 **Why:** existing channels have v1 tiles with no manifests.
@@ -317,12 +329,53 @@ client never enters the sample-verification loop.
 
 ---
 
-## Deferred (explicitly not ticketed now)
+## Epic F — Portable deployment and one admin website
 
-- **Serverless / Vercel**: blocked on a v2 client (CA TLS, redirects, presigned or multipart upload). The current client pins SPKI, refuses redirects, and sends up to 16 MiB in one PUT.
-- **`/v1/previews` + `/v1/lookup` + VTT**: Nuvio renders NVMT only; adopting the preview API needs a VTT parser and sprite cropper. Out of scope.
-- **Central host removal**: `host` stays as an optional profile.
-- **Full-file hash**: rejected; `fp` is already the exact-blob key and the pool never sees the bytes.
+### F1 — Add the Vercel deployment profile with Telegram as the durable pool
+**Why:** Vercel is a required target, but its function body limit cannot accept the current NVMT upload directly and its instances cannot own durable local state.
+**Scope:** `backend/openseek/`, Vercel entry/configuration, Supabase schema and policies.
+**Do:**
+- Keep local/VPS support on SQLite and local temporary disk; no Supabase dependency for self-hosting.
+- Add a Vercel adapter using Supabase PostgreSQL for rebuildable index/status, Supabase Storage for expiring upload staging, and Supabase Queues/Cron for retrying Telegram publication.
+- Keep Telegram as the only durable shared package store. Never persist a second permanent copy in Supabase.
+- Provide an upload lifecycle: issue a short-lived signed staging target, accept finalization, queue Telegram publication, expose an upload ID/status, and expire/delete the staged object after acceptance.
+- Keep the local/VPS direct PUT flow. Downloads in both profiles stream directly from Telegram through OpenSeek; do not stage downloads.
+**Acceptance:** local/VPS behavior does not require Supabase; a Vercel upload over the function body limit becomes complete only after Telegram accepts it, survives a worker retry, and its staged object is removed; Vercel download streams the Telegram bytes without a durable object copy.
+**Depends:** B1–B3. **Size:** L.
+
+### F2 — Serve the same admin dashboard in every profile
+**Why:** operators should use one browser website whether OpenSeek runs locally, on a VPS, or on Vercel.
+**Scope:** `backend/openseek/app.py`, dashboard assets, admin authentication/configuration.
+**Do:**
+- Serve the same dashboard and owner operations in local/VPS and Vercel profiles, backed by profile-specific storage/runtime adapters.
+- Keep OpenSeek as the product name across both deployments; this is not a SeekDB rebrand.
+- Keep the local per-install admin secret. Protect the Vercel dashboard with one owner-configured secret; do not add user accounts, sign-up, or Supabase Auth.
+- Preserve the existing dashboard operations (status, pairing/sharing, pool scan/rebuild, and settings) in both profiles.
+**Acceptance:** the same dashboard workflows work against local/VPS and Vercel deployments; unauthenticated admin calls fail; Nuvio pool pairing/auth remains separate from owner access.
+**Depends:** F1. **Size:** L.
+
+### F3 — Generate NVMT only from an explicit dashboard action
+**Why:** OpenSeek must support an owner-requested generator without putting video decoding on Nuvio's player request path.
+**Scope:** dashboard job/API, the minimum reusable extraction code, NVMT packaging, Telegram publication.
+**Do:**
+- Add a dashboard action that starts an asynchronous NVMT generation job and reports status/progress.
+- Accept a media URL that the OpenSeek deployment can reach; use the same source flow in local/VPS and Vercel.
+- Make generation produce a validated NVMT package plus hints, then use the same Telegram publication flow as Nuvio uploads.
+- Support this action in local/VPS and Vercel profiles, using the deployment's job mechanism; bound temporary data and clean up on success/failure.
+- Keep Nuvio's local generation-on-miss behavior independent. Never trigger OpenSeek generation from pool lookup or playback requests.
+**Acceptance:** an owner can start and complete generation from the same dashboard in local/VPS and Vercel profiles; Telegram receives a valid package and manifest; a pool/player request causes zero video decoding.
+**Depends:** F1, F2. **Size:** L.
+
+### F4 — Remove the desktop app and legacy player preview/VTT product
+**Why:** the browser dashboard is the only admin interface, and the shared product uses NVMT rather than the old player VTT pipeline.
+**Scope:** `desktop/`, desktop packaging/installer references, `/v1/previews`, `/v1/lookup`, VTT/sprite routes and code, docs/tests for those surfaces.
+**Do:**
+- Remove the Windows desktop application and its build/release paths.
+- Remove the old player preview, VTT, lookup, and sprite-sheet product surfaces and the generation code used only by them.
+- Retain and adapt only the media extraction and packaging pieces needed by F3's explicit dashboard NVMT generation.
+- Remove obsolete docs, tests, dependencies, and packaging references without changing `/v1/pool/*` behavior.
+**Acceptance:** no desktop app or player VTT/preview surface is shipped; the dashboard can still generate and publish NVMT; Nuvio can still generate on a playback miss and use the shared pool.
+**Depends:** F2, F3. **Size:** L.
 
 ---
 
@@ -340,3 +393,4 @@ client never enters the sample-verification loop.
 | Phase 2 | C3, D5 | offsets and rejections |
 
 Run server A2–A5 and client D0–D1 in parallel after A1. Start B1 after A2, B2 after B1, B7 after B2/B5, C1 after B3. Start D2 after A1; D3 after A4.
+Start F1 after B1–B3, then F2, F3, and F4 in order. D8 follows the F1 upload contract.

@@ -1,0 +1,3 @@
+# Telegram is the canonical shared pool store
+
+OpenSeek keeps accepted NVMT packages and their manifests in Telegram as the durable shared pool. Local/VPS SQLite and Vercel Supabase PostgreSQL hold rebuildable indexes; Supabase Storage is temporary Vercel upload staging, not a second package store. Vercel uploads are staged only to bypass the function request limit, then published to Telegram with retry/status tracking. Downloads stream from Telegram through OpenSeek to Nuvio without staging. This keeps the shared data in one user-understood pool while allowing both self-hosted and serverless deployments.
