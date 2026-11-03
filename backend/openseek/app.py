@@ -988,18 +988,115 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
         try:
             q = request.query_params
             size_text = q.get("size_bytes")
+            device_id = getattr(request.state, "device_id", None)
+            work_key = q.get("work_key")
             candidates = await asyncio.to_thread(
                 pool.candidates,
                 duration_ms=int(q.get("duration_ms", "")),
                 imdb=q.get("imdb"), season=int(q.get("season", "0")),
                 episode=int(q.get("episode", "0")),
                 size_bytes=int(size_text) if size_text is not None else None,
-                filename=q.get("filename"), exclude_fp=q.get("exclude_fp"))
+                filename=q.get("filename"), exclude_fp=q.get("exclude_fp"),
+                device_id=device_id, work_key=work_key)
         except ValueError:
             return err(400, "bad_request")
         except PoolError as exc:
             return err(exc.status, exc.code)
         return JSONResponse({"candidates": candidates}, headers={"Cache-Control": "no-store"})
+
+    @app.put("/v1/pool/candidates/{fp}/offset")
+    async def pool_candidate_offset(request: Request, fp: str):
+        pool = core.pool
+        if pool is None:
+            return err(404, "not_found")
+        if not pool_allowed(request, pool):
+            return err(403, "forbidden")
+        if not is_fingerprint(fp):
+            return err(400, "bad_key")
+        try:
+            body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+        except Exception:
+            return err(400, "bad_request")
+        work_key = body.get("work_key") or request.query_params.get("work_key")
+        b_ms = body.get("b_ms")
+        if not work_key or not isinstance(work_key, str) or len(work_key) > 64:
+            return err(400, "bad_work_key")
+        if b_ms is None or not isinstance(b_ms, int) or abs(b_ms) > 86_400_000:
+            return err(400, "bad_offset")
+        device_id = getattr(request.state, "device_id", None)
+        if device_id is None:
+            return err(401, "device_required")
+        core.db.put_pool_offset(device_id, work_key, fp, b_ms)
+        return JSONResponse({"ok": True}, headers={"Cache-Control": "no-store"})
+
+    @app.delete("/v1/pool/candidates/{fp}/offset", status_code=204)
+    async def pool_candidate_delete_offset(request: Request, fp: str):
+        pool = core.pool
+        if pool is None:
+            return err(404, "not_found")
+        if not pool_allowed(request, pool):
+            return err(403, "forbidden")
+        if not is_fingerprint(fp):
+            return err(400, "bad_key")
+        try:
+            body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+        except Exception:
+            body = {}
+        work_key = body.get("work_key") or request.query_params.get("work_key")
+        if not work_key or not isinstance(work_key, str) or len(work_key) > 64:
+            return err(400, "bad_work_key")
+        device_id = getattr(request.state, "device_id", None)
+        if device_id is None:
+            return err(401, "device_required")
+        core.db.delete_pool_offset(device_id, work_key, fp)
+        return Response(status_code=204)
+
+    @app.put("/v1/pool/candidates/{fp}/reject")
+    async def pool_candidate_reject(request: Request, fp: str):
+        pool = core.pool
+        if pool is None:
+            return err(404, "not_found")
+        if not pool_allowed(request, pool):
+            return err(403, "forbidden")
+        if not is_fingerprint(fp):
+            return err(400, "bad_key")
+        try:
+            body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+        except Exception:
+            return err(400, "bad_request")
+        work_key = body.get("work_key") or request.query_params.get("work_key")
+        days = body.get("days", 30)
+        if not work_key or not isinstance(work_key, str) or len(work_key) > 64:
+            return err(400, "bad_work_key")
+        if not isinstance(days, int) or days < 1 or days > 365:
+            return err(400, "bad_days")
+        device_id = getattr(request.state, "device_id", None)
+        if device_id is None:
+            return err(401, "device_required")
+        core.db.put_pool_rejection(device_id, work_key, fp, days)
+        return JSONResponse({"ok": True}, headers={"Cache-Control": "no-store"})
+
+    @app.delete("/v1/pool/candidates/{fp}/reject", status_code=204)
+    async def pool_candidate_delete_reject(request: Request, fp: str):
+        pool = core.pool
+        if pool is None:
+            return err(404, "not_found")
+        if not pool_allowed(request, pool):
+            return err(403, "forbidden")
+        if not is_fingerprint(fp):
+            return err(400, "bad_key")
+        try:
+            body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+        except Exception:
+            body = {}
+        work_key = body.get("work_key") or request.query_params.get("work_key")
+        if not work_key or not isinstance(work_key, str) or len(work_key) > 64:
+            return err(400, "bad_work_key")
+        device_id = getattr(request.state, "device_id", None)
+        if device_id is None:
+            return err(401, "device_required")
+        core.db.delete_pool_rejection(device_id, work_key, fp)
+        return Response(status_code=204)
 
     @app.get("/v1/pool/episodes/{episode_key}")
     async def pool_episode_candidates(request: Request, episode_key: str):

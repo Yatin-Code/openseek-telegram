@@ -170,7 +170,7 @@ class ASGIPoolAPI:
     def __init__(self, app):
         self.app = app
 
-    def __call__(self, url, data, headers, timeout):
+    def __call__(self, url, data, headers, timeout, method=None):
         parsed = urlsplit(url)
         body = data or b""
         sent = []
@@ -192,7 +192,7 @@ class ASGIPoolAPI:
 
         scope = {
             "type": "http", "asgi": {"version": "3.0", "spec_version": "2.3"},
-            "http_version": "1.1", "method": "PUT" if data is not None else "GET",
+            "http_version": "1.1", "method": method or ("PUT" if data is not None else "GET"),
             "scheme": "https", "path": parsed.path, "raw_path": parsed.path.encode(),
             "query_string": parsed.query.encode(), "root_path": "", "headers": request_headers,
             "client": ("127.0.0.1", 45678), "server": ("pool.test", 443), "state": {},
@@ -870,4 +870,151 @@ def test_real_sample_decode_to_telegram_pool_and_second_instance(tmp_path, monke
         sync.stop()
         contributor_db.close()
         viewer_db.close()
+        core.stop()
+
+
+def test_pool_verified_tie_break(tmp_path):
+    """Verified package wins tie-break against unverified candidate with the same score."""
+    db = DB(tmp_path / "verified_test.sqlite")
+    tg = FakeTelegramBotAPI()
+    storage = TelegramBotStore("123456:test", "-100123", opener=tg.urlopen)
+    svc = PoolService(db, storage, READ_KEY, WRITE_KEY)
+    fp1 = "1" * 64
+    fp2 = "2" * 64
+    duration = 20_000
+    image = jpeg()
+    pkg = nvmt_package(5_000, duration, {0: (0, image)})
+    try:
+        svc.upload_package(fp2, "nvmt-v1-g5", duration, pkg, imdb="tt1234567", season=0, episode=0)
+        svc.upload_package(fp1, "nvmt-v1-g5", duration, pkg, imdb="tt1234567", season=0, episode=0)
+        db.x("UPDATE pool_hints SET created=1 WHERE fp IN (?,?)", (fp1, fp2))
+
+        # Both have score 100.
+        candidates = svc.candidates(duration_ms=duration, imdb="tt1234567", season=0, episode=0)
+        assert len(candidates) == 2
+        assert candidates[0]["score"] == 100 and candidates[1]["score"] == 100
+
+        # Mark fp2 as verified.
+        assert db.set_hint_verified(fp2, "nvmt-v1-g5", True)
+        assert db.is_hint_verified(fp2, "nvmt-v1-g5")
+
+        candidates_after = svc.candidates(duration_ms=duration, imdb="tt1234567", season=0, episode=0)
+        assert candidates_after[0]["fp"] == fp2
+        assert candidates_after[1]["fp"] == fp1
+
+        # Unverify restores normal ordering.
+        assert db.set_hint_verified(fp2, "nvmt-v1-g5", False)
+        assert not db.is_hint_verified(fp2, "nvmt-v1-g5")
+    finally:
+        db.close()
+
+
+def test_pool_device_offset_and_rejection_isolation(tmp_path, monkeypatch):
+    """Per-device offsets and rejections are isolated to the calling device and work key."""
+    class NoSourceProxy:
+        def stop(self):
+            pass
+
+    async def inline_to_thread(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(app_module.asyncio, "to_thread", inline_to_thread)
+    tg = FakeTelegramBotAPI()
+    storage = TelegramBotStore("123456:test", "-100123", opener=tg.urlopen)
+    core = Core(Settings(data_dir=tmp_path / "pool-corrections", pool_enabled=True,
+                         pool_read_key=READ_KEY, pool_write_key=WRITE_KEY,
+                         telegram_bot_token="123456:test", telegram_channel_id="-100123"),
+                pool_storage=storage, proxy=NoSourceProxy())
+    api = ASGIPoolAPI(create_api_app(core))
+    fp1 = hashlib.sha256(b"release 1").hexdigest()
+    fp2 = hashlib.sha256(b"release 2").hexdigest()
+    duration = 20_000
+    pkg = nvmt_package(5_000, duration, {0: (0, jpeg())})
+    work_key = hashlib.sha256(b"openseek-work-v1\nimdb:tt1234567").hexdigest()
+    token_a, token_b = "A" * 43, "B" * 43
+    dev_a = core.auth.register("device A", hashlib.sha256(token_a.encode()).hexdigest(), role="guest")
+    dev_b = core.auth.register("device B", hashlib.sha256(token_b.encode()).hexdigest(), role="guest")
+
+    try:
+        for fp in (fp1, fp2):
+            res = api(f"https://pool.test/v1/pool/{fp}/nvmt?profile=nvmt-v1-g5&duration_ms={duration}"
+                      f"&imdb=tt1234567&season=0&episode=0",
+                      pkg, {"Authorization": f"Bearer {WRITE_KEY}", "Content-Type": "application/vnd.openseek.nvmt"}, 2)
+            assert res.status == 201
+
+        # Query candidates for dev_a
+        r = api(f"https://pool.test/v1/pool/candidates?imdb=tt1234567&season=0&episode=0&duration_ms={duration}"
+                f"&work_key={work_key}", None, {"Authorization": f"Bearer {token_a}"}, 2)
+        assert r.status == 200
+        items = json.loads(r.data)["candidates"]
+        assert len(items) == 2
+        assert all(c["b_ms"] == 0 for c in items)
+
+        # Set offset for dev_a on fp1
+        put_off = api(f"https://pool.test/v1/pool/candidates/{fp1}/offset",
+                      json.dumps({"work_key": work_key, "b_ms": 1500}).encode(),
+                      {"Authorization": f"Bearer {token_a}", "Content-Type": "application/json"}, 2)
+        assert put_off.status == 200
+
+        spoofed = api(f"https://pool.test/v1/pool/candidates/{fp1}/offset?device_id={dev_a}",
+                      json.dumps({"work_key": work_key, "b_ms": 9999}).encode(),
+                      {"Authorization": f"Bearer {READ_KEY}", "Content-Type": "application/json"}, 2)
+        assert spoofed.status == 401
+        assert core.db.get_pool_offset(dev_a, work_key, fp1) == 1500
+
+        # dev_a sees b_ms = 1500 on fp1
+        r_a = api(f"https://pool.test/v1/pool/candidates?imdb=tt1234567&season=0&episode=0&duration_ms={duration}"
+                  f"&work_key={work_key}", None, {"Authorization": f"Bearer {token_a}"}, 2)
+        items_a = json.loads(r_a.data)["candidates"]
+        c1_a = next(c for c in items_a if c["fp"] == fp1)
+        assert c1_a["b_ms"] == 1500
+
+        # dev_b sees b_ms = 0 (isolated)
+        r_b = api(f"https://pool.test/v1/pool/candidates?imdb=tt1234567&season=0&episode=0&duration_ms={duration}"
+                  f"&work_key={work_key}", None, {"Authorization": f"Bearer {token_b}"}, 2)
+        items_b = json.loads(r_b.data)["candidates"]
+        c1_b = next(c for c in items_b if c["fp"] == fp1)
+        assert c1_b["b_ms"] == 0
+
+        # Reject fp1 for dev_a
+        put_rej = api(f"https://pool.test/v1/pool/candidates/{fp1}/reject",
+                      json.dumps({"work_key": work_key, "days": 7}).encode(),
+                      {"Authorization": f"Bearer {token_a}", "Content-Type": "application/json"}, 2)
+        assert put_rej.status == 200
+
+        # dev_a no longer receives fp1
+        r_a_rej = api(f"https://pool.test/v1/pool/candidates?imdb=tt1234567&season=0&episode=0&duration_ms={duration}"
+                      f"&work_key={work_key}", None, {"Authorization": f"Bearer {token_a}"}, 2)
+        items_a_rej = json.loads(r_a_rej.data)["candidates"]
+        assert len(items_a_rej) == 1
+        assert items_a_rej[0]["fp"] == fp2
+
+        # dev_b still receives both
+        r_b_rej = api(f"https://pool.test/v1/pool/candidates?imdb=tt1234567&season=0&episode=0&duration_ms={duration}"
+                      f"&work_key={work_key}", None, {"Authorization": f"Bearer {token_b}"}, 2)
+        assert len(json.loads(r_b_rej.data)["candidates"]) == 2
+
+        # Clear rejection for dev_a
+        del_rej = api(f"https://pool.test/v1/pool/candidates/{fp1}/reject",
+                      json.dumps({"work_key": work_key}).encode(),
+                      {"Authorization": f"Bearer {token_a}", "Content-Type": "application/json"}, 2,
+                      method="DELETE")
+        assert del_rej.status == 204
+
+        # fp1 is visible again
+        r_a_restored = api(f"https://pool.test/v1/pool/candidates?imdb=tt1234567&season=0&episode=0&duration_ms={duration}"
+                           f"&work_key={work_key}", None, {"Authorization": f"Bearer {token_a}"}, 2)
+        assert len(json.loads(r_a_restored.data)["candidates"]) == 2
+
+        # Clear offset
+        del_off = api(f"https://pool.test/v1/pool/candidates/{fp1}/offset",
+                      json.dumps({"work_key": work_key}).encode(),
+                      {"Authorization": f"Bearer {token_a}", "Content-Type": "application/json"}, 2,
+                      method="DELETE")
+        assert del_off.status == 204
+        r_a_no_off = api(f"https://pool.test/v1/pool/candidates?imdb=tt1234567&season=0&episode=0&duration_ms={duration}"
+                         f"&work_key={work_key}", None, {"Authorization": f"Bearer {token_a}"}, 2)
+        c1_no_off = next(c for c in json.loads(r_a_no_off.data)["candidates"] if c["fp"] == fp1)
+        assert c1_no_off["b_ms"] == 0
+    finally:
         core.stop()

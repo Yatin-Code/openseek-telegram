@@ -184,3 +184,36 @@ Filename fallback, no IMDb:
 GET /v1/pool/candidates?duration_ms=5400000&filename=some.film.2023.1080p
 → score 75, match "filename+duration", relation same_length
 ```
+
+## Per-device corrections
+
+When a candidate match is slightly shifted or unacceptable, a device may record an offset or reject the candidate. These corrections apply only to the calling device and do not alter the global package or other devices' candidate queries.
+
+Correction writes require the calling device's authenticated bearer token. The shared pool read key and a caller-supplied `device_id` do not identify a device and cannot write corrections. Candidate queries made with a device token apply that device's saved corrections.
+
+### Offset
+
+```
+PUT /v1/pool/candidates/{fp}/offset
+Content-Type: application/json
+
+{"work_key": "<64 hex>", "b_ms": 2500}
+```
+
+- `work_key`: stable hash identifying the work (`openseek-work-v1` for films or `openseek-episode-v1` for series).
+- `b_ms`: integer millisecond shift applied to linear mapping (`-86,400,000` to `86,400,000`).
+- Overrides `b_ms` on subsequent candidate responses for this `(device, work_key, fp)`.
+- `DELETE /v1/pool/candidates/{fp}/offset?work_key=...` removes the offset.
+
+### Rejection
+
+```
+PUT /v1/pool/candidates/{fp}/reject
+Content-Type: application/json
+
+{"work_key": "<64 hex>", "days": 30}
+```
+
+- Hides this candidate `fp` for this calling device and `work_key` for `days` (1–365, default 30).
+- Subsequent candidate queries for this device omit the rejected `fp`.
+- `DELETE /v1/pool/candidates/{fp}/reject?work_key=...` clears the rejection.
