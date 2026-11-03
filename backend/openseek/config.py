@@ -186,6 +186,7 @@ class Settings:
     telegram_session_file: Path | None = None
     pool_channel_scan_limit: int = 2000
     pool_index_refresh_s: int = 300
+    pool_channel_writable: str = "auto"    # auto | 1 | 0
     contribution: bool = False
     librarian: str = ""
     librarian_key: str = ""
@@ -287,6 +288,7 @@ class Settings:
             "TELEGRAM_SESSION_FILE": ("telegram_session_file", Path),
             "POOL_CHANNEL_SCAN_LIMIT": ("pool_channel_scan_limit", int),
             "POOL_INDEX_REFRESH_S": ("pool_index_refresh_s", int),
+            "POOL_CHANNEL_WRITABLE": ("pool_channel_writable", str),
             "CONTRIBUTION": ("contribution", _bool),
             "LIBRARIAN": ("librarian", str),
             "LIBRARIAN_KEY": ("librarian_key", str),
@@ -304,7 +306,7 @@ class Settings:
         host_only = {"POOL_ENABLED", "POOL_URL", "POOL_READ_KEY", "POOL_WRITE_KEY", "POOL_SHARE", "POOL_TIMEOUT_S"}
         channel_only = {"TELEGRAM_API_ID", "TELEGRAM_API_HASH", "TELEGRAM_SESSION", "TELEGRAM_SESSION_FILE",
                         "POOL_CHANNEL_SCAN_LIMIT", "POOL_INDEX_REFRESH_S", "CONTRIBUTION", "LIBRARIAN",
-                        "LIBRARIAN_KEY", "LIBRARIAN_ENABLED"}
+                        "LIBRARIAN_KEY", "LIBRARIAN_ENABLED", "POOL_CHANNEL_WRITABLE"}
         skip = host_only if mode_hint == "channel" else channel_only if mode_hint == "host" else host_only | channel_only
         kw = {}
         for suffix, (name, fn) in conv.items():
@@ -422,6 +424,8 @@ class Settings:
         if mode == "host" and not self.pool_url and not self.pool_host_enabled:
             raise ConfigError("host mode requires OPENSEEK_POOL_URL or enabled pool-host credentials")
         if mode == "channel":
+            if self.pool_channel_writable not in ("auto", "1", "0"):
+                raise ConfigError("OPENSEEK_POOL_CHANNEL_WRITABLE must be auto, 1, or 0")
             if self.pool_channel_scan_limit < 1 or self.pool_channel_scan_limit > 100_000:
                 raise ConfigError("OPENSEEK_POOL_CHANNEL_SCAN_LIMIT must be 1..100000")
             if self.pool_index_refresh_s < 10 or self.pool_index_refresh_s > 86400:

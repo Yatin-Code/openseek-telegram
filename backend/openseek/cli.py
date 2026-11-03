@@ -33,6 +33,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="openseek")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("serve", help="run the daemon (HTTPS API + loopback admin)")
+    sub.add_parser("doctor", help="show pool configuration and live channel permissions")
     sub.add_parser("setup", help="write a protected pool configuration file")
     sub.add_parser("pair", help="open a 10-minute pairing window and print the code")
     sub.add_parser("devices", help="list paired devices")
@@ -70,6 +71,24 @@ def main(argv: list[str] | None = None) -> int:
         from .app import serve
         serve(settings)
         return 0
+    if a.cmd == "doctor":
+        report = {"mode": settings.effective_pool_mode}
+        if settings.effective_pool_mode == "channel":
+            report["telegram_identity"] = "bot" if settings.telegram_bot_token else "user_session"
+            report["channel_id"] = settings.telegram_channel_id
+            report["configured_writable"] = settings.pool_channel_writable
+        try:
+            status, body = _admin(settings, "GET", "/admin/pool/status")
+        except (urllib.error.URLError, OSError):
+            print(json.dumps({**report, "daemon": "unavailable"}, indent=2, sort_keys=True))
+            return 1
+        if status == 200 and body:
+            report["daemon"] = "running"
+            report["pool"] = body
+            print(json.dumps(report, indent=2, sort_keys=True))
+            return 0
+        print(json.dumps({**report, "daemon": f"HTTP {status}"}, indent=2, sort_keys=True))
+        return 1
     if a.cmd == "pool":
         if a.pool_action == "login":
             from .pool import PoolError

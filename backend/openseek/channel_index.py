@@ -306,4 +306,8 @@ class ChannelIndex:
         count = self.db.q("SELECT COUNT(*) FROM pool_channel_tiles")
         return {"channel_id": self.channel_id, "last_message_id": state[0] if state else 0,
                 "scanned_at": state[1] if state else 0, "tiles": int(count[0][0]) if count else 0,
-                "last_error": self.last_error}
+                "last_error": self.last_error,
+                "entity_type": getattr(self.store, "entity_type", "unknown"),
+                "channel_writable": getattr(self.store, "can_post", None),
+                "detected_channel_writable": getattr(self.store, "detected_can_post", None),
+                "post_permission_error": getattr(self.store, "post_permission_error", "")}

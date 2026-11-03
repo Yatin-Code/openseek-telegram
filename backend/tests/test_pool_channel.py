@@ -14,7 +14,7 @@ import pytest
 from openseek.app import Core
 from openseek.cache import Cache, PROFILE
 from openseek.channel_index import ChannelIndex
-from openseek.config import MiB, Settings
+from openseek.config import ConfigError, MiB, Settings
 from openseek.contribution import TelegramLibrarian
 from openseek.db import DB
 from openseek.pool import (ChannelPoolClient, ChannelPoolSync, PoolError,
@@ -241,6 +241,11 @@ def test_pool_mode_compatibility_and_local_only(tmp_path):
         channel_core.stop()
 
 
+def test_pool_channel_writable_override_validation():
+    with pytest.raises(ConfigError, match="POOL_CHANNEL_WRITABLE"):
+        Settings.from_env({"OPENSEEK_POOL_MODE": "channel", "OPENSEEK_POOL_CHANNEL_WRITABLE": "sometimes"})
+
+
 class FakeTelethonClient:
     def __init__(self):
         self.messages = {}
@@ -263,7 +268,7 @@ class FakeTelethonClient:
         return channel_id
 
     async def get_permissions(self, _entity, _user):
-        return SimpleNamespace(send_messages=True, post_messages=True)
+        return SimpleNamespace(send_messages=getattr(self, "can_send", True), post_messages=True)
 
     async def send_file(self, _entity, file, caption, **_kw):
         source, filename = file
@@ -309,6 +314,24 @@ def test_mtproto_store_sync_facade_upload_scan_download(tmp_path):
         assert store.get_tile(message_id) == data
         messages = store.scan(0, 10)
         assert messages == [ChannelMessage(message_id, caption, len(data), _tile_filename(0, 10_000, 1))]
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("override,expected", [("auto", False), ("1", True), ("0", False)])
+def test_mtproto_store_allows_read_only_channel_and_reports_write_override(tmp_path, override, expected):
+    settings = Settings(data_dir=tmp_path, pool_mode="channel", contribution=True,
+                        telegram_api_id=123, telegram_api_hash="a" * 32,
+                        telegram_bot_token="123456:test", telegram_channel_id="-100123",
+                        pool_channel_writable=override)
+    fake = FakeTelethonClient()
+    fake.can_send = False
+    store = TelegramMTProtoStore(settings, client_factory=lambda *_args, **_kwargs: fake)
+    try:
+        store.start()
+        assert store.detected_can_post is False
+        assert store.can_post is expected
+        assert store.entity_type == "megagroup"
     finally:
         store.close()
 

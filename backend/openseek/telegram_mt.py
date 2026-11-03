@@ -45,6 +45,10 @@ class TelegramMTProtoStore:
         self._ready = threading.Event()
         self._client = None
         self._entity = None
+        self.detected_can_post: bool | None = None
+        self.can_post: bool | None = None
+        self.post_permission_error = ""
+        self.entity_type = "unknown"
         self._connected = False
         self._message_handler = None
         self._handler_attached = False
@@ -168,14 +172,23 @@ class TelegramMTProtoStore:
     async def _verify_entity(self, check_post: bool) -> None:
         try:
             self._entity = await self._client.get_entity(self.channel_id)
+            is_broadcast = bool(getattr(self._entity, "broadcast", False))
+            self.entity_type = "broadcast" if is_broadcast else "megagroup"
             async for _message in self._client.iter_messages(self._entity, limit=1):
                 break
-            if check_post:
+            try:
                 permissions = await self._client.get_permissions(self._entity, "me")
-                is_broadcast = bool(getattr(self._entity, "broadcast", False))
-                allowed = getattr(permissions, "post_messages", False) if is_broadcast else getattr(permissions, "send_messages", True)
-                if allowed is False:
-                    raise PoolError(403, "telegram_post_forbidden")
+                allowed = (getattr(permissions, "post_messages", False) if is_broadcast else
+                           getattr(permissions, "send_messages", True))
+                self.detected_can_post = allowed is not False
+                self.post_permission_error = ""
+            except Exception as exc:
+                # Telegram can allow history reads while withholding post rights.
+                # That is a valid read-only channel node, not a startup failure.
+                self.detected_can_post = False
+                self.post_permission_error = getattr(exc, "code", type(exc).__name__)
+            override = self.settings.pool_channel_writable
+            self.can_post = (self.detected_can_post if override == "auto" else override == "1")
         except PoolError:
             raise
         except Exception as exc:
