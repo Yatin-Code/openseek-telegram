@@ -227,6 +227,63 @@ def test_channel_mode_uploads_nvmt_tiles_and_retry_keeps_first_writer(tmp_path):
         core.stop()
 
 
+def test_channel_manifest_incremental_ordering_malformed_and_rebuild(tmp_path):
+    store = MemoryChannel()
+    db, _cache = make_db_cache(tmp_path / "node")
+    index = ChannelIndex(db, store, scan_limit=10, refresh_s=10)
+    data = jpeg()
+    first_fp = hashlib.sha256(b"manifest before tile").hexdigest()
+    second_fp = hashlib.sha256(b"tile before manifest").hexdigest()
+
+    def hints(fp):
+        return {"v": 1, "fp": fp, "profile": "nvmt-v1-g5", "imdb": "tt1234567",
+                "season": 0, "episode": 0, "duration_ms": 20_000, "size_bytes": 5_000_000,
+                "filename_norm": "sample.movie.2024", "n_tiles": 4, "grid": 5_000,
+                "created": 1}
+
+    def add_tile(fp, k=0):
+        digest = hashlib.sha256(data).hexdigest()
+        return store.put_tile(data, f"openseek:v1:{fp}:{PROFILE}:{k}:{digest}",
+                              {"pts_ms": k * 10_000, "duration_ms": 20_000, "n_tiles": 2})
+
+    try:
+        # A manifest can arrive first. It is indexed immediately, but without
+        # channel tiles it cannot become a usable candidate.
+        store.post_message(ChannelPoolService._manifest_caption(hints(first_fp)))
+        assert index.refresh(force=True)["scanned"] == 1
+        assert db.q("SELECT fp FROM pool_hints") == [(first_fp,)]
+        assert db.q("SELECT COUNT(*) FROM pool_channel_tiles")[0][0] == 0
+        add_tile(first_fp)
+        assert index.refresh(force=True)["indexed"] == 1
+
+        # The reverse order is handled by the next incremental refresh too.
+        add_tile(second_fp)
+        assert index.refresh(force=True)["indexed"] == 1
+        store.post_message(ChannelPoolService._manifest_caption(hints(second_fp)))
+        assert index.refresh(force=True)["scanned"] == 1
+        assert {row[0] for row in db.q("SELECT fp FROM pool_hints")} == {first_fp, second_fp}
+
+        # Invalid JSON and unrecognized caption versions do not abort scanning.
+        store.post_message("openseek:hints:v1:bm90anNvbg")
+        store.post_message("openseek:hints:v2:bm90anNvbg")
+        assert index.refresh(force=True)["scanned"] == 2
+        assert db.q("SELECT COUNT(*) FROM pool_hints")[0][0] == 2
+
+        stale_fp = "f" * 64
+        db.x("INSERT INTO pool_hints(fp,profile,duration_ms,n_tiles,grid,created) "
+             "VALUES(?,?,?,?,?,?)", (stale_fp, "nvmt-v1-g5", 20_000, 1, 5_000, 2))
+        db.x("INSERT INTO pool_episode_packages(episode_key,fp,profile,duration_ms,updated) "
+             "VALUES(?,?,?,?,?)", ("a" * 64, stale_fp, "nvmt-v1-g5", 20_000, 2))
+
+        rebuilt = index.rebuild()
+        assert rebuilt["indexed"] == 2
+        assert {row[0] for row in db.q("SELECT fp FROM pool_hints")} == {first_fp, second_fp}
+        assert db.q("SELECT COUNT(*) FROM pool_episode_packages")[0][0] == 0
+        assert db.q("SELECT COUNT(*) FROM pool_channel_tiles")[0][0] == 2
+    finally:
+        db.close()
+
+
 def test_first_writer_wins_and_losing_outbox_is_cleared(tmp_path):
     fp = "b" * 64
     store = MemoryChannel()

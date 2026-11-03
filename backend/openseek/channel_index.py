@@ -1,7 +1,9 @@
 """Rebuildable SQLite index for valid tile documents in a Telegram channel."""
 from __future__ import annotations
 
+import base64
 import hashlib
+import json
 import logging
 import re
 import threading
@@ -12,8 +14,9 @@ from .db import DB
 from .ids import is_fingerprint
 from .pool import (MAX_DURATION_MS, MAX_TILE_BYTES, NVMT_PROFILES, PoolError,
                    TILE_INTERVAL_MS, _EPISODE_KEY, _timing_relation, _tile_metadata_from_filename,
-                   encode_nvmt, validate_tile)
+                   encode_nvmt, validate_pool_hints, validate_tile)
 from .scheduler import tile_count
+from .telegram_mt import _HINTS_CAPTION
 
 log = logging.getLogger("openseek.channel_index")
 _CAPTION = re.compile(r"^openseek:v1:([0-9a-f]{64}):([^:]+):(\d+):([0-9a-f]{64})$")
@@ -54,6 +57,20 @@ class ChannelIndex:
         candidates = []
         seen = set()
         for message in messages:
+            caption = getattr(message, "caption", "") or ""
+            hm = _HINTS_CAPTION.fullmatch(caption)
+            if hm:
+                try:
+                    if len(caption.encode("utf-8")) > 900:
+                        raise ValueError("manifest caption too long")
+                    raw_b64 = hm.group(1)
+                    padded = raw_b64 + ("=" * ((4 - len(raw_b64) % 4) % 4))
+                    decoded = json.loads(base64.b64decode(
+                        padded, altchars=b"-_", validate=True).decode("utf-8"))
+                    self.record_manifest(decoded)
+                except Exception as exc:
+                    log.debug("ignoring invalid hints message %s (%s)", getattr(message, "message_id", 0), exc)
+                continue
             tile = self._parse_message(message)
             if tile is None:
                 continue
@@ -120,6 +137,8 @@ class ChannelIndex:
                 try:
                     self.db.conn.execute("DELETE FROM pool_channel_tiles")
                     self.db.conn.execute("DELETE FROM pool_channel_state WHERE channel_id=?", (self.channel_id,))
+                    self.db.conn.execute("DELETE FROM pool_hints")
+                    self.db.conn.execute("DELETE FROM pool_episode_packages")
                     self.db.conn.execute("COMMIT")
                 except BaseException:
                     self.db.conn.execute("ROLLBACK")
@@ -240,6 +259,54 @@ class ChannelIndex:
             except BaseException:
                 self.db.conn.execute("ROLLBACK")
                 raise
+
+    def record_manifest(self, hints: dict) -> bool:
+        """Store validated hints into pool_hints."""
+        if not isinstance(hints, dict) or hints.get("v") != 1:
+            return False
+        fp = hints.get("fp")
+        profile = hints.get("profile")
+        if not is_fingerprint(fp) or profile not in NVMT_PROFILES:
+            return False
+        try:
+            season = hints.get("season", 0)
+            episode = hints.get("episode", 0)
+            duration_ms = hints.get("duration_ms")
+            size_bytes = hints.get("size_bytes")
+            n_tiles = hints.get("n_tiles")
+            grid = hints.get("grid")
+            created = hints.get("created")
+            if (type(season) is not int or type(episode) is not int or
+                    type(duration_ms) is not int or
+                    (size_bytes is not None and type(size_bytes) is not int) or
+                    type(n_tiles) is not int or type(grid) is not int or
+                    type(created) not in (int, float) or
+                    grid != NVMT_PROFILES[profile] or duration_ms <= 0 or n_tiles <= 0 or
+                    n_tiles > (duration_ms + grid - 1) // grid or created < 0):
+                return False
+            validated = validate_pool_hints(
+                hints.get("imdb"),
+                season,
+                episode,
+                duration_ms,
+                size_bytes,
+                hints.get("filename_norm") or hints.get("filename"),
+            )
+        except Exception:
+            return False
+        manifest_created = float(created)
+        with self.db._lock:
+            self.db.x(
+                "INSERT INTO pool_hints(fp,profile,imdb,season,episode,duration_ms,size_bytes,filename_norm,n_tiles,grid,created) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(fp,profile) DO UPDATE SET "
+                "imdb=excluded.imdb,season=excluded.season,episode=excluded.episode,duration_ms=excluded.duration_ms,"
+                "size_bytes=excluded.size_bytes,filename_norm=excluded.filename_norm,n_tiles=excluded.n_tiles,"
+                "grid=excluded.grid,created=excluded.created",
+                (fp, profile, validated["imdb"], validated["season"], validated["episode"],
+                 validated["duration_ms"], validated["size_bytes"], validated["filename_norm"],
+                 n_tiles, grid, manifest_created))
+        return True
 
     def manifest(self, fp: str, profile: str) -> dict | None:
         if not is_fingerprint(fp) or profile != PROFILE:

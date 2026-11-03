@@ -186,7 +186,7 @@ class ChannelPoolService:
         manifest = {"v": 1, "fp": fp, "profile": profile, "imdb": hints["imdb"],
                     "season": hints["season"], "episode": hints["episode"],
                     "duration_ms": duration_ms, "size_bytes": hints["size_bytes"],
-                    "filename": hints["filename_norm"], "n_tiles": len(source_tiles),
+                    "filename_norm": hints["filename_norm"], "n_tiles": len(source_tiles),
                     "grid": grid, "created": created}
         old_hints = self.index.db.q(
             "SELECT imdb,season,episode,duration_ms,size_bytes,filename_norm,n_tiles,grid "
