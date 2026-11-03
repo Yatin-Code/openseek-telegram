@@ -94,7 +94,7 @@ class Core:
             self.channel_index = ChannelIndex(
                 self.db, self.channel_store, channel_id=settings.telegram_channel_id,
                 scan_limit=settings.pool_channel_scan_limit, refresh_s=settings.pool_index_refresh_s)
-            self.pool = ChannelPoolService(self.channel_index)
+            self.pool = ChannelPoolService(self.channel_index, settings.pool_read_key, settings.pool_write_key)
             if settings.librarian_enabled and hasattr(self.channel_store, "set_message_handler"):
                 self.librarian = TelegramLibrarian(self.channel_store, self.channel_index)
                 self.librarian.attach()
@@ -619,6 +619,10 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
         if pool.authorize(pool_key(request), write=True):
             return None
         device_id = request.state.device_id
+        if core.settings.effective_pool_mode == "channel":
+            role = core.auth.role_of(device_id) if device_id is not None else None
+            if ((role == "owner" and core.settings.contribution) or core.can_contribute(device_id)):
+                return None
         if device_id is not None and core.auth.role_of(device_id) == "guest":
             return err(403, "not_contribute")
         return err(403, "forbidden")

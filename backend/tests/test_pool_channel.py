@@ -20,8 +20,8 @@ from openseek.channel_index import ChannelIndex
 from openseek.config import ConfigError, MiB, Settings
 from openseek.contribution import TelegramLibrarian
 from openseek.db import DB
-from openseek.pool import (ChannelPoolClient, ChannelPoolSync, PoolError,
-                           _tile_filename)
+from openseek.pool import (ChannelPoolClient, ChannelPoolSync, PoolError, decode_nvmt,
+                           _tile_filename, encode_nvmt)
 from openseek.telegram_mt import ChannelMessage, TelegramMTProtoStore
 from openseek.scheduler import tile_count
 from openseek.setup import _env_assignment, run_setup
@@ -36,6 +36,7 @@ def jpeg(color=(12, 34, 56)) -> bytes:
 class MemoryChannel:
     def __init__(self):
         self.channel_id = "-100123456"
+        self.can_post = True
         self.settings = SimpleNamespace(librarian="", librarian_key="")
         self.messages: list[ChannelMessage] = []
         self.data: dict[int, bytes] = {}
@@ -63,6 +64,12 @@ class MemoryChannel:
 
     def scan(self, min_id=0, limit=2000):
         return [message for message in self.messages if message.message_id > min_id][:limit]
+
+    def post_message(self, text, target=None):
+        message_id = self.next_id
+        self.next_id += 1
+        self.messages.append(ChannelMessage(message_id, text, 0, ""))
+        return message_id
 
     def delete_message(self, message_id, target=None):
         self.deleted.append(message_id)
@@ -168,6 +175,54 @@ def test_channel_mode_serves_pool_routes_from_index(tmp_path):
         assert [item["fp"] for item in candidates.json()["candidates"]] == [fp]
         assert missing.status_code == 404 and missing.json()["error"] == "not_found"
         assert core.jobs.running_sources() == []
+    finally:
+        core.stop()
+
+
+def test_channel_mode_uploads_nvmt_tiles_and_retry_keeps_first_writer(tmp_path):
+    store = MemoryChannel()
+    settings = Settings(data_dir=tmp_path, pool_mode="channel", contribution=True,
+                        pool_write_key="w" * 40, telegram_api_id=123,
+                        telegram_api_hash="a" * 32, telegram_bot_token="123456:test",
+                        telegram_channel_id=store.channel_id)
+    core = Core(settings, pool_storage=store)
+    fp = hashlib.sha256(b"channel upload source").hexdigest()
+    image_a, image_b = jpeg((11, 22, 33)), jpeg((33, 22, 11))
+    package = encode_nvmt(5_000, 4, {0: (0, image_a), 2: (10_000, image_b)})
+    app = create_api_app(core)
+
+    async def put():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                     base_url="https://openseek.test") as client:
+            return await client.put(
+                f"/v1/pool/{fp}/nvmt?profile=nvmt-v1-g5&duration_ms=20000&imdb=tt1234567"
+                "&season=0&episode=0&size_bytes=1000000&filename=Film.Name.2024.mkv",
+                content=package, headers={"Authorization": f"Bearer {'w' * 40}",
+                                          "Content-Type": "application/vnd.openseek.nvmt"})
+
+    try:
+        store.fail_next_upload = True
+        with pytest.raises(PoolError, match="telegram_unavailable"):
+            core.pool.upload_package(fp, "nvmt-v1-g5", 20_000, package, imdb="tt1234567",
+                                     size_bytes=1_000_000, filename="Film.Name.2024.mkv")
+        assert core.db.q("SELECT COUNT(*) FROM pool_channel_tiles")[0][0] == 0
+
+        # The retry indexes the first Telegram tile, publishes the missing one,
+        # and only then records the manifest and complete local hint row.
+        response = asyncio.run(put())
+        assert response.status_code == 201, response.text
+        assert core.db.q("SELECT COUNT(*) FROM pool_channel_tiles")[0][0] == 2
+        hint = core.db.q("SELECT imdb,filename_norm,n_tiles,grid FROM pool_hints WHERE fp=?", (fp,))[0]
+        assert hint == ("tt1234567", "film.name.2024", 2, 5_000)
+        assert sum(message.caption.startswith("openseek:hints:v1:") for message in store.messages) == 1
+        package_read, _ = core.pool.package(fp, "nvmt-v1-g5")
+        grid, n_slots, tiles = decode_nvmt(fp, "nvmt-v1-g5", 20_000, package_read)
+        assert (grid, n_slots, tiles) == (5_000, 4, {0: (0, image_a), 2: (10_000, image_b)})
+
+        duplicate = asyncio.run(put())
+        assert duplicate.status_code == 200 and duplicate.json()["duplicate"] is True
+        assert sum(bool(message.document_size) for message in store.messages) == 2
+        assert sum(message.caption.startswith("openseek:hints:v1:") for message in store.messages) == 1
     finally:
         core.stop()
 

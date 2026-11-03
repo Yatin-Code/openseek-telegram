@@ -22,6 +22,7 @@ from .pool import (MAX_TILE_BYTES, PoolError, _tile_filename,
 
 log = logging.getLogger("openseek.telegram_mt")
 _CAPTION = re.compile(r"^openseek:v1:([0-9a-f]{64}):([^:]+):(\d+):([0-9a-f]{64})$")
+_HINTS_CAPTION = re.compile(r"^openseek:hints:v1:([A-Za-z0-9_-]+)$")
 
 
 @dataclass(frozen=True)
@@ -288,6 +289,28 @@ class TelegramMTProtoStore:
                 raise PoolError(400, "bad_tile_metadata")
         return self._submit(self._put_tile(bytes(data), caption, filename, target))
 
+    def post_message(self, text: str, target: str | None = None) -> int:
+        if not isinstance(text, str) or not text or len(text.encode("utf-8")) > 4096:
+            raise PoolError(400, "bad_channel_message")
+        return self._submit(self._post_message(text, target))
+
+    async def _post_message(self, text: str, target: str | None) -> int:
+        await self._ensure_connected()
+        if target:
+            entity = await self._client.get_entity(target)
+        elif self._entity is None:
+            await self._verify_entity(True)
+            entity = self._entity
+        else:
+            entity = self._entity
+        try:
+            message = await self._retry(lambda: self._client.send_message(entity, text, link_preview=False))
+            return int(message.id)
+        except PoolError:
+            raise
+        except Exception as exc:
+            raise _pool_error(exc) from exc
+
     async def _put_tile(self, data: bytes, caption: str, filename: str, target: str | None) -> int:
         await self._ensure_connected()
         if target:
@@ -396,14 +419,14 @@ class TelegramMTProtoStore:
                     raise
                 await asyncio.sleep(delay)
 
-    async def _download_bounded(self, document) -> bytes:
+    async def _download_bounded(self, document, max_bytes: int = MAX_TILE_BYTES) -> bytes:
         for attempt in range(4):
             buffer = bytearray()
             try:
                 async for chunk in self._client.iter_download(document, request_size=64 * 1024):
                     buffer.extend(chunk)
-                    if len(buffer) > MAX_TILE_BYTES:
-                        raise PoolError(413, "tile_too_large")
+                    if len(buffer) > max_bytes:
+                        raise PoolError(413, "package_too_large" if max_bytes > MAX_TILE_BYTES else "tile_too_large")
                 return bytes(buffer)
             except PoolError:
                 raise

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import hashlib
+import base64
+import json
 import secrets
 import threading
 import time
@@ -9,8 +11,9 @@ import time
 from .cache import PROFILE
 from .channel_index import ChannelIndex
 from .ids import is_fingerprint
-from .pool import (MAX_DURATION_MS, NVMT_PROFILES, PoolError, TILE_INTERVAL_MS,
-                   _EPISODE_KEY, encode_nvmt, validate_tile)
+from .pool import (MAX_DURATION_MS, MAX_NVMT_BYTES, NVMT_PROFILES, PoolError,
+                   TILE_INTERVAL_MS, _EPISODE_KEY, _tile_filename, decode_nvmt, encode_nvmt,
+                   validate_pool_hints, validate_tile)
 from .scheduler import tile_count
 
 
@@ -82,7 +85,7 @@ class ChannelPoolService:
         if not tiles:
             return None
         package = encode_nvmt(grid, n_slots, tiles)
-        if len(package) > 16 * 1024 * 1024:
+        if len(package) > MAX_NVMT_BYTES:
             raise PoolError(502, "stored_package_too_large")
         return package, {"duration_ms": duration, "n_slots": n_slots, "n_tiles": len(tiles),
                          "sha256": hashlib.sha256(package).hexdigest(), "profile": profile}
@@ -112,8 +115,126 @@ class ChannelPoolService:
         return True
 
     def upload(self, *args, **kwargs) -> dict:
-        raise PoolError(501, "channel_upload_pending")
+        fp, profile, k, pts_ms, duration_ms, n_tiles, data = args[:7]
+        if not getattr(self.store, "can_post", True):
+            raise PoolError(403, "read_only_channel")
+        digest = validate_tile(fp, profile, k, pts_ms, duration_ms, n_tiles, data)
+        existing = self.index.lookup(fp, profile, k)
+        if existing is not None:
+            if existing["sha256"] != digest:
+                raise PoolError(409, "tile_conflict")
+            return {"stored": False, "duplicate": True, "sha256": digest}
+        caption = f"openseek:v1:{fp}:{profile}:{k}:{digest}"
+        metadata = {"pts_ms": pts_ms, "duration_ms": duration_ms, "n_tiles": n_tiles}
+        message_id = self.store.put_tile(data, caption, metadata)
+        from .telegram_mt import ChannelMessage
+        message = ChannelMessage(int(message_id), caption, len(data),
+                                 _tile_filename(pts_ms, duration_ms, n_tiles))
+        self.index.record_message(message)
+        return {"stored": True, "duplicate": False, "sha256": digest}
 
-    def upload_package(self, *args, **kwargs) -> dict:
-        raise PoolError(501, "channel_upload_pending")
+    def upload_package(self, fp: str, profile: str, duration_ms: int, data: bytes,
+                       episode_key: str | None = None, *, imdb: str | None = None,
+                       season: int = 0, episode: int = 0, size_bytes: int | None = None,
+                       filename: str | None = None) -> dict:
+        if not getattr(self.store, "can_post", True):
+            raise PoolError(403, "read_only_channel")
+        hints = validate_pool_hints(imdb, season, episode, duration_ms, size_bytes, filename)
+        grid, n_slots, source_tiles = decode_nvmt(fp, profile, duration_ms, data)
+        if episode_key is not None and not _EPISODE_KEY.fullmatch(episode_key):
+            raise PoolError(400, "bad_episode_key")
+        if len(data) > MAX_NVMT_BYTES:
+            raise PoolError(413, "package_too_large")
+        if not source_tiles:
+            raise PoolError(400, "empty_package")
+        self.index.refresh(force=True)
+        channel_count = (duration_ms + TILE_INTERVAL_MS - 1) // TILE_INTERVAL_MS
+        selected: dict[int, tuple[int, bytes]] = {}
+        used_slots: set[int] = set()
+        for k in range(channel_count):
+            target_ms = k * TILE_INTERVAL_MS
+            slot = min(source_tiles, key=lambda item: (abs(source_tiles[item][0] - target_ms), item))
+            if slot in used_slots or abs(source_tiles[slot][0] - target_ms) > grid // 2:
+                continue
+            if slot >= n_slots:
+                continue
+            used_slots.add(slot)
+            selected[k] = source_tiles[slot]
+        if not selected:
+            raise PoolError(400, "no_channel_tiles")
+        pending_messages = []
+        stored = 0
+        for k, (pts_ms, tile_data) in selected.items():
+            digest = validate_tile(fp, PROFILE, k, pts_ms, duration_ms, channel_count, tile_data)
+            existing = self.index.lookup(fp, PROFILE, k)
+            if existing is not None:
+                # Immutable first-writer-wins for every channel tile key.
+                continue
+            caption = f"openseek:v1:{fp}:{PROFILE}:{k}:{digest}"
+            metadata = {"pts_ms": pts_ms, "duration_ms": duration_ms, "n_tiles": channel_count}
+            message_id = self.store.put_tile(tile_data, caption, metadata)
+            from .telegram_mt import ChannelMessage
+            pending_messages.append(ChannelMessage(int(message_id), caption, len(tile_data),
+                                                    _tile_filename(pts_ms, duration_ms, channel_count)))
+            stored += 1
+
+        # If publication was interrupted earlier, refresh above made those tiles
+        # visible and this retry only publishes missing keys.
+        for message in pending_messages:
+            self.index.record_message(message)
+        created = int(time.time())
+        manifest = {"v": 1, "fp": fp, "profile": profile, "imdb": hints["imdb"],
+                    "season": hints["season"], "episode": hints["episode"],
+                    "duration_ms": duration_ms, "size_bytes": hints["size_bytes"],
+                    "filename": hints["filename_norm"], "n_tiles": len(source_tiles),
+                    "grid": grid, "created": created}
+        old_hints = self.index.db.q(
+            "SELECT imdb,season,episode,duration_ms,size_bytes,filename_norm,n_tiles,grid "
+            "FROM pool_hints WHERE fp=? AND profile=?", (fp, profile))
+        same_hints = bool(old_hints and old_hints[0] == (
+            hints["imdb"], hints["season"], hints["episode"], duration_ms,
+            hints["size_bytes"], hints["filename_norm"], len(source_tiles), grid))
+        if stored or not same_hints:
+            caption = self._manifest_caption(manifest)
+            post = getattr(self.store, "post_message", None)
+            if post is None:
+                raise PoolError(503, "telegram_manifest_unavailable")
+            post(caption)
+        now = time.time()
+        with self.index.db._lock:
+            self.index.db.conn.execute("BEGIN IMMEDIATE")
+            try:
+                self.index.db.conn.execute(
+                    "INSERT INTO pool_hints(fp,profile,imdb,season,episode,duration_ms,size_bytes,filename_norm,n_tiles,grid,created) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(fp,profile) DO UPDATE SET "
+                    "imdb=excluded.imdb,season=excluded.season,episode=excluded.episode,"
+                    "duration_ms=excluded.duration_ms,"
+                    "size_bytes=excluded.size_bytes,filename_norm=excluded.filename_norm,n_tiles=excluded.n_tiles,"
+                    "grid=excluded.grid,created=excluded.created",
+                    (fp, profile, hints["imdb"], hints["season"], hints["episode"], duration_ms,
+                     hints["size_bytes"], hints["filename_norm"], len(source_tiles), grid, now))
+                if episode_key:
+                    self.index.db.conn.execute(
+                        "INSERT INTO pool_episode_packages(episode_key,fp,profile,duration_ms,updated) VALUES(?,?,?,?,?) "
+                        "ON CONFLICT(episode_key,fp,profile) DO UPDATE SET duration_ms=excluded.duration_ms,updated=excluded.updated",
+                        (episode_key, fp, profile, duration_ms, now))
+                self.index.db.conn.execute("COMMIT")
+            except BaseException:
+                self.index.db.conn.execute("ROLLBACK")
+                raise
+        return {"stored": stored > 0, "duplicate": stored == 0, "tiles": len(source_tiles),
+                "channel_tiles": len(selected), "sha256": hashlib.sha256(data).hexdigest()}
+
+    @staticmethod
+    def _manifest_caption(manifest: dict) -> str:
+        while True:
+            encoded = base64.urlsafe_b64encode(
+                json.dumps(manifest, separators=(",", ":"), ensure_ascii=True).encode()).decode().rstrip("=")
+            caption = f"openseek:hints:v1:{encoded}"
+            if len(caption.encode()) <= 900:
+                return caption
+            filename = manifest.get("filename")
+            if not filename:
+                raise PoolError(400, "manifest_too_large")
+            manifest["filename"] = filename[:max(0, len(filename) - 20)]
 
