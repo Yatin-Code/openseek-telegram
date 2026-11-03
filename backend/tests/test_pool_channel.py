@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 import stat
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -876,7 +877,9 @@ class FakeLibrarianStore:
         self._entity = "channel"
         self._client = FakeTelethonClient()
 
-    async def _download_bounded(self, _document):
+    async def _download_bounded(self, _document, max_bytes=None):
+        if max_bytes is not None and len(self.data) > max_bytes:
+            raise PoolError(413, "package_too_large")
         return self.data
 
     async def _retry(self, operation):
@@ -884,8 +887,9 @@ class FakeLibrarianStore:
 
 
 class FakeEvent:
-    def __init__(self, caption, data, filename, *, sender_bot=False):
-        doc = SimpleNamespace(size=len(data), attributes=[SimpleNamespace(file_name=filename)])
+    def __init__(self, caption, data, filename, *, mime_type=None, sender_bot=False):
+        doc = SimpleNamespace(size=len(data), data=data, mime_type=mime_type,
+                              attributes=[SimpleNamespace(file_name=filename)])
         self.message = SimpleNamespace(document=doc, message=caption)
         self.sender_id = 456
         self.is_private = True
@@ -919,6 +923,164 @@ def test_librarian_reposts_valid_user_tile_and_rejects_bot_sender(tmp_path):
         asyncio.run(librarian.handle_message(bot_event, store))
         assert bot_event.deleted
         assert store._client.next_id == 2
+    finally:
+        db.close()
+
+
+def test_librarian_accepts_nvmt_package_and_reposts_tiles(tmp_path):
+    fp = "a" * 64
+    duration_ms = 20_000
+    grid = 10_000
+    tiles = {0: (0, jpeg((10, 20, 30))), 1: (10_000, jpeg((40, 50, 60)))}
+    pkg_data = encode_nvmt(grid, 2, tiles)
+    manifest = {
+        "v": 1, "fp": fp, "profile": PROFILE, "imdb": "tt1234567",
+        "season": 1, "episode": 2, "duration_ms": duration_ms,
+        "size_bytes": 100_000, "filename": "test.s01e02.mkv"
+    }
+    raw_b64 = base64.urlsafe_b64encode(json.dumps(manifest).encode()).decode().rstrip("=")
+    caption = f"openseek:hints:v1:{raw_b64}"
+    store = FakeLibrarianStore(pkg_data)
+    db, _ = make_db_cache(tmp_path / "librarian_pkg")
+    try:
+        index = ChannelIndex(db, MemoryChannel())
+        librarian = TelegramLibrarian(store, index)
+        event = FakeEvent(caption, pkg_data, "package.nvmt", mime_type="application/vnd.openseek.nvmt")
+        asyncio.run(librarian.handle_message(event, store))
+        assert event.deleted
+        assert index.lookup(fp, PROFILE, 0) is not None
+        assert index.lookup(fp, PROFILE, 1) is not None
+        hint_rows = db.q("SELECT fp,imdb,season,episode FROM pool_hints WHERE fp=?", (fp,))
+        assert len(hint_rows) == 1
+        assert hint_rows[0][1] == "tt1234567"
+        # Check success DM was sent
+        sent_msgs = [m.message for m in store._client.messages.values() if hasattr(m, "message")]
+        assert any("Accepted" in m for m in sent_msgs)
+    finally:
+        db.close()
+
+
+def test_manifest_first_writer_preserves_original_catalog_hints(tmp_path):
+    db, _ = make_db_cache(tmp_path / "first_manifest")
+    try:
+        index = ChannelIndex(db, MemoryChannel())
+        first = {
+            "v": 1, "fp": "f" * 64, "profile": "nvmt-v1-g10", "imdb": "tt1234567",
+            "season": 1, "episode": 2, "duration_ms": 20_000, "size_bytes": 100_000,
+            "filename": "first.s01e02.mkv", "n_tiles": 2, "grid": 10_000, "created": 1,
+        }
+        conflicting = {**first, "imdb": "tt7654321", "filename": "other.mkv", "created": 2}
+        assert index.record_manifest(first)
+        assert not index.record_manifest(conflicting)
+        stored = db.q("SELECT imdb,filename_norm FROM pool_hints WHERE fp=?", (first["fp"],))[0]
+        assert stored == ("tt1234567", "first.s01e02")
+    finally:
+        db.close()
+
+
+def test_sender_title_quota_reserves_only_three_competing_packages(tmp_path):
+    db = DB(tmp_path / "sender_quota.sqlite")
+    try:
+        def claim(_):
+            return db.sender_quota_claim(42, "work-key", "2026-11-04", 3)
+
+        with ThreadPoolExecutor(max_workers=12) as executor:
+            outcomes = list(executor.map(claim, range(30)))
+        assert sum(outcomes) == 3
+        assert db.sender_quota_count(42, "work-key", "2026-11-04") == 3
+    finally:
+        db.close()
+
+
+def test_librarian_rejects_package_wrong_mime(tmp_path):
+    fp = "b" * 64
+    duration_ms = 20_000
+    grid = 10_000
+    tiles = {0: (0, jpeg((10, 20, 30)))}
+    pkg_data = encode_nvmt(grid, 2, tiles)
+    manifest = {"v": 1, "fp": fp, "profile": PROFILE, "duration_ms": duration_ms}
+    raw_b64 = base64.urlsafe_b64encode(json.dumps(manifest).encode()).decode().rstrip("=")
+    caption = f"openseek:hints:v1:{raw_b64}"
+    store = FakeLibrarianStore(pkg_data)
+    db, _ = make_db_cache(tmp_path / "librarian_wrong_mime")
+    try:
+        index = ChannelIndex(db, MemoryChannel())
+        librarian = TelegramLibrarian(store, index)
+        event = FakeEvent(caption, pkg_data, "package.nvmt", mime_type="application/octet-stream")
+        asyncio.run(librarian.handle_message(event, store))
+        assert event.deleted
+        assert len(store._client.messages) == 1  # DM to sender only, no tiles
+        assert "Rejected: bad_mime_type" in next(iter(store._client.messages.values())).message
+        assert index.lookup(fp, PROFILE, 0) is None
+    finally:
+        db.close()
+
+
+def test_librarian_rejects_package_malformed_hints(tmp_path):
+    fp = "c" * 64
+    store = FakeLibrarianStore(b"NVMT-not-valid")
+    db, _ = make_db_cache(tmp_path / "librarian_malformed_hints")
+    try:
+        index = ChannelIndex(db, MemoryChannel())
+        librarian = TelegramLibrarian(store, index)
+        caption = "openseek:hints:v1:not-valid-base64!!!"
+        event = FakeEvent(caption, b"data", "package.nvmt", mime_type="application/vnd.openseek.nvmt")
+        asyncio.run(librarian.handle_message(event, store))
+        assert event.deleted
+        assert index.lookup(fp, PROFILE, 0) is None
+    finally:
+        db.close()
+
+
+def test_librarian_rejects_oversized_package(tmp_path):
+    fp = "d" * 64
+    store = FakeLibrarianStore(b"X" * (17 * 1024 * 1024))
+    db, _ = make_db_cache(tmp_path / "librarian_oversized")
+    try:
+        index = ChannelIndex(db, MemoryChannel())
+        librarian = TelegramLibrarian(store, index)
+        manifest = {"v": 1, "fp": fp, "profile": PROFILE, "duration_ms": 20_000}
+        raw_b64 = base64.urlsafe_b64encode(json.dumps(manifest).encode()).decode().rstrip("=")
+        caption = f"openseek:hints:v1:{raw_b64}"
+        event = FakeEvent(caption, b"X" * (17 * 1024 * 1024), "package.nvmt",
+                          mime_type="application/vnd.openseek.nvmt")
+        asyncio.run(librarian.handle_message(event, store))
+        assert event.deleted
+        assert index.lookup(fp, PROFILE, 0) is None
+    finally:
+        db.close()
+
+
+def test_librarian_rejects_partial_tile_failure_atomically(tmp_path):
+    fp = "e" * 64
+    duration_ms = 20_000
+    grid = 10_000
+    tiles = {0: (0, jpeg((1, 2, 3))), 1: (10_000, jpeg((4, 5, 6)))}
+    pkg_data = encode_nvmt(grid, 2, tiles)
+    manifest = {"v": 1, "fp": fp, "profile": PROFILE, "duration_ms": duration_ms}
+    raw_b64 = base64.urlsafe_b64encode(json.dumps(manifest).encode()).decode().rstrip("=")
+    caption = f"openseek:hints:v1:{raw_b64}"
+    store = FakeLibrarianStore(pkg_data)
+    send_file_orig = store._client.send_file
+    calls = [0]
+    async def fail_second_file(entity, file, caption, **kw):
+        calls[0] += 1
+        if calls[0] == 2:
+            raise RuntimeError("Telegram network simulated drop")
+        return await send_file_orig(entity, file, caption, **kw)
+    store._client.send_file = fail_second_file
+
+    db, _ = make_db_cache(tmp_path / "librarian_partial_fail")
+    try:
+        index = ChannelIndex(db, MemoryChannel())
+        librarian = TelegramLibrarian(store, index)
+        event = FakeEvent(caption, pkg_data, "package.nvmt", mime_type="application/vnd.openseek.nvmt")
+        asyncio.run(librarian.handle_message(event, store))
+        assert event.deleted
+        # The first tile repost must have been deleted atomically!
+        assert 1 not in store._client.messages
+        assert index.lookup(fp, PROFILE, 0) is None
+        assert index.lookup(fp, PROFILE, 1) is None
     finally:
         db.close()
 

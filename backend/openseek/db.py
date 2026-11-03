@@ -69,10 +69,26 @@ CREATE TABLE IF NOT EXISTS pool_hints (
   fp TEXT NOT NULL, profile TEXT NOT NULL, imdb TEXT, season INTEGER NOT NULL DEFAULT 0,
   episode INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL, size_bytes INTEGER,
   filename_norm TEXT, n_tiles INTEGER NOT NULL, grid INTEGER NOT NULL, created REAL NOT NULL,
+  verified INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (fp, profile));
 CREATE INDEX IF NOT EXISTS pool_hints_imdb_episode ON pool_hints(imdb, season, episode);
 CREATE INDEX IF NOT EXISTS pool_hints_filename ON pool_hints(filename_norm);
 CREATE INDEX IF NOT EXISTS pool_hints_duration ON pool_hints(duration_ms);
+CREATE TABLE IF NOT EXISTS pool_sender_quota (
+  sender_id INTEGER NOT NULL, work_key TEXT NOT NULL, day TEXT NOT NULL,
+  count INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (sender_id, work_key, day));
+CREATE TABLE IF NOT EXISTS pool_blocked_senders (
+  sender_id INTEGER PRIMARY KEY, created REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS pool_device_offsets (
+  device_id TEXT NOT NULL, work_key TEXT NOT NULL, src_fp TEXT NOT NULL,
+  b_ms INTEGER NOT NULL, updated REAL NOT NULL,
+  PRIMARY KEY (device_id, work_key, src_fp));
+CREATE TABLE IF NOT EXISTS pool_device_rejections (
+  device_id TEXT NOT NULL, work_key TEXT NOT NULL, src_fp TEXT NOT NULL,
+  created REAL NOT NULL, expires REAL NOT NULL,
+  PRIMARY KEY (device_id, work_key, src_fp));
+CREATE INDEX IF NOT EXISTS pool_device_rejections_expires ON pool_device_rejections(expires);
 -- Durable upload queue: only keys/metadata are stored here; the JPEG remains in the normal cache.
 CREATE TABLE IF NOT EXISTS pool_outbox (
   fp TEXT NOT NULL, k INTEGER NOT NULL, pts_ms INTEGER NOT NULL, duration_ms INTEGER NOT NULL,
@@ -132,6 +148,9 @@ class DB:
         channel_outbox = {r[1] for r in self.conn.execute("PRAGMA table_info(pool_channel_outbox)").fetchall()}
         if channel_outbox and "message_id" not in channel_outbox:
             self.conn.execute("ALTER TABLE pool_channel_outbox ADD COLUMN message_id INTEGER NOT NULL DEFAULT 0")
+        hint_cols = {r[1] for r in self.conn.execute("PRAGMA table_info(pool_hints)").fetchall()}
+        if hint_cols and "verified" not in hint_cols:
+            self.conn.execute("ALTER TABLE pool_hints ADD COLUMN verified INTEGER NOT NULL DEFAULT 0")
 
     def put_thumb_source(self, play_fp: str, thumb_fp: str, a: float, b: float, residual_ms: float,
                          kind: str) -> None:
@@ -211,6 +230,7 @@ class DB:
                     self.conn.execute("DELETE FROM pool_hints WHERE fp=? AND profile=?", (fp, profile))
                 for fp, k in outbox_rows:
                     self.conn.execute("DELETE FROM pool_outbox WHERE fp=? AND k=?", (fp, k))
+                self.conn.execute("DELETE FROM pool_device_rejections WHERE expires<=?", (time.time(),))
                 self.conn.execute("COMMIT")
             except Exception:
                 self.conn.execute("ROLLBACK")
@@ -408,3 +428,83 @@ class DB:
     def preview(self, preview_id: str) -> tuple[str, str] | None:
         r = self.q("SELECT device_id, fp FROM previews WHERE preview_id=?", (preview_id,))
         return (r[0][0], r[0][1]) if r else None
+
+    # ---------------------------------------------------------------- pool quotas & corrections (Epic C)
+    def sender_quota_count(self, sender_id: int, work_key: str, day: str) -> int:
+        r = self.q("SELECT count FROM pool_sender_quota WHERE sender_id=? AND work_key=? AND day=?",
+                   (sender_id, work_key, day))
+        return int(r[0][0]) if r else 0
+
+    def sender_quota_inc(self, sender_id: int, work_key: str, day: str) -> int:
+        self.x("INSERT INTO pool_sender_quota(sender_id, work_key, day, count) VALUES(?,?,?,1) "
+               "ON CONFLICT(sender_id, work_key, day) DO UPDATE SET count=count+1",
+               (sender_id, work_key, day))
+        return self.sender_quota_count(sender_id, work_key, day)
+
+    def sender_quota_claim(self, sender_id: int, work_key: str, day: str, limit: int) -> bool:
+        """Atomically reserve one per-title contribution slot, including across concurrent handlers."""
+        return self.x(
+            "INSERT INTO pool_sender_quota(sender_id, work_key, day, count) VALUES(?,?,?,1) "
+            "ON CONFLICT(sender_id, work_key, day) DO UPDATE SET count=count+1 WHERE count<?",
+            (sender_id, work_key, day, max(1, int(limit)))) == 1
+
+    def sender_quotas(self) -> list[tuple[int, str, str, int]]:
+        return self.q("SELECT sender_id, work_key, day, count FROM pool_sender_quota ORDER BY day DESC")
+
+    def is_pool_blocked_sender(self, sender_id: int) -> bool:
+        r = self.q("SELECT 1 FROM pool_blocked_senders WHERE sender_id=?", (sender_id,))
+        return bool(r)
+
+    def block_pool_sender(self, sender_id: int) -> None:
+        self.x("INSERT OR REPLACE INTO pool_blocked_senders(sender_id, created) VALUES(?,?)",
+               (sender_id, time.time()))
+
+    def unblock_pool_sender(self, sender_id: int) -> bool:
+        return self.x("DELETE FROM pool_blocked_senders WHERE sender_id=?", (sender_id,)) > 0
+
+    def blocked_pool_senders(self) -> list[tuple[int, float]]:
+        return self.q("SELECT sender_id, created FROM pool_blocked_senders ORDER BY created DESC")
+
+    def set_hint_verified(self, fp: str, profile: str, verified: bool = True) -> bool:
+        return self.x("UPDATE pool_hints SET verified=? WHERE fp=? AND profile=?",
+                      (1 if verified else 0, fp, profile)) > 0
+
+    def is_hint_verified(self, fp: str, profile: str) -> bool:
+        r = self.q("SELECT verified FROM pool_hints WHERE fp=? AND profile=?", (fp, profile))
+        return bool(r and r[0][0])
+
+    def put_pool_offset(self, device_id: str, work_key: str, src_fp: str, b_ms: int) -> None:
+        self.x("INSERT OR REPLACE INTO pool_device_offsets(device_id, work_key, src_fp, b_ms, updated) "
+               "VALUES(?,?,?,?,?)", (device_id, work_key, src_fp, int(b_ms), time.time()))
+
+    def get_pool_offset(self, device_id: str, work_key: str, src_fp: str) -> int | None:
+        r = self.q("SELECT b_ms FROM pool_device_offsets WHERE device_id=? AND work_key=? AND src_fp=?",
+                   (device_id, work_key, src_fp))
+        return int(r[0][0]) if r else None
+
+    def delete_pool_offset(self, device_id: str, work_key: str, src_fp: str) -> bool:
+        return self.x("DELETE FROM pool_device_offsets WHERE device_id=? AND work_key=? AND src_fp=?",
+                      (device_id, work_key, src_fp)) > 0
+
+    def put_pool_rejection(self, device_id: str, work_key: str, src_fp: str, days: int = 30) -> None:
+        now = time.time()
+        expires = now + max(1, int(days)) * 86400
+        self.x("INSERT OR REPLACE INTO pool_device_rejections(device_id, work_key, src_fp, created, expires) "
+               "VALUES(?,?,?,?,?)", (device_id, work_key, src_fp, now, expires))
+
+    def is_pool_rejected(self, device_id: str, work_key: str, src_fp: str) -> bool:
+        r = self.q("SELECT 1 FROM pool_device_rejections WHERE device_id=? AND work_key=? AND src_fp=? AND expires>?",
+                   (device_id, work_key, src_fp, time.time()))
+        return bool(r)
+
+    def delete_pool_rejection(self, device_id: str, work_key: str, src_fp: str) -> bool:
+        return self.x("DELETE FROM pool_device_rejections WHERE device_id=? AND work_key=? AND src_fp=?",
+                      (device_id, work_key, src_fp)) > 0
+
+    def prune_pool_rejections(self) -> int:
+        return self.x("DELETE FROM pool_device_rejections WHERE expires<=?", (time.time(),))
+
+    def get_pool_rejections_for_device(self, device_id: str, work_key: str) -> set[str]:
+        return {r[0] for r in self.q(
+            "SELECT src_fp FROM pool_device_rejections WHERE device_id=? AND work_key=? AND expires>?",
+            (device_id, work_key, time.time()))}

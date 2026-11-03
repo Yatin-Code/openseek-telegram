@@ -107,6 +107,66 @@ def _tile_metadata_from_filename(filename: str, k: int) -> tuple[int, int, int] 
     return pts_ms, duration_ms, n_tiles
 
 
+def _rank_hint_rows(rows: list[tuple], *, duration_ms: int, imdb: str | None, season: int,
+                    episode: int, size_bytes: int | None, filename_norm: str | None,
+                    device_id: str | None, work_key: str | None, db, limit: int) -> list[dict]:
+    """Apply the shared catalog, timing, correction, and tie-break policy to normalized rows."""
+    rejected_fps = db.get_pool_rejections_for_device(device_id, work_key) if (device_id and work_key) else set()
+    query_tokens = set((filename_norm or "").split(".")) - {""}
+    ranked = []
+    for (fp, profile, row_imdb, row_season, row_episode, source_ms, row_size,
+         row_filename, n_tiles, grid, created, n_slots, verified) in rows:
+        if fp in rejected_fps:
+            continue
+        relation_data = _timing_relation(duration_ms, int(source_ms))
+        if relation_data is None:
+            continue
+        relation, a_num, a_den = relation_data
+        match_parts = []
+        score = 0
+        same_catalog = bool(imdb and row_imdb == imdb)
+        same_episode = same_catalog and int(row_season) == season and int(row_episode) == episode
+        if same_episode:
+            match_parts.extend(("imdb", "season", "episode", "duration"))
+            score = {"same_length": 100, "speed_24_25": 95, "length_differs": 90}[relation]
+        elif same_catalog and season == episode == int(row_season) == int(row_episode) == 0:
+            match_parts.extend(("imdb", "duration"))
+            score = 85
+        elif filename_norm and row_filename:
+            if filename_norm == row_filename and relation == "same_length":
+                match_parts.extend(("filename", "duration"))
+                score = 75
+            else:
+                candidate_tokens = set(str(row_filename).split(".")) - {""}
+                overlap = len(query_tokens & candidate_tokens) / max(1, len(query_tokens | candidate_tokens))
+                if overlap >= 0.6 and relation == "same_length":
+                    match_parts.extend(("filename", "duration"))
+                    score = 65
+        if score < 65:
+            continue
+        size_delta = (abs(int(row_size) - size_bytes) / max(1, size_bytes)
+                      if row_size is not None and size_bytes is not None else None)
+        offset_b = (db.get_pool_offset(device_id, work_key, fp) or 0) if (device_id and work_key) else 0
+        ranked.append({
+            "fp": fp, "profile": profile, "duration_ms": int(source_ms), "n_slots": int(n_slots),
+            "n_tiles": int(n_tiles), "score": score, "match": "+".join(match_parts),
+            "relation": relation, "approximate": True, "a_num": a_num, "a_den": a_den,
+            "b_ms": offset_b, "source_duration_ms": int(source_ms),
+            "_size_delta": size_delta if size_delta is not None and size_delta <= 0.01 else None,
+            "_delta": abs(int(source_ms) - duration_ms), "_created": float(created),
+            "_verified": int(verified),
+        })
+    ranked.sort(key=lambda item: (-item["score"], item["_size_delta"] is None,
+                                  item["_size_delta"] if item["_size_delta"] is not None else 0,
+                                  item["_delta"], -item["_created"], -item["_verified"],
+                                  item["fp"], item["profile"]))
+    result = ranked[:max(1, min(int(limit), 8))]
+    for candidate in result:
+        for key in ("_size_delta", "_delta", "_created", "_verified"):
+            candidate.pop(key, None)
+    return result
+
+
 class _DualStackHTTPSConnection(http.client.HTTPSConnection):
     """Prefer IPv4 but fall back across resolved addresses before timing out a Bot API request.
 
@@ -519,7 +579,8 @@ class PoolService:
 
     def candidates(self, *, duration_ms: int, imdb: str | None = None, season: int = 0,
                    episode: int = 0, size_bytes: int | None = None, filename: str | None = None,
-                   exclude_fp: str | None = None, limit: int = 8) -> list[dict]:
+                   exclude_fp: str | None = None, limit: int = 8,
+                   device_id: str | None = None, work_key: str | None = None) -> list[dict]:
         """Rank bounded NVMT reuse candidates using only the declared catalog hints."""
         query = validate_pool_hints(imdb, season, episode, duration_ms, size_bytes, filename)
         filename_norm = query["filename_norm"]
@@ -527,60 +588,27 @@ class PoolService:
             raise PoolError(400, "missing_hints")
         if exclude_fp is not None and not is_fingerprint(exclude_fp):
             raise PoolError(400, "bad_key")
+        hint_cols = {r[1] for r in self.db.conn.execute("PRAGMA table_info(pool_hints)").fetchall()}
+        has_verified = "verified" in hint_cols
+        ver_col = ",h.verified" if has_verified else ""
         rows = self.db.q(
-            "SELECT h.fp,h.profile,h.imdb,h.season,h.episode,h.duration_ms,h.size_bytes,h.filename_norm,"
-            "h.n_tiles,h.grid,h.created,p.n_slots "
-            "FROM pool_hints h JOIN pool_packages p ON p.fp=h.fp AND p.profile=h.profile "
-            "WHERE ABS(h.duration_ms-?)<=? AND (? IS NULL OR h.fp<>?)",
+            f"SELECT h.fp,h.profile,h.imdb,h.season,h.episode,h.duration_ms,h.size_bytes,h.filename_norm,"
+            f"h.n_tiles,h.grid,h.created,p.n_slots{ver_col} "
+            f"FROM pool_hints h JOIN pool_packages p ON p.fp=h.fp AND p.profile=h.profile "
+            f"WHERE ABS(h.duration_ms-?)<=? AND (? IS NULL OR h.fp<>?)",
             (duration_ms, max(90_000, int(duration_ms * 0.15)), exclude_fp, exclude_fp))
-        qtokens = set((filename_norm or "").split(".")) - {""}
-        ranked = []
-        for (fp, profile, row_imdb, row_season, row_episode, source_ms, row_size,
-             row_filename, n_tiles, grid, created, n_slots) in rows:
-            relation_data = _timing_relation(duration_ms, int(source_ms))
-            if relation_data is None:
-                continue
-            relation, a_num, a_den = relation_data
-            match_parts = []
-            score = 0
-            same_catalog = bool(imdb and row_imdb == imdb)
-            same_episode = same_catalog and int(row_season) == season and int(row_episode) == episode
-            if same_episode:
-                match_parts.extend(("imdb", "season", "episode", "duration"))
-                score = {"same_length": 100, "speed_24_25": 95, "length_differs": 90}[relation]
-            elif same_catalog and season == episode == int(row_season) == int(row_episode) == 0:
-                match_parts.extend(("imdb", "duration"))
-                score = 85
-            elif filename_norm and row_filename:
-                if filename_norm == row_filename and relation == "same_length":
-                    match_parts.extend(("filename", "duration"))
-                    score = 75
-                else:
-                    ctokens = set(str(row_filename).split(".")) - {""}
-                    overlap = len(qtokens & ctokens) / max(1, len(qtokens | ctokens))
-                    if overlap >= 0.6 and relation == "same_length":
-                        match_parts.extend(("filename", "duration"))
-                        score = 65
-            if score < 65:
-                continue
-            size_delta = (abs(int(row_size) - size_bytes) / max(1, size_bytes)
-                          if row_size is not None and size_bytes is not None else None)
-            ranked.append({
-                "fp": fp, "profile": profile, "duration_ms": int(source_ms), "n_slots": int(n_slots),
-                "n_tiles": int(n_tiles), "score": score, "match": "+".join(match_parts),
-                "relation": relation, "approximate": True, "a_num": a_num, "a_den": a_den,
-                "b_ms": 0, "source_duration_ms": int(source_ms),
-                "_size_delta": size_delta if size_delta is not None and size_delta <= 0.01 else None,
-                "_delta": abs(int(source_ms) - duration_ms), "_created": float(created),
-            })
-        ranked.sort(key=lambda c: (-c["score"], c["_size_delta"] is None,
-                                   c["_size_delta"] if c["_size_delta"] is not None else 0,
-                                   c["_delta"], -c["_created"], c["fp"], c["profile"]))
-        result = ranked[:max(1, min(int(limit), 8))]
-        for candidate in result:
-            for key in ("_size_delta", "_delta", "_created"):
-                candidate.pop(key, None)
-        return result
+        normalized = []
+        for row in rows:
+            if has_verified:
+                candidate, verified = row[:-1], row[-1]
+            else:
+                candidate, verified = row, 0
+            fp, profile, row_imdb, row_season, row_episode, source_ms, row_size, row_filename, n_tiles, grid, created, n_slots = candidate
+            normalized.append((fp, profile, row_imdb, row_season, row_episode, source_ms, row_size,
+                               row_filename, n_tiles, grid, created, n_slots, verified))
+        return _rank_hint_rows(normalized, duration_ms=duration_ms, imdb=imdb, season=season,
+                               episode=episode, size_bytes=size_bytes, filename_norm=filename_norm,
+                               device_id=device_id, work_key=work_key, db=self.db, limit=limit)
 
     def _package_slots_from_tiles(self, fp: str, profile: str, slots: list[int],
                                   tile_rows: list[tuple]) -> tuple[bytes, dict] | None:

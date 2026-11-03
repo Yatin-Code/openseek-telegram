@@ -48,6 +48,21 @@ def main(argv: list[str] | None = None) -> int:
     pool_sub.add_parser("scan", help="scan new Telegram messages once")
     pool_sub.add_parser("rebuild", help="clear and rebuild the channel index")
     pool_sub.add_parser("login", help="log in to a Telegram user session")
+    contrib = pool_sub.add_parser("contributor", help="manage Telegram contributors and quotas")
+    contrib_sub = contrib.add_subparsers(dest="contrib_action", required=True)
+    contrib_sub.add_parser("list", help="list contributor quotas and blocked senders")
+    block_p = contrib_sub.add_parser("block", help="block a Telegram sender ID")
+    block_p.add_argument("sender_id", type=int)
+    unblock_p = contrib_sub.add_parser("unblock", help="unblock a Telegram sender ID")
+    unblock_p.add_argument("sender_id", type=int)
+    hints = pool_sub.add_parser("hints", help="manage package hints")
+    hints_sub = hints.add_subparsers(dest="hints_action", required=True)
+    ver_p = hints_sub.add_parser("verify", help="mark a package's hints as verified")
+    ver_p.add_argument("fp")
+    ver_p.add_argument("profile")
+    unver_p = hints_sub.add_parser("unverify", help="unmark a package's hints verified status")
+    unver_p.add_argument("fp")
+    unver_p.add_argument("profile")
     a = ap.parse_args(argv)
     if a.cmd == "setup":
         from .setup import run_setup
@@ -92,6 +107,42 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({**report, "daemon": f"HTTP {status}"}, indent=2, sort_keys=True))
         return 1
     if a.cmd == "pool":
+        if a.pool_action == "contributor":
+            from .db import DB
+            settings.data_dir.mkdir(parents=True, exist_ok=True)
+            db = DB(settings.data_dir / "openseek.db")
+            try:
+                if a.contrib_action == "list":
+                    quotas = [{"sender_id": r[0], "work_key": r[1], "day": r[2], "count": r[3]}
+                              for r in db.sender_quotas()]
+                    blocked = [{"sender_id": r[0], "created": r[1]} for r in db.blocked_pool_senders()]
+                    print(json.dumps({"quotas": quotas, "blocked": blocked}, indent=2, sort_keys=True))
+                    return 0
+                if a.contrib_action == "block":
+                    db.block_pool_sender(a.sender_id)
+                    print(f"blocked sender {a.sender_id}")
+                    return 0
+                if a.contrib_action == "unblock":
+                    ok = db.unblock_pool_sender(a.sender_id)
+                    print(f"unblocked sender {a.sender_id}" if ok else f"sender {a.sender_id} was not blocked")
+                    return 0
+            finally:
+                db.close()
+        if a.pool_action == "hints":
+            from .db import DB
+            settings.data_dir.mkdir(parents=True, exist_ok=True)
+            db = DB(settings.data_dir / "openseek.db")
+            try:
+                if a.hints_action == "verify":
+                    ok = db.set_hint_verified(a.fp, a.profile, True)
+                    print(f"verified {a.fp} {a.profile}" if ok else f"hints not found for {a.fp} {a.profile}")
+                    return 0 if ok else 1
+                if a.hints_action == "unverify":
+                    ok = db.set_hint_verified(a.fp, a.profile, False)
+                    print(f"unverified {a.fp} {a.profile}" if ok else f"hints not found for {a.fp} {a.profile}")
+                    return 0 if ok else 1
+            finally:
+                db.close()
         if a.pool_action == "login":
             from .pool import PoolError
             from .telegram_mt import TelegramMTProtoStore

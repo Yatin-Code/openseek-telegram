@@ -5,6 +5,8 @@ All notable changes are documented here. The format follows [Keep a Changelog](h
 ## [Unreleased]
 
 ### Added
+* Telegram librarian support for NVMT package contributions, contributor quotas and moderation, verified hint ranking,
+  and per-device candidate offsets and rejections.
 * Optional Telegram-backed shared pool for exact-file OpenSeek tiles. Participating instances generate all video
   frames locally; only finished JPEGs are uploaded. The pool uses SQLite metadata, separate read/write bearer keys,
   Telegram `sendDocument` storage, a durable upload outbox, exact-content lookup, and local-cache fallback on misses.
