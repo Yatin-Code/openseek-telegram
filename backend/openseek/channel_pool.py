@@ -97,8 +97,7 @@ class ChannelPoolService:
         return self.index.episode_candidates(episode_key, duration_ms, limit)
 
     def candidates(self, **hints) -> list[dict]:
-        # Hint-aware ranking is added with B3/B4 once Telegram manifests rebuild the index.
-        return []
+        return self.index.candidates(**hints)
 
     def index_episode_package(self, fp: str, profile: str, episode_key: str) -> bool:
         if (not is_fingerprint(fp) or profile not in NVMT_PROFILES or

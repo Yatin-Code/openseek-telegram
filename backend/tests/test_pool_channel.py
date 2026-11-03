@@ -284,6 +284,64 @@ def test_channel_manifest_incremental_ordering_malformed_and_rebuild(tmp_path):
         db.close()
 
 
+def test_channel_candidates_rank_movies_and_series_from_manifest_hints(tmp_path):
+    store = MemoryChannel()
+    db, _cache = make_db_cache(tmp_path / "node")
+    index = ChannelIndex(db, store, scan_limit=100, refresh_s=10)
+    pool = ChannelPoolService(index)
+    image = jpeg()
+
+    def publish(label, duration_ms, imdb, season, episode, filename):
+        fp = hashlib.sha256(label.encode()).hexdigest()
+        grid = 5_000
+        n_slots = (duration_ms + grid - 1) // grid
+        tiles = {slot: (slot * grid, image) for slot in range(n_slots)}
+        package = encode_nvmt(grid, n_slots, tiles)
+        pool.upload_package(fp, "nvmt-v1-g5", duration_ms, package, imdb=imdb,
+                            season=season, episode=episode, size_bytes=5_000_000,
+                            filename=filename)
+        return fp
+
+    try:
+        series_fp = publish("series-s02e03", 20_000, "tt1111111", 2, 3, "Show.S02E03.mkv")
+        movie_fp = publish("movie-match", 20_000, "tt2222222", 0, 0, "Movie.Title.2024.mkv")
+        filename_fp = publish("filename-match", 20_000, "tt9999999", 0, 0,
+                              "Movie.Title.2024.mp4")
+        nearby_fp = publish("movie-nearby", 24_000, "tt2222222", 0, 0,
+                            "Movie.Title.2024.webm")
+        outside_fp = publish("movie-outside-cutoff", 120_000, "tt2222222", 0, 0,
+                             "Movie.Title.2024.mkv")
+
+        # A valid manifest alone must not be returned as a candidate.
+        orphan_fp = hashlib.sha256(b"manifest without tiles").hexdigest()
+        orphan = {"v": 1, "fp": orphan_fp, "profile": "nvmt-v1-g5", "imdb": "tt2222222",
+                  "season": 0, "episode": 0, "duration_ms": 20_000, "size_bytes": 5_000_000,
+                  "filename_norm": "movie.title.2024", "n_tiles": 4, "grid": 5_000,
+                  "created": 1}
+        store.post_message(ChannelPoolService._manifest_caption(orphan))
+        index.refresh(force=True)
+
+        movie_candidates = pool.candidates(duration_ms=20_000, imdb="tt2222222", season=0, episode=0,
+                                           size_bytes=5_000_000, filename="Movie.Title.2024.mkv")
+        movie_fps = [candidate["fp"] for candidate in movie_candidates]
+        assert movie_fps == [movie_fp, nearby_fp, filename_fp]
+        assert outside_fp not in movie_fps and orphan_fp not in movie_fps
+        assert movie_candidates[0]["score"] == 100
+        assert movie_candidates[0]["match"] == "imdb+season+episode+duration"
+        assert movie_candidates[1]["relation"] == "length_differs"
+        assert movie_candidates[2]["score"] == 75
+        assert movie_candidates[0]["n_slots"] == 4
+        assert movie_candidates[0]["n_tiles"] == 2
+
+        series_candidates = pool.candidates(duration_ms=20_000, imdb="tt1111111", season=2, episode=3,
+                                            filename="Other.Name.mkv")
+        assert [candidate["fp"] for candidate in series_candidates] == [series_fp]
+        assert series_candidates[0]["score"] == 100
+        assert series_candidates[0]["match"] == "imdb+season+episode+duration"
+    finally:
+        db.close()
+
+
 def test_first_writer_wins_and_losing_outbox_is_cleared(tmp_path):
     fp = "b" * 64
     store = MemoryChannel()
