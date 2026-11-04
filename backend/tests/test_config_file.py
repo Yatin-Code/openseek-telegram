@@ -72,6 +72,13 @@ def test_missing_file_uses_defaults(tmp_path):
     assert Settings.from_env({"OPENSEEK_CONFIG_FILE": str(tmp_path)}) == Settings()    # a directory
 
 
+def test_cron_secret_is_environment_only_and_optional(tmp_path):
+    assert Settings().cron_secret == ""
+    assert Settings.from_env({"OPENSEEK_CRON_SECRET": "c" * 40}).cron_secret == "c" * 40
+    # Like admin tokens, a lesser-privileged config file must not inject this secret.
+    assert load(tmp_path, {"cron_secret": "c" * 40}).cron_secret == ""
+
+
 def test_bom_prefixed_file(tmp_path):
     s = load(tmp_path, b"\xef\xbb\xbf" + json.dumps({"port": 9010}).encode(), raw=True)
     assert s.port == 9010

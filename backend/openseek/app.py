@@ -47,8 +47,9 @@ from .pool import (MAX_NVMT_BYTES, ChannelPoolClient, ChannelPoolSync, PoolClien
                    PoolError, PoolService, PoolSync, TelegramBotStore)
 from .channel_index import ChannelIndex
 from .channel_pool import ChannelPoolService, PoolWritePolicy
-from .remote import RemoteChannelStore, SupabaseClient
-from .store import ChannelStore
+from .remote import RemoteChannelStore, RemoteUploadQueueStore, SupabaseClient
+from .store import ChannelStore, UploadQueueStore
+from .uploads import UploadError, UploadService
 from .telegram_mt import TelegramMTProtoStore
 from .contribution import TelegramLibrarian
 from .contrib import ContributionPolicy, Spacing, clean_hosts
@@ -59,7 +60,8 @@ log = logging.getLogger("openseek.app")
 
 MAX_BODY = 16 * 1024
 MAX_MS = 12 * 3600 * 1000
-PUBLIC_PATHS = {"/v1/health", "/v1/pair/start", "/v1/pair/claim"}
+PUBLIC_PATHS = {"/v1/health", "/v1/pair/start", "/v1/pair/claim",
+                "/v1/internal/tick"}       # tick authenticates its own Bearer secret in the route
 # Headers a reverse proxy, tunnel or load balancer adds. The owner and admin APIs are direct-connection only: a request that carries any of them
 # was relayed by something else, so its TCP peer address says nothing about who sent it. Refused (remote access is what the guest listener is for).
 PROXY_HEADERS = ("x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "x-forwarded-port", "forwarded", "x-real-ip",
@@ -88,6 +90,8 @@ class Core:
         self.channel_store = None
         self.channel_index = None
         self.librarian = None
+        self.supabase = None
+        self.uploads = None
         mode = settings.effective_pool_mode
         self.pool_write_policy = PoolWritePolicy(mode)
         if settings.pool_host_enabled:
@@ -101,10 +105,12 @@ class Core:
                 store=self.channel_store,
                 proxy_url=settings.pool_contrib_url,
                 librarian_url=_librarian_url(settings) or "")
-            if settings.profile == "vercel":
-                index_store = RemoteChannelStore(SupabaseClient(
+            if settings.profile == "vercel" or (settings.supabase_url and settings.supabase_service_key):
+                self.supabase = SupabaseClient(
                     settings.supabase_url, settings.supabase_service_key,
-                    bucket=settings.supabase_bucket))
+                    bucket=settings.supabase_bucket)
+            if settings.profile == "vercel":
+                index_store = RemoteChannelStore(self.supabase)
                 index_db = None
             else:
                 index_store = ChannelStore(self.db)
@@ -114,6 +120,10 @@ class Core:
                 channel_id=settings.telegram_channel_id,
                 scan_limit=settings.pool_channel_scan_limit, refresh_s=settings.pool_index_refresh_s)
             self.pool = ChannelPoolService(self.channel_index, settings.pool_read_key, settings.pool_write_key)
+            if settings.profile == "vercel" or self.supabase is not None:
+                upload_store = (RemoteUploadQueueStore(self.supabase) if self.supabase is not None
+                                else UploadQueueStore(self.db))
+                self.uploads = UploadService(settings, self.supabase, self.pool, upload_store)
             if settings.librarian_enabled and hasattr(self.channel_store, "set_message_handler"):
                 self.librarian = TelegramLibrarian(self.channel_store, self.channel_index)
                 self.librarian.attach()
@@ -193,6 +203,8 @@ class Core:
             self.channel_index.stop()
         if self.channel_store:
             self.channel_store.close()
+        if self.supabase is not None:
+            self.supabase.close()
         self.proxy.stop()
         self.db.close()
 
@@ -307,7 +319,11 @@ class Guard:
             return await _send_json(send, 403, {"error": "forbidden"})
 
         headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
-        if not self.public and any(h in headers for h in PROXY_HEADERS):
+        # Vercel's platform proxy always adds forwarded headers; refusing them would make the
+        # profile unusable. They are never consulted for auth, rate limits, or base URLs. The
+        # loopback admin listener keeps the strict local-only rules (F2 owns its surface).
+        forwarded_allowed = not self.admin and self.core.settings.profile == "vercel"
+        if not self.public and not forwarded_allowed and any(h in headers for h in PROXY_HEADERS):
             return await _send_json(send, 403, {"error": "proxy_refused"})
         clen = headers.get("content-length")
         pool_upload = scope.get("path", "").startswith("/v1/pool/") and scope["method"] == "PUT"
@@ -538,6 +554,19 @@ class ClaimIn(BaseModel):
     pair_id: StrictStr = Field(max_length=64)
     device_name: StrictStr = Field(max_length=256)
     client_proof: StrictStr = Field(max_length=128)
+
+
+class UploadIn(BaseModel):
+    """Vercel staging request: the same hints as the direct NVMT PUT, never bytes."""
+    model_config = ConfigDict(extra="ignore")
+    fp: StrictStr = Field(min_length=1, max_length=1024)
+    profile: StrictStr = Field(min_length=1, max_length=1024)
+    duration_ms: StrictInt
+    size_bytes: StrictInt | None = None
+    imdb: StrictStr | None = Field(default=None, max_length=1024)
+    season: StrictInt = 0
+    episode: StrictInt = 0
+    filename: StrictStr | None = Field(default=None, max_length=1024)
 
 
 class StartIn(BaseModel):
@@ -1208,6 +1237,84 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
             return err(exc.status, exc.code, headers)
         return JSONResponse(result, status_code=200 if result["duplicate"] else 201,
                             headers={"Cache-Control": "no-store"})
+
+    # ---------------------------------------------------------------- Vercel staged uploads
+    @app.post("/v1/pool/uploads", status_code=201)
+    async def pool_upload_create(request: Request, body: UploadIn):
+        pool = core.pool
+        if pool is None:
+            # A plain local node has no pool surface either; staging is the contract answer.
+            return err(400, "staging_unavailable") if core.uploads is None else err(404, "not_found")
+        denied = pool_write_denial(request, pool)
+        if denied is not None:
+            return denied
+        if core.uploads is None:
+            return err(400, "staging_unavailable")      # local/VPS: direct PUT is the only path
+        try:
+            result = await asyncio.to_thread(
+                core.uploads.create, device_id=request.state.device_id, fp=body.fp,
+                profile=body.profile, duration_ms=body.duration_ms,
+                size_bytes=body.size_bytes, imdb=body.imdb, season=body.season,
+                episode=body.episode, filename=body.filename)
+        except UploadError as exc:
+            return err(exc.status, exc.code)
+        return JSONResponse(result, status_code=201, headers={"Cache-Control": "no-store"})
+
+    @app.post("/v1/pool/uploads/{upload_id}/finalize", status_code=202)
+    async def pool_upload_finalize(request: Request, upload_id: str):
+        pool = core.pool
+        if pool is None:
+            return err(404, "not_found")
+        denied = pool_write_denial(request, pool)
+        if denied is not None:
+            return denied
+        if core.uploads is None:
+            return err(404, "unknown_upload")
+        try:
+            result = await asyncio.to_thread(core.uploads.finalize, upload_id)
+        except UploadError as exc:
+            return err(exc.status, exc.code)
+        return JSONResponse(result, status_code=202, headers={"Cache-Control": "no-store"})
+
+    @app.get("/v1/pool/uploads/{upload_id}")
+    async def pool_upload_status(request: Request, upload_id: str):
+        pool = core.pool
+        if pool is None:
+            return err(404, "not_found")
+        if core.uploads is None:
+            return err(404, "unknown_upload")
+        write_key = pool.authorize(pool_key(request), write=True)
+        try:
+            result = await asyncio.to_thread(
+                core.uploads.status, upload_id, device_id=request.state.device_id,
+                write_key=write_key)
+        except UploadError as exc:
+            return err(exc.status, exc.code)
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+    @app.post("/v1/internal/tick")
+    async def internal_tick(request: Request):
+        """Cron entry point: drain a bounded number of queued Telegram publications."""
+        secret = core.settings.cron_secret
+        admin = core.admin_token
+        if not secret and not admin:
+            return err(503, "tick_unconfigured")
+        given = (pool_key(request) or "").encode("utf-8", "replace")
+        accepted = [value.encode("utf-8") for value in (secret, admin) if value]
+        if not any(hmac.compare_digest(given, value) for value in accepted):
+            return err(401, "unauthorized")
+        if core.uploads is None:
+            return err(503, "tick_unconfigured")
+        raw_limit = request.query_params.get("limit", "1")
+        if not raw_limit.isdigit():
+            return err(400, "bad_request")
+        limit = max(1, min(int(raw_limit), 3))
+        try:
+            result = await asyncio.to_thread(core.uploads.drain, limit)
+        except Exception as exc:                       # store failure, never a per-item failure
+            log.error("tick failed (%s)", type(exc).__name__)
+            return err(503, "tick_failed")
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
 
     # ---------------------------------------------------------------- data plane
     def data_access(request: Request, cap: str, preview_id: str):

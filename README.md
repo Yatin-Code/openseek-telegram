@@ -112,6 +112,7 @@ All settings are environment variables read at start-up. Invalid values stop the
 | `OPENSEEK_HOST` / `OPENSEEK_PORT` | `0.0.0.0` / `8787` | HTTPS API listener |
 | `OPENSEEK_ADMIN_PORT` | `8788` | Admin listener, always bound to 127.0.0.1; every call except the dashboard page needs the admin secret |
 | `OPENSEEK_ADMIN_TOKEN` | random, in `<data>/admin.token` | Optional explicit admin secret (at least 16 characters). Normally leave unset |
+| `OPENSEEK_CRON_SECRET` | empty | Bearer secret for `POST /v1/internal/tick` (Vercel publication queue). When empty, the generated admin token is the only accepted credential |
 | `OPENSEEK_PUBLIC_PORT` | `0` (off) | Internet-facing guest listener; must differ from the other ports |
 | `OPENSEEK_PUBLIC_BIND` | `0.0.0.0` | Bind address of the guest listener |
 | `OPENSEEK_PUBLIC_HOST` | empty | `name.example.org:443`, advertised in invitations and capability URLs |

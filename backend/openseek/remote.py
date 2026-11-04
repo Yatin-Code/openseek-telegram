@@ -121,6 +121,135 @@ class SupabaseClient:
                                    "signed upload URL missing")
         return str(body["url"])
 
+    def _object_url(self, path: str) -> str:
+        return (f"/storage/v1/object/{quote(self.bucket, safe='')}/"
+                f"{quote(path, safe='/')}")
+
+    def get_object(self, path: str) -> bytes:
+        """Authenticated staging download. The path never contains secrets."""
+        return self.request("GET", self._object_url(path)).content
+
+    def object_exists(self, path: str) -> bool:
+        """HEAD the staged object. A missing object is a normal answer, not an exception."""
+        try:
+            response = self._client.head(self._object_url(path))
+        except httpx.HTTPError as exc:
+            raise RemoteStoreError(0, type(exc).__name__, str(exc)) from None
+        if response.status_code == 404:
+            return False
+        if response.status_code >= 400:
+            raise RemoteStoreError(response.status_code, "storage_head_failed",
+                                   response.text[:300] or "head failed")
+        return True
+
+
+_UPLOAD_COLUMNS = ("upload_id,device_id,fp,profile,duration_ms,size_bytes,imdb,season,episode,"
+                   "filename_norm,object_path,state,created,updated,expires,error")
+
+
+class RemoteUploadQueueStore:
+    """`UploadQueueStore` over PostgREST, with the same optimistic single-row claims.
+
+    PostgREST cannot start a multi-statement transaction, so `claim` relies on a
+    conditional PATCH (`state=eq.queued`): the only worker whose PATCH returns a row
+    owns the upload. A crash leaves a `publishing` row that no worker reclaims; it is
+    harmless because the upload is not marked accepted until Telegram takes it.
+    """
+
+    def __init__(self, client: SupabaseClient):
+        self.client = client
+
+    @staticmethod
+    def _upload(row: dict) -> dict:
+        out = dict(row)
+        for key in ("duration_ms", "size_bytes", "season", "episode"):
+            if out.get(key) is not None:
+                out[key] = int(out[key])
+        for key in ("created", "updated", "expires"):
+            out[key] = float(out[key])
+        return out
+
+    def create_upload(self, row: dict) -> None:
+        self.client.upsert("pool_uploads", [row], on_conflict="upload_id",
+                           ignore_duplicates=True)
+
+    def get_upload(self, upload_id: str) -> dict | None:
+        rows = self.client.select(
+            "pool_uploads", [("select", _UPLOAD_COLUMNS), ("upload_id", f"eq.{upload_id}"),
+                             ("limit", "1")])
+        return self._upload(rows[0]) if rows else None
+
+    def expire(self, upload_id: str, now: float) -> bool:
+        rows = self.client.patch(
+            "pool_uploads",
+            [("upload_id", f"eq.{upload_id}"), ("state", "eq.pending"),
+             ("expires", f"lte.{float(now)}")],
+            {"state": "expired", "updated": float(now), "error": "expired"})
+        return bool(rows)
+
+    def enqueue(self, upload_id: str, now: float) -> bool:
+        claimed = self.client.patch(
+            "pool_uploads",
+            [("upload_id", f"eq.{upload_id}"), ("state", "eq.pending")],
+            {"state": "queued", "updated": float(now), "error": None})
+        if not claimed:
+            return False
+        row = claimed[0]
+        self.client.upsert("pool_publication_queue", [{
+            "upload_id": upload_id, "fp": row["fp"], "profile": row["profile"],
+            "attempts": 0, "next_attempt": float(now), "state": "queued",
+            "created": float(now), "updated": float(now), "error": None}],
+            on_conflict="upload_id", ignore_duplicates=True)
+        return True
+
+    def claim(self, now: float) -> dict | None:
+        due = self.client.select(
+            "pool_publication_queue",
+            [("select", "upload_id,attempts"), ("state", "eq.queued"),
+             ("next_attempt", f"lte.{float(now)}"), ("order", "next_attempt.asc"),
+             ("limit", "8")])
+        for candidate in due:
+            claimed = self.client.patch(
+                "pool_publication_queue",
+                [("upload_id", f"eq.{candidate['upload_id']}"), ("state", "eq.queued")],
+                {"state": "publishing", "updated": float(now)})
+            if not claimed:
+                continue
+            upload_id = candidate["upload_id"]
+            self.client.patch(
+                "pool_uploads",
+                [("upload_id", f"eq.{upload_id}"), ("state", "eq.queued")],
+                {"state": "publishing", "updated": float(now)})
+            row = self.get_upload(upload_id)
+            if row is None:
+                self.client.patch(
+                    "pool_publication_queue",
+                    [("upload_id", f"eq.{upload_id}"), ("state", "eq.publishing")],
+                    {"state": "failed", "updated": float(now), "error": "unknown_upload"})
+                continue
+            row["attempts"] = int(candidate.get("attempts", 0))
+            return row
+        return None
+
+    def retry(self, upload_id: str, *, attempts: int, next_attempt: float, error: str,
+              terminal: bool, now: float) -> None:
+        state = "failed" if terminal else "queued"
+        self.client.patch(
+            "pool_publication_queue", [("upload_id", f"eq.{upload_id}")],
+            {"attempts": int(attempts), "next_attempt": float(next_attempt), "state": state,
+             "updated": float(now), "error": error})
+        self.client.patch(
+            "pool_uploads", [("upload_id", f"eq.{upload_id}")],
+            {"state": state, "updated": float(now), "error": error})
+
+    def complete(self, upload_id: str, now: float) -> None:
+        self.client.patch(
+            "pool_uploads", [("upload_id", f"eq.{upload_id}")],
+            {"state": "accepted", "updated": float(now), "error": None})
+        self.client.patch(
+            "pool_publication_queue", [("upload_id", f"eq.{upload_id}")],
+            {"state": "done", "updated": float(now), "error": None})
+
 
 class RemoteChannelStore:
     """`ChannelStore` surface implemented over PostgREST tables and the package view."""

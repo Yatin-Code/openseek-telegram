@@ -20,6 +20,131 @@ def _tile_dict(row) -> dict:
     return dict(zip(keys, row))
 
 
+_UPLOAD_COLUMNS = ("upload_id,device_id,fp,profile,duration_ms,size_bytes,imdb,season,episode,"
+                   "filename_norm,object_path,state,created,updated,expires,error")
+_UPLOAD_KEYS = tuple(_UPLOAD_COLUMNS.split(","))
+
+
+def _upload_dict(row) -> dict:
+    out = dict(zip(_UPLOAD_KEYS, row))
+    for key in ("duration_ms", "size_bytes", "season", "episode"):
+        if out.get(key) is not None:
+            out[key] = int(out[key])
+    for key in ("created", "updated", "expires"):
+        out[key] = float(out[key])
+    return out
+
+
+class UploadQueueStore:
+    """SQLite status/retry rows for Vercel staging. Telegram is the only durable store.
+
+    The two tables hold no package bytes: only metadata and the retry schedule. Every
+    state transition is a single conditional statement, so two workers cannot publish
+    the same upload even when the cron tick overlaps.
+    """
+
+    def __init__(self, db: DB):
+        self.db = db
+
+    def create_upload(self, row: dict) -> None:
+        self.db.x(
+            f"INSERT INTO pool_uploads({_UPLOAD_COLUMNS}) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (row["upload_id"], row["device_id"], row["fp"], row["profile"],
+             int(row["duration_ms"]), row.get("size_bytes"), row.get("imdb"),
+             int(row.get("season", 0)), int(row.get("episode", 0)),
+             row.get("filename_norm"), row["object_path"], row["state"],
+             float(row["created"]), float(row["updated"]), float(row["expires"]),
+             row.get("error")))
+
+    def get_upload(self, upload_id: str) -> dict | None:
+        rows = self.db.q(f"SELECT {_UPLOAD_COLUMNS} FROM pool_uploads WHERE upload_id=?",
+                         (upload_id,))
+        return _upload_dict(rows[0]) if rows else None
+
+    def expire(self, upload_id: str, now: float) -> bool:
+        """pending -> expired, once. A finalized upload is never expired."""
+        return self.db.x(
+            "UPDATE pool_uploads SET state='expired',updated=?,error='expired' "
+            "WHERE upload_id=? AND state='pending' AND expires<=?",
+            (float(now), upload_id, float(now))) > 0
+
+    def enqueue(self, upload_id: str, now: float) -> bool:
+        """pending -> queued and append the retry row atomically; first finalize wins."""
+        with self.db._lock:
+            self.db.conn.execute("BEGIN IMMEDIATE")
+            try:
+                changed = self.db.conn.execute(
+                    "UPDATE pool_uploads SET state='queued',updated=?,error=NULL "
+                    "WHERE upload_id=? AND state='pending'", (float(now), upload_id)).rowcount
+                if not changed:
+                    self.db.conn.execute("ROLLBACK")
+                    return False
+                self.db.conn.execute(
+                    "INSERT INTO pool_publication_queue(upload_id,fp,profile,attempts,"
+                    "next_attempt,state,created,updated,error) "
+                    "SELECT upload_id,fp,profile,0,?,'queued',?,?,NULL "
+                    "FROM pool_uploads WHERE upload_id=?", (float(now), float(now), float(now), upload_id))
+                self.db.conn.execute("COMMIT")
+                return True
+            except BaseException:
+                self.db.conn.execute("ROLLBACK")
+                raise
+
+    def claim(self, now: float) -> dict | None:
+        """Claim one due row: queued -> publishing in one transaction (optimistic lock)."""
+        with self.db._lock:
+            self.db.conn.execute("BEGIN IMMEDIATE")
+            try:
+                due = self.db.conn.execute(
+                    "SELECT upload_id,attempts FROM pool_publication_queue "
+                    "WHERE state='queued' AND next_attempt<=? "
+                    "ORDER BY next_attempt,created LIMIT 1", (float(now),)).fetchone()
+                if due is None:
+                    self.db.conn.execute("COMMIT")
+                    return None
+                upload_id, attempts = due
+                changed = self.db.conn.execute(
+                    "UPDATE pool_publication_queue SET state='publishing',updated=? "
+                    "WHERE upload_id=? AND state='queued'", (float(now), upload_id)).rowcount
+                if not changed:
+                    self.db.conn.execute("COMMIT")
+                    return None
+                self.db.conn.execute(
+                    "UPDATE pool_uploads SET state='publishing',updated=? "
+                    "WHERE upload_id=? AND state='queued'", (float(now), upload_id))
+                row = self.db.conn.execute(
+                    f"SELECT {_UPLOAD_COLUMNS} FROM pool_uploads WHERE upload_id=?",
+                    (upload_id,)).fetchone()
+                self.db.conn.execute("COMMIT")
+                if row is None:
+                    return None
+                item = _upload_dict(row)
+                item["attempts"] = int(attempts)
+                return item
+            except BaseException:
+                self.db.conn.execute("ROLLBACK")
+                raise
+
+    def retry(self, upload_id: str, *, attempts: int, next_attempt: float, error: str,
+              terminal: bool, now: float) -> None:
+        state = "failed" if terminal else "queued"
+        self.db.tx([
+            ("UPDATE pool_publication_queue SET attempts=?,next_attempt=?,state=?,updated=?,error=? "
+             "WHERE upload_id=?", (int(attempts), float(next_attempt), state, float(now),
+                                   error, upload_id)),
+            ("UPDATE pool_uploads SET state=?,updated=?,error=? WHERE upload_id=?",
+             (state, float(now), error, upload_id)),
+        ])
+
+    def complete(self, upload_id: str, now: float) -> None:
+        self.db.tx([
+            ("UPDATE pool_uploads SET state='accepted',updated=?,error=NULL WHERE upload_id=?",
+             (float(now), upload_id)),
+            ("UPDATE pool_publication_queue SET state='done',updated=?,error=NULL WHERE upload_id=?",
+             (float(now), upload_id)),
+        ])
+
+
 class ChannelStore:
     """SQLite implementation of the channel index. `DB` keeps connection ownership."""
 
