@@ -6,6 +6,7 @@ All notable changes are documented here. The format follows [Keep a Changelog](h
 
 ### Added
 * One browser dashboard across local/VPS and Vercel, with a first-run Telegram setup wizard, private per-install `.env` storage, and durable Supabase-backed device/invitation/sharing state on Vercel.
+* Explicit dashboard NVMT generation with progress, bounded job execution, validated package assembly, and Telegram publication; player and pool lookup requests never start generation.
 * Vercel channel-pool deployment profile with Supabase-backed rebuildable index and temporary upload staging; Telegram remains the only durable package store.
 * Telegram librarian support for NVMT package contributions, contributor quotas and moderation, verified hint ranking,
   and per-device candidate offsets and rejections.

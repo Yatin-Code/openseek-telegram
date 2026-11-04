@@ -22,7 +22,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from fastapi import FastAPI, Request
+from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr, ValidationError, field_validator
@@ -45,8 +45,10 @@ from .logutil import plain, setup_logging
 from .netpolicy import DestinationPolicy, filter_forwarded_headers
 from .pairing import PairingClosed, PairingFailed, PairingManager, RateLimited
 from .public import PublicLimiter, classify
-from .pool import (MAX_NVMT_BYTES, ChannelPoolClient, ChannelPoolSync, PoolClient,
-                   PoolError, PoolService, PoolSync, TelegramBotStore)
+from .pool import (MAX_NVMT_BYTES, ChannelPoolClient,
+                   ChannelPoolSync, PoolClient, PoolError, PoolService, PoolSync,
+                   TelegramBotStore)
+from .generation import GenerationError, GenerationService, GenerationStateStore
 from .channel_index import ChannelIndex
 from .channel_pool import ChannelPoolService, PoolWritePolicy
 from .remote import RemoteChannelStore, RemoteUploadQueueStore, SupabaseClient
@@ -129,6 +131,8 @@ class Core:
         self.jobs.pool_sync = self.pool_sync
         self.library = Library(self.db, self.cache, settings_store=self.state_store)
         self.jobs.library = self.library
+        self.generations = GenerationService(
+            self, GenerationStateStore(self.db, self.supabase if settings.profile == "vercel" else None))
         self.started = time.time()
         self.closing = False
         self.ffmpeg = _engine_available()
@@ -211,6 +215,7 @@ class Core:
 
     def stop(self) -> None:
         self.closing = True
+        self.generations.close()
         self.jobs.shutdown()
         if self.pool_sync:
             self.pool_sync.stop()
@@ -606,6 +611,16 @@ class UploadIn(BaseModel):
     imdb: StrictStr | None = Field(default=None, max_length=1024)
     season: StrictInt = 0
     episode: StrictInt = 0
+    filename: StrictStr | None = Field(default=None, max_length=1024)
+
+
+class GenerationIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    source_url: StrictStr = Field(min_length=1, max_length=4096)
+    profile: Literal["nvmt-v1-g5", "nvmt-v1-g10"] = "nvmt-v1-g10"
+    imdb: StrictStr | None = Field(default=None, max_length=16)
+    season: StrictInt = Field(default=0, ge=0, le=9999)
+    episode: StrictInt = Field(default=0, ge=0, le=9999)
     filename: StrictStr | None = Field(default=None, max_length=1024)
 
 
@@ -1495,6 +1510,8 @@ async function sharing(on){await fetch('/admin/sharing',{method:'PUT',headers:Ob
 async function meta(on){await fetch('/admin/library',{method:'PUT',headers:Object.assign({'Content-Type':'application/json'},H),body:JSON.stringify({metadata_index:on})});load()}
 async function mkinvite(){const r=await fetch('/admin/invites',{method:'POST',headers:Object.assign({'Content-Type':'application/json'},H),body:JSON.stringify({public:!!window.pubOn})});
 const j=await r.json();window.lastInvite=r.ok?('Server '+j.address+' - code '+j.code+' (valid '+Math.round(j.expires_in_s/3600)+' h, one use). Join string: '+j.join):'Could not create: '+j.error;load()}
+async function generate(event){event.preventDefault();const d=Object.fromEntries(new FormData(event.currentTarget));d.season=Number(d.season||0);d.episode=Number(d.episode||0);
+const r=await fetch('/admin/generations',{method:'POST',headers:Object.assign({'Content-Type':'application/json'},H),body:JSON.stringify(d)});const j=await r.json();window.generationMessage=r.ok?'Generation started: '+j.generation_id:'Could not start generation: '+(j.error||'request_failed');load()}
 window.setupScreen=false;
 async function setupSubmit(event){event.preventDefault();const f=event.currentTarget;const d=Object.fromEntries(new FormData(f));d.telegram_api_id=Number(d.telegram_api_id);
 const r=await fetch('/admin/setup',{method:'POST',headers:Object.assign({'Content-Type':'application/json'},H),body:JSON.stringify(d)});const j=await r.json();
@@ -1533,6 +1550,12 @@ for(const i of sh.invites){h+='<tr><td>'+esc(i.label||i.invite_id.slice(0,8))+'<
 (i.state=='open'?'<button onclick="act(\\'DELETE\\',\\'/admin/invites/'+esc(i.invite_id)+'\\')">Revoke</button>':'')+'</td></tr>'}
 h+='</table>'}
 h+='<h2>Pool</h2>';
+ h+='<h2>Generate NVMT package</h2><p>This runs only when you start it here. It reads the media URL and publishes the generated package to Telegram.</p><form onsubmit="generate(event)">'+
+'<p><label>Media URL<br><input name="source_url" type="url" required maxlength="4096" style="width:100%"></label></p><p><label>Profile <select name="profile"><option>nvmt-v1-g10</option><option>nvmt-v1-g5</option></select></label> '+
+'<label>IMDb ID <input name="imdb" placeholder="tt1234567"></label> <label>Season <input name="season" type="number" min="0" value="0"></label> <label>Episode <input name="episode" type="number" min="0" value="0"></label></p>'+
+'<p><label>Filename hint <input name="filename" maxlength="1024"></label> <button type="submit">Generate and publish</button></p></form>'+
+(window.generationMessage?'<p role="status">'+esc(window.generationMessage)+'</p>':'')+'<div id="generationJobs"></div>';
+const gj=await (await fetch('/admin/generations',{headers:H})).json();document.getElementById('generationJobs').innerHTML=gj.jobs.map(j=>'<p><code>'+esc(j.generation_id)+'</code> '+esc(j.state)+' · '+esc(j.tiles_done||0)+'/'+esc(j.tiles_total||'?')+' tiles'+(j.error?' · '+esc(j.error):'')+'</p>').join('');
 const pr=await fetch('/admin/pool/status',{headers:H});const p=await pr.json();
 if(!pr.ok)h+='<p role="alert">Pool setup check failed: '+esc(setupErrorText(p.reason||p.error||'setup_failed'))+'</p>';
 h+='<p>Mode <b>'+esc(p.mode)+'</b>';
@@ -1908,6 +1931,37 @@ def create_admin_app(core: Core) -> FastAPI:
             result["last_error"] = (core.pool_sync.last_error if core.pool_sync else
                                     core.channel_index.last_error if core.channel_index else "")
         return result
+
+    @app.post("/admin/generations", status_code=202)
+    async def generation_start(background_tasks: BackgroundTasks, body: GenerationIn):
+        if core.pool is None or core.channel_store is None:
+            return err(409, "pool_unavailable")
+        try:
+            generation_id, job = await asyncio.to_thread(
+                core.generations.start, body.source_url, body.profile, body.imdb,
+                body.season, body.episode, body.filename)
+        except GenerationError as exc:
+            return err(429 if exc.code in ("generation_busy", "busy") else 400, exc.code)
+        except SourceForbidden:
+            return err(400, "source_forbidden")
+        background_tasks.add_task(core.generations.run, generation_id, job)
+        return JSONResponse({"generation_id": generation_id, "state": "generating"},
+                            status_code=202, headers={"Cache-Control": "no-store"})
+
+    @app.get("/admin/generations")
+    async def generation_list():
+        return {"jobs": await asyncio.to_thread(core.generations.recent)}
+
+    @app.get("/admin/generations/{generation_id}")
+    async def generation_status(generation_id: str):
+        status = await asyncio.to_thread(core.generations.status, generation_id)
+        return status if status is not None else err(404, "not_found")
+
+    @app.delete("/admin/generations/{generation_id}", status_code=204)
+    async def generation_cancel(generation_id: str):
+        if not await asyncio.to_thread(core.generations.cancel, generation_id):
+            return err(409, "not_running")
+        return Response(status_code=204)
 
     @app.post("/admin/pool/scan")
     async def pool_scan():

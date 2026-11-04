@@ -115,6 +115,12 @@ CREATE TABLE IF NOT EXISTS invites (
   max_uses INTEGER NOT NULL DEFAULT 1, uses INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0,
   revoked REAL, device_days REAL, tag TEXT);
 CREATE TABLE IF NOT EXISTS settings (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+-- Owner-triggered generation status; source URLs are deliberately never persisted.
+CREATE TABLE IF NOT EXISTS generation_jobs (
+  generation_id TEXT PRIMARY KEY, state TEXT NOT NULL, fp TEXT, profile TEXT,
+  duration_ms INTEGER, tiles_done INTEGER NOT NULL DEFAULT 0, tiles_total INTEGER,
+  upload_id TEXT, error TEXT, package_sha256 TEXT, created REAL NOT NULL, updated REAL NOT NULL);
+CREATE INDEX IF NOT EXISTS generation_jobs_created ON generation_jobs(created);
 CREATE TABLE IF NOT EXISTS release_meta (
   fp TEXT PRIMARY KEY, imdb_id TEXT, tmdb_id INTEGER, season INTEGER NOT NULL DEFAULT 0,
   episode INTEGER NOT NULL DEFAULT 0, size_bytes INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL);

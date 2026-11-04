@@ -84,6 +84,11 @@ The Vercel function uses `/tmp/openseek` for scratch state when `OPENSEEK_DATA_D
 unset. This directory is disposable and is not shared between function instances. The
 channel index and upload queue are stored in Supabase instead.
 
+Explicit dashboard NVMT generation is capped below the configured 300-second function
+duration. A generation that does not finish in that invocation is marked interrupted;
+retry it from the dashboard. Vercel Hobby's function duration ceiling is 300 seconds,
+so longer work needs a self-hosted local/VPS deployment.
+
 ## 4. Deploy and check the pool
 
 Deploy to Production. Vercel calls `GET /v1/internal/tick` once per minute with

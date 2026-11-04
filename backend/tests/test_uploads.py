@@ -45,7 +45,7 @@ class FakeSupabase:
 
     def __init__(self):
         self.tables = {"pool_uploads": [], "pool_publication_queue": [], "pool_devices": [],
-                       "pool_invites": [], "pool_owner_settings": []}
+                       "pool_invites": [], "pool_owner_settings": [], "pool_generation_jobs": []}
         self.objects: dict[str, bytes] = {}
         self.sign_calls: list[tuple[str, int]] = []
         self.deleted_objects: list[str] = []
@@ -362,7 +362,6 @@ def test_vercel_create_returns_absolute_signed_target_and_pending_row(tmp_path):
     ({"fp": "z" * 63}, "bad_key"),
     ({"fp": "Z" * 64}, "bad_key"),
     ({"profile": "nvmt-v9"}, "bad_profile"),
-    ({"size_bytes": MAX_NVMT_BYTES + 1}, "package_too_large"),
     ({"duration_ms": 0}, "bad_hints"),
     ({"duration_ms": MAX_DURATION_MS + 1}, "bad_hints"),
     ({"imdb": "not-an-imdb"}, "bad_hints"),
@@ -378,6 +377,18 @@ def test_create_validation_never_stages(tmp_path, changes, code):
         assert response.json() == {"error": code}
         assert env.fake.sign_calls == []
         assert env.fake.rows("pool_uploads") == []
+    finally:
+        env.core.stop()
+
+
+def test_create_accepts_source_size_larger_than_nvmt_package_limit(tmp_path):
+    env = make_env(tmp_path)
+    body = upload_body(hashlib.sha256(b"large source file").hexdigest(),
+                       size_bytes=MAX_NVMT_BYTES + 1)
+    try:
+        response = call(env, "POST", "/v1/pool/uploads", body=body)
+        assert response.status_code == 201, response.text
+        assert env.fake.rows("pool_uploads")[0]["size_bytes"] == MAX_NVMT_BYTES + 1
     finally:
         env.core.stop()
 

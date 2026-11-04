@@ -140,6 +140,24 @@ create table if not exists public.pool_owner_settings (
   v text not null
 );
 
+-- Generation status only. The source URL stays in the invoking function's memory.
+create table if not exists public.pool_generation_jobs (
+  generation_id text primary key,
+  state text not null,
+  fp text,
+  profile text,
+  duration_ms bigint,
+  tiles_done integer not null default 0,
+  tiles_total integer,
+  upload_id text,
+  error text,
+  package_sha256 text,
+  created double precision not null,
+  updated double precision not null
+);
+create index if not exists pool_generation_jobs_created
+  on public.pool_generation_jobs (created desc);
+
 create or replace function public.record_pool_invite_failure(p_pair_id text)
 returns boolean
 language plpgsql
@@ -198,3 +216,4 @@ alter table public.pool_publication_queue enable row level security;
 alter table public.pool_devices enable row level security;
 alter table public.pool_invites enable row level security;
 alter table public.pool_owner_settings enable row level security;
+alter table public.pool_generation_jobs enable row level security;

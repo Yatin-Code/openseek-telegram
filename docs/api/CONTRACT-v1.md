@@ -10,6 +10,10 @@ See `docs/SECURITY-MODEL.md` for the security properties. Clients can be written
   fingerprint, paired devices (revoke), cache stats. Vercel serves the same dashboard over HTTPS; `/admin/*`
   operations require `OPENSEEK_ADMIN_TOKEN` in `X-OpenSeek-Admin`, and clients use the public edge pin from
   `OPENSEEK_PUBLIC_TLS_PIN`. CLI: `openseek pair`, `openseek devices`, `openseek revoke <id>`.
+- Owner-only dashboard NVMT generation: `POST /admin/generations` accepts a media URL and optional catalog hints,
+  returns a generation ID, and publishes a validated NVMT package to Telegram. Poll `GET /admin/generations/{id}`
+  for progress; list recent jobs at `GET /admin/generations`. URLs are held in memory only. Generation starts only
+  from this dashboard action, never from Nuvio playback or pool lookup requests.
 - JSON bodies ≤ 16 KiB, `Content-Type: application/json`; shared NVMT packages are binary and capped at 16 MiB.
   Errors: `{"error": "<code>"}` — stable snake_case
   codes, never echoing input.
