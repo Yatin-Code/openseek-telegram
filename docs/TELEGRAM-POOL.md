@@ -168,3 +168,31 @@ duration metadata, so they cannot be used to build exact NVMT packages until a m
 Channel mode ignores legacy host URL/key settings. With mode unset, host settings are ignored unless
 `OPENSEEK_POOL_ENABLED=1`; `host` keeps the HTTP pool API and Bot API store. `python -m openseek pool status` reports
 the selected mode without returning tokens or session data.
+
+## Existing packages and hint backfill
+
+Packages published before the NVMT hint manifest are still available by their exact `fp` and profile. They do not
+become cross-release candidates merely because an index is rebuilt. A scan or rebuild never derives IMDb IDs,
+season/episode numbers, duration, file size, or title from a video, Telegram filename, or other guessed metadata.
+
+An operator can opt an individual existing package into hint matching when they have authoritative metadata. Keep a
+sidecar mapping from the exact package identity to the supplied values, for example:
+
+```json
+{
+  "fp": "64-lowercase-hex-characters",
+  "profile": "nvmt-v1-g5",
+  "imdb": "tt1234567",
+  "season": 2,
+  "episode": 3,
+  "duration_ms": 2670000,
+  "size_bytes": 1234567890,
+  "filename": "Show.S02E03.mkv"
+}
+```
+
+For a channel pool, retrieve that same NVMT package by its exact `fp` and profile, then have a writable channel node
+accept it again through `PUT /v1/pool/{fp}/nvmt` with the sidecar values as query parameters. The node validates
+the package and metadata, keeps the existing `fp`, and publishes the hint manifest to Telegram. The duration must
+match the package; `size_bytes` and `filename` must describe the original media from a trusted catalog. If that
+metadata is unavailable, leave the package exact-`fp`-only. There is no automatic or bulk backfill command.
