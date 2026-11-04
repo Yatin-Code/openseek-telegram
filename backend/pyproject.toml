@@ -20,6 +20,9 @@ dependencies = [
 [project.scripts]
 openseek = "openseek.cli:main"
 
+[tool.vercel]
+entrypoint = "openseek.vercel:app"
+
 [tool.setuptools]
 packages = ["openseek"]
 

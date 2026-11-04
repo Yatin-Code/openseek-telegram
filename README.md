@@ -101,6 +101,8 @@ In another terminal on the same machine run `python -m openseek pair`. It opens 
 one-time code and the server's certificate pin. Enter the code, the server address and (if your client asks) the pin in your client.
 `python -m openseek devices` lists paired devices and `python -m openseek revoke <device_id>` removes one.
 
+For the Vercel channel-pool profile, see [docs/VERCEL.md](docs/VERCEL.md).
+
 ## Configuration
 
 All settings are environment variables read at start-up. Invalid values stop the server with a configuration error.
@@ -111,7 +113,7 @@ All settings are environment variables read at start-up. Invalid values stop the
 | `OPENSEEK_HOST` / `OPENSEEK_PORT` | `0.0.0.0` / `8787` | HTTPS API listener |
 | `OPENSEEK_ADMIN_PORT` | `8788` | Admin listener, always bound to 127.0.0.1; every call except the dashboard page needs the admin secret |
 | `OPENSEEK_ADMIN_TOKEN` | random, in `<data>/admin.token` | Optional explicit admin secret (at least 16 characters). Normally leave unset |
-| `OPENSEEK_CRON_SECRET` | empty | Bearer secret for `POST /v1/internal/tick` (Vercel publication queue). When empty, the generated admin token is the only accepted credential |
+| `OPENSEEK_CRON_SECRET` or `CRON_SECRET` | empty | Bearer secret for the Vercel tick (`GET` for scheduled calls; `POST` for manual calls). `CRON_SECRET` is the Vercel Cron name. When empty, the generated admin token is the only accepted credential |
 | `OPENSEEK_PUBLIC_PORT` | `0` (off) | Internet-facing guest listener; must differ from the other ports |
 | `OPENSEEK_PUBLIC_BIND` | `0.0.0.0` | Bind address of the guest listener |
 | `OPENSEEK_PUBLIC_HOST` | empty | `name.example.org:443`, advertised in invitations and capability URLs |

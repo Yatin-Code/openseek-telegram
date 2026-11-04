@@ -23,6 +23,9 @@ def _tile_dict(row) -> dict:
 _UPLOAD_COLUMNS = ("upload_id,device_id,fp,profile,duration_ms,size_bytes,imdb,season,episode,"
                    "filename_norm,object_path,state,created,updated,expires,error")
 _UPLOAD_KEYS = tuple(_UPLOAD_COLUMNS.split(","))
+# A claimed upload that never reaches a terminal state (crash between Telegram
+# acceptance and the local update) becomes claimable again after this lease.
+_PUBLISH_LEASE_S = 300
 
 
 def _upload_dict(row) -> dict:
@@ -61,6 +64,28 @@ class UploadQueueStore:
                          (upload_id,))
         return _upload_dict(rows[0]) if rows else None
 
+    def pending_expired(self, now: float) -> list[dict]:
+        """Pending rows past their staging TTL, oldest first."""
+        rows = self.db.q(f"SELECT {_UPLOAD_COLUMNS} FROM pool_uploads "
+                         "WHERE state='pending' AND expires<=? ORDER BY expires LIMIT 100",
+                         (float(now),))
+        return [_upload_dict(row) for row in rows]
+
+    def staging_cleanup_candidates(self, limit: int = 100) -> list[dict]:
+        """Accepted or expired uploads whose temporary object still needs deletion."""
+        rows = self.db.q(f"SELECT {_UPLOAD_COLUMNS} FROM pool_uploads "
+                         "WHERE state IN ('accepted','expired','failed') AND object_path<>'' "
+                         "ORDER BY updated LIMIT ?", (max(1, int(limit)),))
+        return [_upload_dict(row) for row in rows]
+
+    def mark_staging_deleted(self, upload_id: str, state: str, now: float) -> bool:
+        if state not in ("accepted", "expired", "failed"):
+            return False
+        return self.db.x(
+            "UPDATE pool_uploads SET object_path='',updated=? "
+            "WHERE upload_id=? AND state=? AND object_path<>''",
+            (float(now), upload_id, state)) > 0
+
     def expire(self, upload_id: str, now: float) -> bool:
         """pending -> expired, once. A finalized upload is never expired."""
         return self.db.x(
@@ -75,7 +100,8 @@ class UploadQueueStore:
             try:
                 changed = self.db.conn.execute(
                     "UPDATE pool_uploads SET state='queued',updated=?,error=NULL "
-                    "WHERE upload_id=? AND state='pending'", (float(now), upload_id)).rowcount
+                    "WHERE upload_id=? AND state='pending' AND expires>?",
+                    (float(now), upload_id, float(now))).rowcount
                 if not changed:
                     self.db.conn.execute("ROLLBACK")
                     return False
@@ -91,21 +117,31 @@ class UploadQueueStore:
                 raise
 
     def claim(self, now: float) -> dict | None:
-        """Claim one due row: queued -> publishing in one transaction (optimistic lock)."""
+        """Claim one due row: queued -> publishing in one transaction (optimistic lock).
+
+        A `publishing` row older than the lease is reclaimable, so a crash after
+        Telegram accepted the package retries the (idempotent) publication instead of
+        waiting forever.
+        """
+        stale_before = float(now) - _PUBLISH_LEASE_S
         with self.db._lock:
             self.db.conn.execute("BEGIN IMMEDIATE")
             try:
                 due = self.db.conn.execute(
                     "SELECT upload_id,attempts FROM pool_publication_queue "
-                    "WHERE state='queued' AND next_attempt<=? "
-                    "ORDER BY next_attempt,created LIMIT 1", (float(now),)).fetchone()
+                    "WHERE (state='queued' AND next_attempt<=?) "
+                    "OR (state='publishing' AND updated<=?) "
+                    "ORDER BY next_attempt,created LIMIT 1",
+                    (float(now), stale_before)).fetchone()
                 if due is None:
                     self.db.conn.execute("COMMIT")
                     return None
                 upload_id, attempts = due
                 changed = self.db.conn.execute(
                     "UPDATE pool_publication_queue SET state='publishing',updated=? "
-                    "WHERE upload_id=? AND state='queued'", (float(now), upload_id)).rowcount
+                    "WHERE upload_id=? AND (state='queued' "
+                    "OR (state='publishing' AND updated<=?))",
+                    (float(now), upload_id, stale_before)).rowcount
                 if not changed:
                     self.db.conn.execute("COMMIT")
                     return None

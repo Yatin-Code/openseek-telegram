@@ -1,0 +1,12 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "functions": {
+    "openseek/vercel.py": {
+      "maxDuration": 60,
+      "excludeFiles": "{tests/**,**/__pycache__/**,**/*.pyc,fixtures/**,**/test_*.py}"
+    }
+  },
+  "crons": [
+    { "path": "/v1/internal/tick", "schedule": "* * * * *" }
+  ]
+}

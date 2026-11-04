@@ -24,7 +24,7 @@ from openseek.channel_pool import ChannelPoolService
 from openseek.config import Settings
 from openseek.db import DB
 from openseek.pool import MAX_DURATION_MS, MAX_NVMT_BYTES, PoolError, decode_nvmt, encode_nvmt
-from openseek.remote import RemoteUploadQueueStore, SupabaseClient
+from openseek.remote import RemoteStoreError, RemoteUploadQueueStore, SupabaseClient
 from openseek.store import ChannelStore, UploadQueueStore
 from openseek.uploads import UploadService
 from test_pool_channel import MemoryChannel, jpeg
@@ -46,6 +46,7 @@ class FakeSupabase:
         self.sign_calls: list[tuple[str, int]] = []
         self.deleted_objects: list[str] = []
         self.requests: list[tuple[str, str]] = []
+        self.delete_failures = 0
 
     # -- helpers
     def add_object(self, path: str, data: bytes) -> None:
@@ -72,6 +73,9 @@ class FakeSupabase:
             elif value.startswith("gte."):
                 wanted = float(value[4:])
                 out = [r for r in out if r.get(key) is not None and float(r[key]) >= wanted]
+            elif value.startswith("gt."):
+                wanted = float(value[3:])
+                out = [r for r in out if r.get(key) is not None and float(r[key]) > wanted]
             else:
                 raise AssertionError(f"fake does not support filter {key}={value}")
         return out
@@ -97,6 +101,20 @@ class FakeSupabase:
         self.requests.append((request.method, request.url.path))
         path = request.url.path
         params = list(request.url.params.multi_items())
+        if path == "/rest/v1/rpc/enqueue_pool_publication" and request.method == "POST":
+            args = json.loads(request.content or b"{}")
+            upload_id = args["p_upload_id"]
+            now = float(args["p_now"])
+            row = next((r for r in self.tables["pool_uploads"]
+                        if r["upload_id"] == upload_id), None)
+            if row is None or row["state"] != "pending" or float(row["expires"]) <= now:
+                return httpx.Response(200, json=False)
+            row.update({"state": "queued", "updated": now, "error": None})
+            self.tables["pool_publication_queue"].append({
+                "upload_id": upload_id, "fp": row["fp"], "profile": row["profile"],
+                "attempts": 0, "next_attempt": now, "state": "queued",
+                "created": now, "updated": now, "error": None})
+            return httpx.Response(200, json=True)
         if path.startswith("/rest/v1/"):
             table = self._table(path)
             rows = self.tables[table]
@@ -153,6 +171,9 @@ class FakeSupabase:
                     return httpx.Response(404, json={"message": "Object not found"})
                 return httpx.Response(200, content=self.objects[object_path])
             if request.method == "DELETE":
+                if self.delete_failures:
+                    self.delete_failures -= 1
+                    return httpx.Response(503, json={"message": "temporary storage outage"})
                 self.deleted_objects.append(object_path)
                 self.objects.pop(object_path, None)
                 return httpx.Response(200, json={"message": "Deleted"})
@@ -241,14 +262,14 @@ def _inline_threads(monkeypatch):
 
 
 def call(env, method: str, path: str, *, body=None, token=WRITE_KEY, params=None,
-         headers=None) -> httpx.Response:
+         headers=None, client_addr=("127.0.0.1", 40000)) -> httpx.Response:
     async def go():
-        transport = httpx.ASGITransport(app=env.app, client=("127.0.0.1", 40000))
-        async with httpx.AsyncClient(transport=transport, base_url="https://pool.test") as client:
+        transport = httpx.ASGITransport(app=env.app, client=client_addr)
+        async with httpx.AsyncClient(transport=transport, base_url="https://pool.test") as http_client:
             request_headers = dict(headers or {})
             if token:
                 request_headers["Authorization"] = "Bearer " + token
-            return await client.request(method, path, json=body, headers=request_headers, params=params)
+            return await http_client.request(method, path, json=body, headers=request_headers, params=params)
     return asyncio.run(go())
 
 
@@ -386,6 +407,29 @@ def test_finalize_moves_pending_to_queued_once(tmp_path):
         env.core.stop()
 
 
+def test_finalize_losing_ttl_race_returns_expired(tmp_path):
+    env = make_env(tmp_path)
+    created = create_upload(env)
+    upload_id = created["upload_id"]
+    store = env.core.uploads.store
+    original_enqueue = store.enqueue
+
+    def expire_then_finalize(_upload_id, now):
+        env.clock.t += 901
+        assert store.expire(upload_id, env.clock.t)
+        return original_enqueue(_upload_id, now)
+
+    store.enqueue = expire_then_finalize
+    try:
+        response = call(env, "POST", f"/v1/pool/uploads/{upload_id}/finalize")
+        assert response.status_code == 410
+        assert response.json() == {"error": "expired"}
+        assert env.fake.rows("pool_uploads")[0]["state"] == "expired"
+        assert env.fake.rows("pool_publication_queue") == []
+    finally:
+        env.core.stop()
+
+
 def test_finalize_and_status_reject_unknown_upload(tmp_path):
     env = make_env(tmp_path)
     try:
@@ -417,6 +461,30 @@ def test_expiry_marks_pending_upload_expired_and_refuses_finalize(tmp_path):
         env.core.stop()
 
 
+def test_tick_cleans_expired_staging_and_retries_storage_delete(tmp_path):
+    env = make_env(tmp_path)
+    created = create_upload(env)
+    upload_id = created["upload_id"]
+    path = f"uploads/{upload_id}.nvmt"
+    env.fake.add_object(path, b"temporary")
+    env.fake.delete_failures = 2
+    try:
+        env.clock.t += 901
+        first = call(env, "POST", "/v1/internal/tick", token=CRON_SECRET)
+        assert first.status_code == 200
+        assert env.fake.rows("pool_uploads")[0]["state"] == "expired"
+        assert path in env.fake.objects
+
+        second = call(env, "POST", "/v1/internal/tick", token=CRON_SECRET)
+        assert second.status_code == 200
+        row = env.fake.rows("pool_uploads")[0]
+        assert row["state"] == "expired" and row["object_path"] == ""
+        assert path not in env.fake.objects
+        assert env.pool.calls == []
+    finally:
+        env.core.stop()
+
+
 def test_status_requires_the_creating_device_or_a_write_key(tmp_path):
     env = make_env(tmp_path)
     created = create_upload(env)
@@ -443,6 +511,22 @@ def test_forwarded_headers_are_allowed_only_on_the_vercel_profile(tmp_path):
         assert response.json() == {"error": "proxy_refused"}
     finally:
         local.core.stop()
+
+
+def test_vercel_pool_accepts_public_clients_but_keeps_pool_key_auth(tmp_path):
+    env = make_env(tmp_path)
+    external = ("8.8.8.8", 40000)
+    try:
+        allowed = call(env, "POST", "/v1/pool/uploads",
+                       body=upload_body(hashlib.sha256(b"public Vercel").hexdigest()),
+                       client_addr=external)
+        assert allowed.status_code == 201
+        denied = call(env, "POST", "/v1/pool/uploads",
+                      body=upload_body(hashlib.sha256(b"no key").hexdigest()),
+                      token=None, client_addr=external)
+        assert denied.status_code == 403
+    finally:
+        env.core.stop()
 
 
 # --------------------------------------------------------------------------- slice 3: publication drain
@@ -490,6 +574,60 @@ def test_tick_publishes_to_telegram_then_deletes_the_staged_object(tmp_path):
             "tt1234567", 0, 0, 20_000, 1234, "movie.2024.1080p")
         status = call(env, "GET", f"/v1/pool/uploads/{upload_id}")
         assert status.json() == {"upload_id": upload_id, "state": "accepted", "error": None}
+    finally:
+        env.core.stop()
+
+
+def test_worker_rejects_actual_staged_size_when_hint_is_missing(tmp_path):
+    env = make_env(tmp_path)
+    fp = hashlib.sha256(b"oversized staged package").hexdigest()
+    try:
+        body = upload_body(fp)
+        body.pop("size_bytes")
+        upload_id = prepare_queued(env, fp, body=body)
+        path = f"uploads/{upload_id}.nvmt"
+        env.fake.add_object(path, b"x" * (MAX_NVMT_BYTES + 1))
+
+        response = call(env, "POST", "/v1/internal/tick", token=CRON_SECRET)
+        assert response.status_code == 200
+        assert response.json() == {"processed": 1, "accepted": 0, "failed": 1}
+        upload = env.fake.rows("pool_uploads")[0]
+        queue = env.fake.rows("pool_publication_queue")[0]
+        assert upload["state"] == "failed"
+        assert upload["error"] == "staged_object_too_large"
+        assert upload["object_path"] == ""
+        assert queue["state"] == "failed"
+        assert path not in env.fake.objects
+        assert env.pool.calls == []
+    finally:
+        env.core.stop()
+
+
+def test_accepted_upload_retries_staging_cleanup_without_republishing(tmp_path):
+    env = make_env(tmp_path)
+    fp = hashlib.sha256(b"cleanup retry").hexdigest()
+    try:
+        upload_id = prepare_queued(env, fp)
+        path = f"uploads/{upload_id}.nvmt"
+        env.fake.add_object(path, b"staged bytes")
+        env.pool.calls.clear()
+        env.pool.upload_package = lambda *args, **kwargs: env.pool.calls.append({"fp": fp})
+        env.fake.delete_failures = 1
+
+        first = call(env, "POST", "/v1/internal/tick", token=CRON_SECRET)
+        assert first.status_code == 200
+        assert first.json() == {"processed": 1, "accepted": 1, "failed": 0}
+        assert env.fake.rows("pool_uploads")[0]["state"] == "accepted"
+        assert env.fake.rows("pool_publication_queue")[0]["state"] == "done"
+        assert path in env.fake.objects
+        assert len(env.pool.calls) == 1
+
+        second = call(env, "POST", "/v1/internal/tick", token=CRON_SECRET)
+        assert second.status_code == 200
+        assert second.json() == {"processed": 0, "accepted": 0, "failed": 0}
+        assert path not in env.fake.objects
+        assert env.fake.rows("pool_uploads")[0]["object_path"] == ""
+        assert len(env.pool.calls) == 1
     finally:
         env.core.stop()
 
@@ -554,6 +692,17 @@ def test_tick_auth_requires_the_cron_secret(tmp_path, token, status):
         env.core.stop()
 
 
+def test_vercel_cron_get_authenticates_and_drains(tmp_path):
+    env = make_env(tmp_path)
+    try:
+        response = call(env, "GET", "/v1/internal/tick", token=CRON_SECRET)
+        assert response.status_code == 200
+        assert response.json() == {"processed": 0, "accepted": 0, "failed": 0}
+        assert call(env, "GET", "/v1/internal/tick", token="wrong").status_code == 401
+    finally:
+        env.core.stop()
+
+
 def test_tick_accepts_the_admin_token_and_bounds_the_batch(tmp_path):
     env = make_env(tmp_path)
     try:
@@ -584,6 +733,11 @@ def test_remote_store_signed_target_and_storage_object_helpers(tmp_path):
         signed = client.signed_upload_url("uploads/one.nvmt", 900)
         assert signed.startswith("/object/upload/sign/openseek-staging/uploads/one.nvmt")
         assert client.get_object("uploads/one.nvmt") == b"staged-bytes"
+        fake.add_object("uploads/large.nvmt", b"01234567890")
+        with pytest.raises(RemoteStoreError) as too_large:
+            client.get_object("uploads/large.nvmt", max_bytes=10)
+        assert too_large.value.status == 413
+        assert too_large.value.code == "object_too_large"
         assert client.object_exists("uploads/one.nvmt") is True
         assert client.object_exists("uploads/missing.nvmt") is False
         client.delete_object("uploads/one.nvmt")
@@ -612,6 +766,8 @@ def test_remote_queue_store_optimistic_claim_retry_and_complete(tmp_path):
         assert claimed["upload_id"] == "u_remote1" and claimed["state"] == "publishing"
         assert claimed["attempts"] == 0
         assert store.claim(now) is None                    # conditional PATCH: one owner only
+        reclaimed = store.claim(now + 301)                 # crashed publishing lease expires
+        assert reclaimed["upload_id"] == "u_remote1" and reclaimed["state"] == "publishing"
         store.retry("u_remote1", attempts=1, next_attempt=now + 2, error="telegram_unavailable",
                     terminal=False, now=now)
         assert store.get_upload("u_remote1")["state"] == "queued"
@@ -639,6 +795,8 @@ def test_local_queue_store_same_state_machine(tmp_path):
         claimed = store.claim(now)
         assert claimed["state"] == "publishing" and claimed["attempts"] == 0
         assert store.claim(now) is None
+        reclaimed = store.claim(now + 301)
+        assert reclaimed["state"] == "publishing"
         store.retry("u_local1", attempts=1, next_attempt=now + 2, error="telegram_unavailable",
                     terminal=False, now=now)
         assert store.claim(now) is None

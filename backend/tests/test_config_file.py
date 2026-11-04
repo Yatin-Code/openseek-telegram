@@ -142,6 +142,14 @@ def test_vercel_env_implies_vercel_profile_unless_explicit():
                               "OPENSEEK_PROFILE": "local"}).profile == "local"
 
 
+def test_vercel_cron_secret_uses_platform_name_with_open_seek_override():
+    assert Settings.from_env({**vercel_env(), "OPENSEEK_PROFILE": "vercel",
+                              "CRON_SECRET": "v" * 40}).cron_secret == "v" * 40
+    assert Settings.from_env({**vercel_env(), "OPENSEEK_PROFILE": "vercel",
+                              "CRON_SECRET": "v" * 40,
+                              "OPENSEEK_CRON_SECRET": "o" * 40}).cron_secret == "o" * 40
+
+
 def test_vercel_profile_requires_channel_pool_mode():
     env = vercel_env()
     env.pop("OPENSEEK_POOL_MODE")

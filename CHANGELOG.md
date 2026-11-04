@@ -5,6 +5,7 @@ All notable changes are documented here. The format follows [Keep a Changelog](h
 ## [Unreleased]
 
 ### Added
+* Vercel channel-pool deployment profile with Supabase-backed rebuildable index and temporary upload staging; Telegram remains the only durable package store.
 * Telegram librarian support for NVMT package contributions, contributor quotas and moderation, verified hint ranking,
   and per-device candidate offsets and rejections.
 * Optional Telegram-backed shared pool for exact-file OpenSeek tiles. Participating instances generate all video

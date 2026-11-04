@@ -102,6 +102,36 @@ create table if not exists public.pool_publication_queue (
 create index if not exists pool_publication_queue_next
   on public.pool_publication_queue (state, next_attempt);
 
+-- Finalize a staged upload and create its retry row in one database transaction.
+-- Only the server's service role can call this function.
+create or replace function public.enqueue_pool_publication(p_upload_id text, p_now double precision)
+returns boolean
+language plpgsql
+security definer
+set search_path = pg_catalog
+as $$
+declare
+  changed integer;
+begin
+  update public.pool_uploads
+     set state = 'queued', updated = p_now, error = null
+   where upload_id = p_upload_id and state = 'pending' and expires > p_now;
+  get diagnostics changed = row_count;
+  if changed <> 1 then
+    return false;
+  end if;
+
+  insert into public.pool_publication_queue
+    (upload_id, fp, profile, attempts, next_attempt, state, created, updated, error)
+  select upload_id, fp, profile, 0, p_now, 'queued', p_now, p_now, null
+    from public.pool_uploads
+   where upload_id = p_upload_id;
+  return true;
+end;
+$$;
+revoke all on function public.enqueue_pool_publication(text, double precision) from public;
+grant execute on function public.enqueue_pool_publication(text, double precision) to service_role;
+
 alter table public.pool_channel_tiles enable row level security;
 alter table public.pool_channel_state enable row level security;
 alter table public.pool_hints enable row level security;

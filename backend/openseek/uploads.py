@@ -15,6 +15,9 @@ State machine:
                  ^                 \\--failure (1..4)--> queued (next_attempt backoff)
                  \\------------- failure (5) ----------> failed
 
+A `publishing` row older than its lease is claimable again, so a crash between the
+Telegram upload and the local status update is retried rather than stranded.
+
 All transitions are conditional on the expected previous state, so overlapping cron
 ticks and duplicate finalize calls cannot publish the same upload twice. Telegram is
 also first-writer-wins for every tile/slot, making a duplicate publication harmless.
@@ -135,14 +138,24 @@ class UploadService:
             raise UploadError(404, "unknown_upload")
         now = self.clock()
         if row["state"] == "expired":
+            self._cleanup_staged(row)
             raise UploadError(410, "expired")
         if row["state"] == "pending" and float(row["expires"]) <= now:
-            self.store.expire(upload_id, now)
+            self._expire_row(row, now)
             raise UploadError(410, "expired")
         if row["state"] != "pending":
             raise UploadError(409, "wrong_state")
         if not self.store.enqueue(upload_id, now):
             # Another finalize (or a worker) won the transition.
+            current = self.store.get_upload(upload_id)
+            if current is not None and (current["state"] == "expired" or
+                                         (current["state"] == "pending" and
+                                          float(current["expires"]) <= now)):
+                if current["state"] == "pending":
+                    self._expire_row(current, now)
+                else:
+                    self._cleanup_staged(current)
+                raise UploadError(410, "expired")
             raise UploadError(409, "wrong_state")
         return {"upload_id": upload_id, "state": "queued"}
 
@@ -158,9 +171,51 @@ class UploadService:
             raise UploadError(403, "forbidden")
         now = self.clock()
         if row["state"] == "pending" and float(row["expires"]) <= now:
-            self.store.expire(upload_id, now)
-            row = self.store.get_upload(upload_id) or {**row, "state": "expired", "error": "expired"}
+            self._expire_row(row, now)
+            row = self.store.get_upload(upload_id) or row
+            if row["state"] == "pending":                  # cleanup failed; retried by tick
+                row = {**row, "state": "expired", "error": "expired"}
+        elif row["state"] == "expired":
+            self._cleanup_staged(row)
         return {"upload_id": upload_id, "state": row["state"], "error": row.get("error")}
+
+    # ---------------------------------------------------------------- expiry
+    def expire(self) -> int:
+        """Delete staged bytes for pending uploads past TTL, then mark them expired.
+
+        The status transition wins before object deletion. This prevents a concurrent
+        finalize from queueing an upload whose staged bytes were just deleted. Failed
+        deletes remain visible to the cleanup pass on the next tick.
+        """
+        now = self.clock()
+        expired = 0
+        for row in self.store.pending_expired(now):
+            expired += int(self._expire_row(row, now))
+        for row in self.store.staging_cleanup_candidates():
+            self._cleanup_staged(row)
+        return expired
+
+    def _expire_row(self, row: dict, now: float) -> bool:
+        changed = self.store.expire(row["upload_id"], now)
+        if changed:
+            self._cleanup_staged({**row, "state": "expired"})
+        else:
+            current = self.store.get_upload(row["upload_id"])
+            if current is not None and current["state"] == "expired":
+                self._cleanup_staged(current)
+        return changed
+
+    def _cleanup_staged(self, row: dict) -> bool:
+        object_path = row.get("object_path")
+        if not object_path:
+            return True
+        try:
+            self.supabase.delete_object(object_path)
+        except Exception as exc:
+            if getattr(exc, "status", None) != 404:        # already gone is success
+                log.warning("staged object cleanup failed (%s)", type(exc).__name__)
+                return False
+        return self.store.mark_staging_deleted(row["upload_id"], row["state"], self.clock())
 
     # ---------------------------------------------------------------- cron drain
     def drain(self, limit: int = 1) -> dict:
@@ -174,6 +229,10 @@ class PublicationWorker:
         self.service = service
 
     def drain(self, limit: int = 1) -> dict:
+        try:
+            self.service.expire()                      # tick housekeeping before publication
+        except Exception as exc:
+            log.warning("staged upload cleanup failed (%s)", type(exc).__name__)
         try:
             limit = int(limit)
         except (TypeError, ValueError):
@@ -194,11 +253,19 @@ class PublicationWorker:
 
     def _publish(self, item: dict, now: float) -> bool:
         upload_id = item["upload_id"]
+        if item.get("state") == "accepted":
+            # The Telegram write and upload-status update already succeeded. A prior
+            # tick may have failed while marking the queue row done; finish that step
+            # without needing the staging object or publishing twice.
+            self.service.store.complete(upload_id, now)
+            self.service._cleanup_staged(item)
+            return True
         # A retry after a crash between Telegram acceptance and the local state update
         # republishes the same package; upload_package's first-writer-wins tile check
         # makes that idempotent, and the final state is still `accepted`.
         try:
-            data = self.service.supabase.get_object(item["object_path"])
+            data = self.service.supabase.get_object(
+                item["object_path"], max_bytes=MAX_NVMT_BYTES)
             self.service.pool.upload_package(
                 item["fp"], item["profile"], int(item["duration_ms"]), data,
                 imdb=item.get("imdb"), season=int(item.get("season", 0)),
@@ -211,6 +278,8 @@ class PublicationWorker:
             status = getattr(exc, "status", None)
             if status == 404:
                 code = "staged_object_missing"
+            elif status == 413:
+                code = "staged_object_too_large"
             elif isinstance(exc, KeyError):
                 code = "staged_object_missing"
             else:
@@ -219,22 +288,23 @@ class PublicationWorker:
             self._failure(item, code, now)
             return False
 
-        # Telegram accepted the package. The staged object is disposable now; a
-        # cleanup failure must not turn a successful publication into a retry.
-        try:
-            self.service.supabase.delete_object(item["object_path"])
-        except Exception as exc:
-            log.warning("staged object cleanup failed (%s)", type(exc).__name__)
+        # Record Telegram acceptance before deleting the temporary bytes. The cleanup
+        # pass can retry deletion after a crash without turning success into failure.
         self.service.store.complete(upload_id, now)
+        self.service._cleanup_staged({**item, "state": "accepted"})
         return True
 
     def _failure(self, item: dict, code: str, now: float) -> None:
         attempts = int(item.get("attempts", 0)) + 1
-        terminal = attempts >= self.service.max_attempts
+        terminal = attempts >= self.service.max_attempts or code == "staged_object_too_large"
         next_attempt = now + min(MAX_BACKOFF_S, 2 ** attempts)
         self.service.store.retry(
             item["upload_id"], attempts=attempts, next_attempt=next_attempt,
             error=code, terminal=terminal, now=now)
+        if code == "staged_object_too_large":
+            failed = self.service.store.get_upload(item["upload_id"])
+            if failed is not None:
+                self.service._cleanup_staged(failed)
 
 
 def _code(value: object, fallback: str) -> str:

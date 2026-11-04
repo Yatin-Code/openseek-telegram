@@ -333,6 +333,10 @@ class Settings:
                 kw[name] = fn(raw)
             except (ValueError, ConfigError) as e:
                 raise ConfigError(f"OPENSEEK_{suffix}: {e}") from None
+        # Vercel Cron injects this conventional name when the project defines it.
+        # The OpenSeek-prefixed setting remains the explicit override elsewhere.
+        if not kw.get("cron_secret") and env.get("CRON_SECRET"):
+            kw["cron_secret"] = env["CRON_SECRET"]
         if "profile" not in kw and env.get("VERCEL", "").strip().lower() in ("1", "true", "yes", "on"):
             kw["profile"] = "vercel"
         cfg_path = env.get("OPENSEEK_CONFIG_FILE")
@@ -384,6 +388,15 @@ class Settings:
         if self.profile == "vercel":
             if self.effective_pool_mode != "channel":
                 raise ConfigError("OPENSEEK_PROFILE=vercel requires OPENSEEK_POOL_MODE=channel")
+            if not self.telegram_channel_id:
+                raise ConfigError("OPENSEEK_PROFILE=vercel requires OPENSEEK_TELEGRAM_CHANNEL_ID")
+            if not self.telegram_api_id or not self.telegram_api_hash:
+                raise ConfigError("OPENSEEK_PROFILE=vercel requires OPENSEEK_TELEGRAM_API_ID and OPENSEEK_TELEGRAM_API_HASH")
+            if not self.telegram_bot_token and not self.telegram_session:
+                raise ConfigError("OPENSEEK_PROFILE=vercel requires a Telegram bot token or StringSession")
+            if (self.telegram_session_file or any(sep in self.telegram_session for sep in ("/", "\\")) or
+                    self.telegram_session.startswith("~") or self.telegram_session.endswith(".session")):
+                raise ConfigError("OPENSEEK_PROFILE=vercel requires a Telegram StringSession, not a session file")
             if not self.supabase_url:
                 raise ConfigError("OPENSEEK_PROFILE=vercel requires OPENSEEK_SUPABASE_URL")
             parsed = urlsplit(self.supabase_url)

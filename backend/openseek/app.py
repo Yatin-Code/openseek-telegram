@@ -315,7 +315,8 @@ class Guard:
             if not client_ip_allowed(client[0], False) or not ipaddress.ip_address(
                     (client[0] or "0.0.0.0").split("%")[0]).is_loopback:
                 return await _send_json(send, 403, {"error": "forbidden"})
-        elif not client_ip_allowed(client[0], self.core.settings.allow_public_clients):
+        elif self.core.settings.profile != "vercel" and not client_ip_allowed(
+                client[0], self.core.settings.allow_public_clients):
             return await _send_json(send, 403, {"error": "forbidden"})
 
         headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
@@ -686,6 +687,13 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
     def read_only_channel_response() -> JSONResponse:
         return JSONResponse({"error": "read_only_channel",
                              "contribute_url": _librarian_url(core.settings)}, status_code=403)
+
+    def corrections_denial() -> JSONResponse | None:
+        # Corrections live in the local SQLite index, which the Vercel profile does not
+        # build. Refuse explicitly instead of accepting a write that ranking will ignore.
+        if core.settings.profile == "vercel":
+            return err(409, "corrections_unavailable")
+        return None
 
     async def proxy_channel_upload(request: Request, fp: str) -> Response:
         if not is_fingerprint(fp):
@@ -1059,6 +1067,9 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
             return err(403, "forbidden")
         if not is_fingerprint(fp):
             return err(400, "bad_key")
+        denied = corrections_denial()
+        if denied is not None:
+            return denied
         try:
             body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
         except Exception:
@@ -1084,6 +1095,9 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
             return err(403, "forbidden")
         if not is_fingerprint(fp):
             return err(400, "bad_key")
+        denied = corrections_denial()
+        if denied is not None:
+            return denied
         try:
             body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
         except Exception:
@@ -1106,6 +1120,9 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
             return err(403, "forbidden")
         if not is_fingerprint(fp):
             return err(400, "bad_key")
+        denied = corrections_denial()
+        if denied is not None:
+            return denied
         try:
             body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
         except Exception:
@@ -1131,6 +1148,9 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
             return err(403, "forbidden")
         if not is_fingerprint(fp):
             return err(400, "bad_key")
+        denied = corrections_denial()
+        if denied is not None:
+            return denied
         try:
             body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
         except Exception:
@@ -1292,6 +1312,7 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
             return err(exc.status, exc.code)
         return JSONResponse(result, headers={"Cache-Control": "no-store"})
 
+    @app.get("/v1/internal/tick")
     @app.post("/v1/internal/tick")
     async def internal_tick(request: Request):
         """Cron entry point: drain a bounded number of queued Telegram publications."""

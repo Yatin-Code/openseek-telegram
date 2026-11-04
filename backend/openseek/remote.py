@@ -95,6 +95,12 @@ class SupabaseClient:
         total = content_range.rsplit("/", 1)[-1]
         return int(total) if total.isdigit() else 0
 
+    def rpc(self, function: str, arguments: dict):
+        """Call a narrowly scoped PostgREST database function."""
+        response = self.request("POST", f"/rest/v1/rpc/{quote(function, safe='')}",
+                                json=arguments)
+        return response.json()
+
     # ---------------------------------------------------------------- Storage REST (F1b staging only)
     def put_object(self, path: str, data: bytes, content_type: str) -> None:
         try:
@@ -125,9 +131,34 @@ class SupabaseClient:
         return (f"/storage/v1/object/{quote(self.bucket, safe='')}/"
                 f"{quote(path, safe='/')}")
 
-    def get_object(self, path: str) -> bytes:
-        """Authenticated staging download. The path never contains secrets."""
-        return self.request("GET", self._object_url(path)).content
+    def get_object(self, path: str, *, max_bytes: int | None = None) -> bytes:
+        """Download a staged object, optionally enforcing a limit while streaming it."""
+        try:
+            with self._client.stream("GET", self._object_url(path)) as response:
+                if response.status_code >= 400:
+                    payload = {}
+                    try:
+                        parsed = response.json()
+                        payload = parsed if isinstance(parsed, dict) else {}
+                    except ValueError:
+                        pass
+                    code = str(payload.get("code") or f"HTTP_{response.status_code}")
+                    message = str(payload.get("message") or response.text[:300] or "request failed")
+                    raise RemoteStoreError(response.status_code, code, message)
+
+                declared = response.headers.get("content-length", "")
+                if max_bytes is not None and declared.isdigit() and int(declared) > max_bytes:
+                    raise RemoteStoreError(413, "object_too_large", "staged object exceeds its limit")
+                chunks = []
+                total = 0
+                for chunk in response.iter_bytes():
+                    total += len(chunk)
+                    if max_bytes is not None and total > max_bytes:
+                        raise RemoteStoreError(413, "object_too_large", "staged object exceeds its limit")
+                    chunks.append(chunk)
+                return b"".join(chunks)
+        except httpx.HTTPError as exc:
+            raise RemoteStoreError(0, type(exc).__name__, str(exc)) from None
 
     def object_exists(self, path: str) -> bool:
         """HEAD the staged object. A missing object is a normal answer, not an exception."""
@@ -145,6 +176,8 @@ class SupabaseClient:
 
 _UPLOAD_COLUMNS = ("upload_id,device_id,fp,profile,duration_ms,size_bytes,imdb,season,episode,"
                    "filename_norm,object_path,state,created,updated,expires,error")
+# Mirrors store._PUBLISH_LEASE_S: a crashed publisher is reclaimable, not stuck.
+_PUBLISH_LEASE_S = 300
 
 
 class RemoteUploadQueueStore:
@@ -152,8 +185,8 @@ class RemoteUploadQueueStore:
 
     PostgREST cannot start a multi-statement transaction, so `claim` relies on a
     conditional PATCH (`state=eq.queued`): the only worker whose PATCH returns a row
-    owns the upload. A crash leaves a `publishing` row that no worker reclaims; it is
-    harmless because the upload is not marked accepted until Telegram takes it.
+    owns the upload. A `publishing` row older than the lease is reclaimed on a later
+    tick, so a crash after Telegram acceptance retries the idempotent publication.
     """
 
     def __init__(self, client: SupabaseClient):
@@ -179,6 +212,38 @@ class RemoteUploadQueueStore:
                              ("limit", "1")])
         return self._upload(rows[0]) if rows else None
 
+    def pending_expired(self, now: float) -> list[dict]:
+        rows = self.client.select(
+            "pool_uploads",
+            [("select", _UPLOAD_COLUMNS), ("state", "eq.pending"),
+             ("expires", f"lte.{float(now)}"), ("order", "expires.asc"),
+             ("limit", "100")])
+        return [self._upload(row) for row in rows]
+
+    def staging_cleanup_candidates(self, limit: int = 100) -> list[dict]:
+        rows = []
+        for state in ("accepted", "expired", "failed"):
+            remaining = max(0, int(limit) - len(rows))
+            if remaining == 0:
+                break
+            candidates = self.client.select(
+                "pool_uploads",
+                [("select", _UPLOAD_COLUMNS), ("state", f"eq.{state}"),
+                 ("object_path", "neq."), ("order", "updated.asc"),
+                 ("limit", str(remaining))])
+            rows.extend(self._upload(row) for row in candidates)
+        return rows
+
+    def mark_staging_deleted(self, upload_id: str, state: str, now: float) -> bool:
+        if state not in ("accepted", "expired", "failed"):
+            return False
+        rows = self.client.patch(
+            "pool_uploads",
+            [("upload_id", f"eq.{upload_id}"), ("state", f"eq.{state}"),
+             ("object_path", "neq.")],
+            {"object_path": "", "updated": float(now)})
+        return bool(rows)
+
     def expire(self, upload_id: str, now: float) -> bool:
         rows = self.client.patch(
             "pool_uploads",
@@ -188,30 +253,32 @@ class RemoteUploadQueueStore:
         return bool(rows)
 
     def enqueue(self, upload_id: str, now: float) -> bool:
-        claimed = self.client.patch(
-            "pool_uploads",
-            [("upload_id", f"eq.{upload_id}"), ("state", "eq.pending")],
-            {"state": "queued", "updated": float(now), "error": None})
-        if not claimed:
-            return False
-        row = claimed[0]
-        self.client.upsert("pool_publication_queue", [{
-            "upload_id": upload_id, "fp": row["fp"], "profile": row["profile"],
-            "attempts": 0, "next_attempt": float(now), "state": "queued",
-            "created": float(now), "updated": float(now), "error": None}],
-            on_conflict="upload_id", ignore_duplicates=True)
-        return True
+        return self.client.rpc("enqueue_pool_publication", {
+            "p_upload_id": upload_id, "p_now": float(now)}) is True
 
     def claim(self, now: float) -> dict | None:
         due = self.client.select(
             "pool_publication_queue",
-            [("select", "upload_id,attempts"), ("state", "eq.queued"),
+            [("select", "upload_id,attempts,state"), ("state", "eq.queued"),
              ("next_attempt", f"lte.{float(now)}"), ("order", "next_attempt.asc"),
              ("limit", "8")])
-        for candidate in due:
-            claimed = self.client.patch(
+        if not due:
+            stale_before = float(now) - _PUBLISH_LEASE_S
+            due = self.client.select(
                 "pool_publication_queue",
-                [("upload_id", f"eq.{candidate['upload_id']}"), ("state", "eq.queued")],
+                [("select", "upload_id,attempts,state"), ("state", "eq.publishing"),
+                 ("updated", f"lte.{stale_before}"), ("order", "updated.asc"),
+                 ("limit", "8")])
+        else:
+            stale_before = None
+        for candidate in due:
+            state = candidate.get("state", "queued")
+            filters = [("upload_id", f"eq.{candidate['upload_id']}"), ("state", f"eq.{state}")]
+            if state == "publishing":
+                stale_before = float(now) - _PUBLISH_LEASE_S
+                filters.append(("updated", f"lte.{stale_before}"))
+            claimed = self.client.patch(
+                "pool_publication_queue", filters,
                 {"state": "publishing", "updated": float(now)})
             if not claimed:
                 continue
