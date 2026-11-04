@@ -522,19 +522,22 @@ def test_channel_candidates_rank_movies_and_series_from_manifest_hints(tmp_path)
     pool = ChannelPoolService(index)
     image = jpeg()
 
-    def publish(label, duration_ms, imdb, season, episode, filename):
+    def publish(label, duration_ms, imdb, season, episode, filename, episode_key=None):
         fp = hashlib.sha256(label.encode()).hexdigest()
         grid = 5_000
         n_slots = (duration_ms + grid - 1) // grid
         tiles = {slot: (slot * grid, image) for slot in range(n_slots)}
         package = encode_nvmt(grid, n_slots, tiles)
         pool.upload_package(fp, "nvmt-v1-g5", duration_ms, package, imdb=imdb,
-                            season=season, episode=episode, size_bytes=5_000_000,
+                            episode_key=episode_key, season=season, episode=episode,
+                            size_bytes=5_000_000,
                             filename=filename)
         return fp
 
     try:
-        series_fp = publish("series-s02e03", 20_000, "tt1111111", 2, 3, "Show.S02E03.mkv")
+        episode_key = hashlib.sha256(b"series s02e03").hexdigest()
+        series_fp = publish("series-s02e03", 20_000, "tt1111111", 2, 3,
+                            "Show.S02E03.mkv", episode_key)
         movie_fp = publish("movie-match", 20_000, "tt2222222", 0, 0, "Movie.Title.2024.mkv")
         filename_fp = publish("filename-match", 20_000, "tt9999999", 0, 0,
                               "Movie.Title.2024.mp4")
@@ -569,6 +572,12 @@ def test_channel_candidates_rank_movies_and_series_from_manifest_hints(tmp_path)
         assert [candidate["fp"] for candidate in series_candidates] == [series_fp]
         assert series_candidates[0]["score"] == 100
         assert series_candidates[0]["match"] == "imdb+season+episode+duration"
+
+        legacy_candidates = pool.episode_candidates(episode_key, 20_000)
+        assert [candidate["fp"] for candidate in legacy_candidates] == [series_fp]
+        assert legacy_candidates[0]["match"] == "imdb+season+episode+duration"
+        assert legacy_candidates[0]["score"] == 100
+        assert legacy_candidates[0]["duration_delta_ms"] == 0
     finally:
         db.close()
 

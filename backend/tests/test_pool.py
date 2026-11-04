@@ -592,6 +592,25 @@ def test_episode_variant_index_and_sparse_sample_routes(tmp_path, monkeypatch):
         assert [entry["fp"] for entry in entries] == [fp_new, fp_old]
         assert entries[0]["n_tiles"] == len(new_tiles)
         assert [entry["duration_delta_ms"] for entry in entries] == [0, duration_new - duration_old]
+        assert entries[0]["score"] == 100
+        assert entries[0]["match"] == "episode_key+duration"
+        assert entries[0]["relation"] == "same_length"
+
+        # Once this legacy key can be resolved to v2 hints, the route delegates
+        # to the shared ranker and still includes the legacy duration delta.
+        core.db.x(
+            "UPDATE pool_hints SET imdb=?,season=?,episode=?,size_bytes=?,filename_norm=? "
+            "WHERE fp=? AND profile=?",
+            ("tt1234567", 1, 2, 1_000_000, "series.s01e02", fp_new, "nvmt-v1-g5"),
+        )
+        ranked = api(f"https://pool.test/v1/pool/episodes/{episode_key}?duration_ms={duration_new}",
+                     None, {"Authorization": f"Bearer {READ_KEY}"}, 2)
+        ranked_entries = json.loads(ranked.data)["candidates"]
+        assert [entry["fp"] for entry in ranked_entries] == [fp_new]
+        assert ranked_entries[0]["score"] == 100
+        assert ranked_entries[0]["match"] == "imdb+season+episode+duration"
+        assert ranked_entries[0]["relation"] == "same_length"
+        assert ranked_entries[0]["duration_delta_ms"] == 0
 
         # Candidate verification fetches only the requested sparse set, not the full NVMT.
         sparse_url = (f"https://pool.test/v1/pool/{fp_new}/nvmt?profile=nvmt-v1-g5"

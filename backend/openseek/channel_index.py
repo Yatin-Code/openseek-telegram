@@ -325,6 +325,22 @@ class ChannelIndex:
     def episode_candidates(self, episode_key: str, duration_ms: int, limit: int = 8) -> list[dict]:
         if not _EPISODE_KEY.fullmatch(episode_key or "") or not isinstance(duration_ms, int) or duration_ms <= 0:
             raise PoolError(400, "bad_episode_key")
+        hint_rows = self.db.q(
+            "SELECT h.imdb,h.season,h.episode FROM pool_episode_packages e "
+            "JOIN pool_hints h ON h.fp=e.fp AND h.profile=e.profile "
+            "WHERE e.episode_key=? AND h.imdb IS NOT NULL "
+            "AND EXISTS (SELECT 1 FROM pool_channel_tiles c WHERE c.fp=e.fp AND c.profile=?) "
+            "ORDER BY ABS(e.duration_ms-?) ASC,e.updated DESC LIMIT 1",
+            (episode_key, PROFILE, duration_ms))
+        if hint_rows:
+            imdb, season, episode = hint_rows[0]
+            candidates = self.candidates(duration_ms=duration_ms, imdb=imdb,
+                                         season=int(season), episode=int(episode), limit=limit)
+            for candidate in candidates:
+                candidate["duration_delta_ms"] = abs(candidate["duration_ms"] - duration_ms)
+            return candidates
+
+        # A manifest-less legacy package still needs the duration-only path.
         tolerance = max(90_000, int(duration_ms * 0.15))
         rows = self.db.q(
             "SELECT e.fp,e.profile,e.duration_ms,e.updated,COUNT(c.k) "

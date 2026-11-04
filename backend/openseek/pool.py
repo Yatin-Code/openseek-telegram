@@ -551,10 +551,27 @@ class PoolService:
                       "sha256": digest, "profile": profile}
 
     def episode_candidates(self, episode_key: str, duration_ms: int, limit: int = 8) -> list[dict]:
-        """Return the legacy episode-key candidates with the v2 ranking metadata added."""
+        """Keep the legacy route while using hint ranking whenever its key is known."""
         if not _EPISODE_KEY.fullmatch(episode_key) or not isinstance(duration_ms, int) or duration_ms <= 0:
             raise PoolError(400, "bad_episode_key")
-        # Runtime is only a coarse filter. The TV must compare sample frames before accepting a candidate.
+        hint_rows = self.db.q(
+            "SELECT h.imdb,h.season,h.episode FROM pool_episode_packages e "
+            "JOIN pool_hints h ON h.fp=e.fp AND h.profile=e.profile "
+            "JOIN pool_packages p ON p.fp=e.fp AND p.profile=e.profile "
+            "WHERE e.episode_key=? AND h.imdb IS NOT NULL "
+            "ORDER BY ABS(e.duration_ms-?) ASC,e.updated DESC LIMIT 1",
+            (episode_key, duration_ms))
+        if hint_rows:
+            imdb, season, episode = hint_rows[0]
+            candidates = self.candidates(duration_ms=duration_ms, imdb=imdb,
+                                         season=int(season), episode=int(episode), limit=limit)
+            for candidate in candidates:
+                candidate["duration_delta_ms"] = abs(candidate["duration_ms"] - duration_ms)
+            return candidates
+
+        # Older packages and clients may have an episode key without a v2 manifest.
+        # Keep their existing lookup behavior until hint metadata is available.
+        # Runtime is only a coarse filter; clients apply the returned timing mapping.
         tolerance = max(90_000, int(duration_ms * 0.15))
         rows = self.db.q(
             "SELECT p.fp,p.profile,p.duration_ms,n.n_slots,n.n_tiles "
