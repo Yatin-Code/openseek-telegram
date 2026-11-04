@@ -28,6 +28,7 @@ from openseek.pool import (ChannelPoolClient, ChannelPoolSync, PoolError, decode
                            _tile_filename, encode_nvmt)
 from openseek.telegram_mt import ChannelMessage, TelegramMTProtoStore
 from openseek.scheduler import tile_count
+from openseek.store import ChannelStore
 from openseek.setup import _env_assignment, run_setup
 
 
@@ -116,14 +117,14 @@ def test_two_independent_channel_instances_share_a_tile_and_rebuild(tmp_path):
     db_b, cache_b = make_db_cache(tmp_path / "b")
     try:
         pts, duration, n_tiles = seed(cache_a, fp, 1, data)
-        index_a = ChannelIndex(db_a, store, scan_limit=10, refresh_s=10)
+        index_a = ChannelIndex(ChannelStore(db_a), store, scan_limit=10, refresh_s=10)
         publisher = ChannelPoolSync(db_a, cache_a, store, index_a)
         publisher.enqueue(fp, 1)
         publisher._publish(fp, 1, pts, duration, n_tiles)
         assert index_a.lookup(fp, PROFILE, 1)["sha256"] == hashlib.sha256(data).hexdigest()
 
         seed(cache_b, fp, 1, data)
-        index_b = ChannelIndex(db_b, store, scan_limit=10, refresh_s=10)
+        index_b = ChannelIndex(ChannelStore(db_b), store, scan_limit=10, refresh_s=10)
         assert index_b.refresh(force=True)["indexed"] == 1
         client_b = ChannelPoolClient(cache_b, index_b, store)
         assert client_b.get_tile(fp, 1) == (data, pts)
@@ -131,7 +132,7 @@ def test_two_independent_channel_instances_share_a_tile_and_rebuild(tmp_path):
 
         db_c, _cache_c = make_db_cache(tmp_path / "c")
         try:
-            index_c = ChannelIndex(db_c, store, scan_limit=10, refresh_s=10)
+            index_c = ChannelIndex(ChannelStore(db_c), store, scan_limit=10, refresh_s=10)
             assert index_c.rebuild()["indexed"] == 1
             assert index_c.lookup(fp, PROFILE, 1)["message_id"] == 1
         finally:
@@ -461,7 +462,7 @@ def test_read_only_channel_without_intake_returns_librarian_url(tmp_path):
 def test_channel_manifest_incremental_ordering_malformed_and_rebuild(tmp_path):
     store = MemoryChannel()
     db, _cache = make_db_cache(tmp_path / "node")
-    index = ChannelIndex(db, store, scan_limit=10, refresh_s=10)
+    index = ChannelIndex(ChannelStore(db), store, scan_limit=10, refresh_s=10)
     data = jpeg()
     first_fp = hashlib.sha256(b"manifest before tile").hexdigest()
     second_fp = hashlib.sha256(b"tile before manifest").hexdigest()
@@ -518,7 +519,7 @@ def test_channel_manifest_incremental_ordering_malformed_and_rebuild(tmp_path):
 def test_channel_candidates_rank_movies_and_series_from_manifest_hints(tmp_path):
     store = MemoryChannel()
     db, _cache = make_db_cache(tmp_path / "node")
-    index = ChannelIndex(db, store, scan_limit=100, refresh_s=10)
+    index = ChannelIndex(ChannelStore(db), store, scan_limit=100, refresh_s=10)
     pool = ChannelPoolService(index)
     image = jpeg()
 
@@ -633,14 +634,14 @@ def test_first_writer_wins_and_losing_outbox_is_cleared(tmp_path):
     try:
         original = jpeg((1, 2, 3))
         pts, duration, n_tiles = seed(cache_a, fp, 0, original)
-        index_a = ChannelIndex(db_a, store)
+        index_a = ChannelIndex(ChannelStore(db_a), store)
         sync_a = ChannelPoolSync(db_a, cache_a, store, index_a)
         sync_a.enqueue(fp, 0)
         sync_a._publish(fp, 0, pts, duration, n_tiles)
 
         conflicting = jpeg((90, 80, 70))
         seed(cache_b, fp, 0, conflicting)
-        index_b = ChannelIndex(db_b, store)
+        index_b = ChannelIndex(ChannelStore(db_b), store)
         index_b.refresh(force=True)
         sync_b = ChannelPoolSync(db_b, cache_b, store, index_b)
         sync_b.enqueue(fp, 0)
@@ -668,7 +669,7 @@ def test_bad_captions_and_digest_mismatch_are_ignored(tmp_path):
     store.next_id = 4
     db, cache = make_db_cache(tmp_path / "index")
     try:
-        index = ChannelIndex(db, store)
+        index = ChannelIndex(ChannelStore(db), store)
         index.refresh(force=True)
         assert index.lookup(fp, PROFILE, 0)["message_id"] == 3
         client = ChannelPoolClient(cache, index, store)
@@ -686,7 +687,7 @@ def test_channel_outbox_retries_a_transient_upload_failure(tmp_path):
     try:
         data = jpeg()
         pts, duration, n_tiles = seed(cache, fp, 0, data)
-        index = ChannelIndex(db, store)
+        index = ChannelIndex(ChannelStore(db), store)
         sync = ChannelPoolSync(db, cache, store, index)
         sync.enqueue(fp, 0)
         store.fail_next_upload = True
@@ -772,7 +773,7 @@ def test_channel_pool_status_reports_history_permissions_and_index_counts(tmp_pa
     store.detected_can_post = False
     db, _cache = make_db_cache(tmp_path / "node")
     try:
-        index = ChannelIndex(db, store)
+        index = ChannelIndex(ChannelStore(db), store)
         status = index.status()
         assert status["entity_type"] == "broadcast"
         assert status["entity_resolved"] is True
@@ -797,6 +798,7 @@ def test_doctor_reports_live_channel_identity_and_permissions(monkeypatch, capsy
 
     assert cli.main(["doctor"]) == 0
     report = json.loads(capsys.readouterr().out)
+    assert report["profile"] == "local"
     assert report["telegram_identity"] == "bot"
     assert report["pool"]["entity_resolved"] is True
     assert report["pool"]["history_readable"] is True
@@ -804,6 +806,24 @@ def test_doctor_reports_live_channel_identity_and_permissions(monkeypatch, capsy
     assert report["pool"]["last_message_id"] == 17
     assert report["pool"]["librarian_status"] == "disabled"
     assert report["contribution_path"] == "proxy"
+
+
+def test_doctor_reports_vercel_supabase_presence_without_printing_the_key(monkeypatch, capsys, tmp_path):
+    settings = Settings(data_dir=tmp_path, pool_mode="channel", profile="vercel",
+                        telegram_bot_token="123456:test", telegram_channel_id="-100123",
+                        supabase_url="https://project.supabase.co",
+                        supabase_service_key="service-role-secret",
+                        supabase_bucket="openseek-staging")
+    monkeypatch.setattr(cli.Settings, "from_env", lambda _env: settings)
+    monkeypatch.setattr(cli, "_admin", lambda *_args: (200, {"mode": "channel"}))
+
+    assert cli.main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    report = json.loads(out)
+    assert report["profile"] == "vercel"
+    assert report["supabase_configured"] is True
+    assert report["supabase_bucket"] == "openseek-staging"
+    assert "service-role-secret" not in out
 
 
 class FakeTelethonClient:
@@ -944,7 +964,7 @@ def test_librarian_reposts_valid_user_tile_and_rejects_bot_sender(tmp_path):
     store = FakeLibrarianStore(data)
     db, _cache = make_db_cache(tmp_path / "librarian")
     try:
-        index = ChannelIndex(db, MemoryChannel())
+        index = ChannelIndex(ChannelStore(db), MemoryChannel())
         librarian = TelegramLibrarian(store, index)
         caption = f"openseek:v1:{fp}:{PROFILE}:0:{hashlib.sha256(data).hexdigest()}"
         name = _tile_filename(0, 10_000, 1)
@@ -979,7 +999,7 @@ def test_librarian_accepts_nvmt_package_and_reposts_tiles(tmp_path):
     store = FakeLibrarianStore(pkg_data)
     db, _ = make_db_cache(tmp_path / "librarian_pkg")
     try:
-        index = ChannelIndex(db, MemoryChannel())
+        index = ChannelIndex(ChannelStore(db), MemoryChannel())
         librarian = TelegramLibrarian(store, index)
         event = FakeEvent(caption, pkg_data, "package.nvmt", mime_type="application/vnd.openseek.nvmt")
         asyncio.run(librarian.handle_message(event, store))
@@ -1000,7 +1020,7 @@ def test_latest_manifest_wins_and_updated_hints_survive_rebuild(tmp_path):
     db, _ = make_db_cache(tmp_path / "latest_manifest")
     store = MemoryChannel()
     try:
-        index = ChannelIndex(db, store)
+        index = ChannelIndex(ChannelStore(db), store)
         first = {
             "v": 1, "fp": "f" * 64, "profile": "nvmt-v1-g10", "imdb": "tt1234567",
             "season": 1, "episode": 2, "duration_ms": 20_000, "size_bytes": 100_000,
@@ -1047,7 +1067,7 @@ def test_librarian_rejects_package_wrong_mime(tmp_path):
     store = FakeLibrarianStore(pkg_data)
     db, _ = make_db_cache(tmp_path / "librarian_wrong_mime")
     try:
-        index = ChannelIndex(db, MemoryChannel())
+        index = ChannelIndex(ChannelStore(db), MemoryChannel())
         librarian = TelegramLibrarian(store, index)
         event = FakeEvent(caption, pkg_data, "package.nvmt", mime_type="application/octet-stream")
         asyncio.run(librarian.handle_message(event, store))
@@ -1064,7 +1084,7 @@ def test_librarian_rejects_package_malformed_hints(tmp_path):
     store = FakeLibrarianStore(b"NVMT-not-valid")
     db, _ = make_db_cache(tmp_path / "librarian_malformed_hints")
     try:
-        index = ChannelIndex(db, MemoryChannel())
+        index = ChannelIndex(ChannelStore(db), MemoryChannel())
         librarian = TelegramLibrarian(store, index)
         caption = "openseek:hints:v1:not-valid-base64!!!"
         event = FakeEvent(caption, b"data", "package.nvmt", mime_type="application/vnd.openseek.nvmt")
@@ -1080,7 +1100,7 @@ def test_librarian_rejects_oversized_package(tmp_path):
     store = FakeLibrarianStore(b"X" * (17 * 1024 * 1024))
     db, _ = make_db_cache(tmp_path / "librarian_oversized")
     try:
-        index = ChannelIndex(db, MemoryChannel())
+        index = ChannelIndex(ChannelStore(db), MemoryChannel())
         librarian = TelegramLibrarian(store, index)
         manifest = {"v": 1, "fp": fp, "profile": PROFILE, "duration_ms": 20_000}
         raw_b64 = base64.urlsafe_b64encode(json.dumps(manifest).encode()).decode().rstrip("=")
@@ -1115,7 +1135,7 @@ def test_librarian_rejects_partial_tile_failure_atomically(tmp_path):
 
     db, _ = make_db_cache(tmp_path / "librarian_partial_fail")
     try:
-        index = ChannelIndex(db, MemoryChannel())
+        index = ChannelIndex(ChannelStore(db), MemoryChannel())
         librarian = TelegramLibrarian(store, index)
         event = FakeEvent(caption, pkg_data, "package.nvmt", mime_type="application/vnd.openseek.nvmt")
         asyncio.run(librarian.handle_message(event, store))

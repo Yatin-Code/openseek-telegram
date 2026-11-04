@@ -47,6 +47,8 @@ from .pool import (MAX_NVMT_BYTES, ChannelPoolClient, ChannelPoolSync, PoolClien
                    PoolError, PoolService, PoolSync, TelegramBotStore)
 from .channel_index import ChannelIndex
 from .channel_pool import ChannelPoolService, PoolWritePolicy
+from .remote import RemoteChannelStore, SupabaseClient
+from .store import ChannelStore
 from .telegram_mt import TelegramMTProtoStore
 from .contribution import TelegramLibrarian
 from .contrib import ContributionPolicy, Spacing, clean_hosts
@@ -99,8 +101,17 @@ class Core:
                 store=self.channel_store,
                 proxy_url=settings.pool_contrib_url,
                 librarian_url=_librarian_url(settings) or "")
+            if settings.profile == "vercel":
+                index_store = RemoteChannelStore(SupabaseClient(
+                    settings.supabase_url, settings.supabase_service_key,
+                    bucket=settings.supabase_bucket))
+                index_db = None
+            else:
+                index_store = ChannelStore(self.db)
+                index_db = self.db
             self.channel_index = ChannelIndex(
-                self.db, self.channel_store, channel_id=settings.telegram_channel_id,
+                index_store, self.channel_store, db=index_db,
+                channel_id=settings.telegram_channel_id,
                 scan_limit=settings.pool_channel_scan_limit, refresh_s=settings.pool_index_refresh_s)
             self.pool = ChannelPoolService(self.channel_index, settings.pool_read_key, settings.pool_write_key)
             if settings.librarian_enabled and hasattr(self.channel_store, "set_message_handler"):

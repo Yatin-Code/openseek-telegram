@@ -87,7 +87,10 @@ def main(argv: list[str] | None = None) -> int:
         serve(settings)
         return 0
     if a.cmd == "doctor":
-        report = {"mode": settings.effective_pool_mode}
+        report = {"mode": settings.effective_pool_mode, "profile": settings.profile}
+        if settings.profile == "vercel":
+            report["supabase_configured"] = bool(settings.supabase_url and settings.supabase_service_key)
+            report["supabase_bucket"] = settings.supabase_bucket
         if settings.effective_pool_mode == "channel":
             report["telegram_identity"] = "bot" if settings.telegram_bot_token else "user_session"
             report["channel_id"] = settings.telegram_channel_id

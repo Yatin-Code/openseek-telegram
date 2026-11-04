@@ -112,6 +112,10 @@ def _ports(v: str) -> frozenset[int]:
 @dataclass(frozen=True)
 class Settings:
     data_dir: Path = Path("data")
+    profile: str = "local"                 # local | vercel (OPENSEEK_PROFILE; VERCEL=1 implies vercel)
+    supabase_url: str = ""
+    supabase_service_key: str = ""
+    supabase_bucket: str = "openseek-staging"
     host: str = "0.0.0.0"
     port: int = 8787
     admin_port: int = 8788                 # always bound to 127.0.0.1 (contract)
@@ -223,6 +227,10 @@ class Settings:
         s = cls()
         conv = {
             "DATA_DIR": ("data_dir", Path),
+            "PROFILE": ("profile", str),
+            "SUPABASE_URL": ("supabase_url", str),
+            "SUPABASE_SERVICE_KEY": ("supabase_service_key", str),
+            "SUPABASE_BUCKET": ("supabase_bucket", str),
             "HOST": ("host", str),
             "PORT": ("port", int),
             "ADMIN_PORT": ("admin_port", int),
@@ -323,6 +331,8 @@ class Settings:
                 kw[name] = fn(raw)
             except (ValueError, ConfigError) as e:
                 raise ConfigError(f"OPENSEEK_{suffix}: {e}") from None
+        if "profile" not in kw and env.get("VERCEL", "").strip().lower() in ("1", "true", "yes", "on"):
+            kw["profile"] = "vercel"
         cfg_path = env.get("OPENSEEK_CONFIG_FILE")
         if cfg_path:
             by_name = {name: fn for name, fn in conv.values()}
@@ -367,6 +377,22 @@ class Settings:
         return s
 
     def validate(self) -> None:
+        if self.profile not in ("local", "vercel"):
+            raise ConfigError("OPENSEEK_PROFILE must be local or vercel")
+        if self.profile == "vercel":
+            if self.effective_pool_mode != "channel":
+                raise ConfigError("OPENSEEK_PROFILE=vercel requires OPENSEEK_POOL_MODE=channel")
+            if not self.supabase_url:
+                raise ConfigError("OPENSEEK_PROFILE=vercel requires OPENSEEK_SUPABASE_URL")
+            parsed = urlsplit(self.supabase_url)
+            if (parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or
+                    parsed.query or parsed.fragment):
+                raise ConfigError("OPENSEEK_SUPABASE_URL must be an HTTPS origin without credentials, query, or fragment")
+            if not self.supabase_service_key:
+                raise ConfigError("OPENSEEK_PROFILE=vercel requires OPENSEEK_SUPABASE_SERVICE_KEY")
+            if (not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,62}", self.supabase_bucket) or
+                    ".." in self.supabase_bucket):
+                raise ConfigError("OPENSEEK_SUPABASE_BUCKET must be 1..63 safe bucket-name characters")
         if not 0 <= self.p2_pause_s <= 60 or not 0 <= self.p1_interleave <= 100:
             raise ConfigError("P2_PAUSE_S must be 0..60; P1_INTERLEAVE must be 0..100")
         if self.pregen not in PREGEN_MODES:

@@ -1,4 +1,8 @@
-"""Rebuildable SQLite index for valid tile documents in a Telegram channel."""
+"""Rebuildable index for valid tile documents in a Telegram channel.
+
+All channel-table access goes through a `ChannelStore` (SQLite) or
+`RemoteChannelStore` (Supabase/PostgREST); Telegram remains the durable store.
+"""
 from __future__ import annotations
 
 import base64
@@ -16,17 +20,26 @@ from .pool import (MAX_DURATION_MS, MAX_TILE_BYTES, NVMT_PROFILES, PoolError,
                    TILE_INTERVAL_MS, _EPISODE_KEY, _rank_hint_rows, _timing_relation, _tile_metadata_from_filename,
                    encode_nvmt, validate_pool_hints, validate_tile)
 from .scheduler import tile_count
+from .store import ChannelStore
 from .telegram_mt import _HINTS_CAPTION
 
 log = logging.getLogger("openseek.channel_index")
 _CAPTION = re.compile(r"^openseek:v1:([0-9a-f]{64}):([^:]+):(\d+):([0-9a-f]{64})$")
 
 
+def _tile_row(tile: tuple, created: float) -> dict:
+    fp, profile, k, pts_ms, duration_ms, n_tiles, size, digest, message_id = tile
+    return {"fp": fp, "profile": profile, "k": k, "pts_ms": pts_ms,
+            "duration_ms": duration_ms, "n_tiles": n_tiles, "size": size,
+            "sha256": digest, "message_id": message_id, "created": created}
+
+
 class ChannelIndex:
-    def __init__(self, db: DB, store, *, channel_id: str | None = None,
-                 scan_limit: int = 2000, refresh_s: int = 300, clock=time.time):
-        self.db, self.store = db, store
-        self.channel_id = str(channel_id or getattr(store, "channel_id", ""))
+    def __init__(self, store: ChannelStore, telegram, *, db: DB | None = None,
+                 channel_id: str | None = None, scan_limit: int = 2000,
+                 refresh_s: int = 300, clock=time.time):
+        self.store, self.telegram, self.db = store, telegram, db
+        self.channel_id = str(channel_id or getattr(telegram, "channel_id", ""))
         self.scan_limit = max(1, int(scan_limit))
         self.refresh_s = max(10, int(refresh_s))
         self.clock = clock
@@ -49,11 +62,10 @@ class ChannelIndex:
                 raise
 
     def _refresh_once(self, last_message_id: int) -> dict:
-        messages = self.store.scan(last_message_id, self.scan_limit)
+        messages = self.telegram.scan(last_message_id, self.scan_limit)
         messages = sorted(messages, key=lambda message: int(message.message_id))
         newest = max((int(message.message_id) for message in messages), default=last_message_id)
         now = self.clock()
-        indexed = 0
         candidates = []
         seen = set()
         for message in messages:
@@ -78,15 +90,14 @@ class ChannelIndex:
             key = (fp, profile, k)
             if key in seen:
                 continue
-            existing = self.db.q(
-                "SELECT sha256,duration_ms FROM pool_channel_tiles WHERE fp=? AND profile=? AND k=?", key)
+            existing = self.store.get_tile(fp, profile, k)
             if existing:
                 seen.add(key)
-                if existing[0][0] == digest and existing[0][1] == 0 and duration_ms > 0:
-                    candidates.append(tile)
+                if existing["sha256"] == digest and existing["duration_ms"] == 0 and duration_ms > 0:
+                    candidates.append(_tile_row(tile, now))
                 continue
             try:
-                data = self.store.get_tile(message_id)
+                data = self.telegram.get_tile(message_id)
                 valid_duration = duration_ms or MAX_DURATION_MS
                 valid_count = n_tiles or tile_count(valid_duration)
                 if len(data) != size or validate_tile(
@@ -96,53 +107,14 @@ class ChannelIndex:
                 log.debug("ignoring invalid Telegram tile message %d (%s)", message_id, type(exc).__name__)
                 continue
             seen.add(key)
-            candidates.append(tile)
-        with self.db._lock:
-            self.db.conn.execute("BEGIN IMMEDIATE")
-            try:
-                for tile in candidates:
-                    fp, profile, k, pts_ms, duration_ms, n_tiles, size, digest, message_id = tile
-                    existing = self.db.conn.execute(
-                        "SELECT sha256,duration_ms,n_tiles FROM pool_channel_tiles "
-                        "WHERE fp=? AND profile=? AND k=?", (fp, profile, k)).fetchone()
-                    if existing is None:
-                        self.db.conn.execute(
-                            "INSERT OR IGNORE INTO pool_channel_tiles "
-                            "(fp,profile,k,pts_ms,duration_ms,n_tiles,size,sha256,message_id,created) "
-                            "VALUES(?,?,?,?,?,?,?,?,?,?)",
-                            (fp, profile, k, pts_ms, duration_ms, n_tiles, size, digest, message_id, now))
-                        indexed += 1
-                    elif (existing[0] == digest and existing[1] == 0 and duration_ms > 0):
-                        # Older host uploads only carried the stable caption. A
-                        # matching later post may fill in its filename metadata.
-                        self.db.conn.execute(
-                            "UPDATE pool_channel_tiles SET pts_ms=?,duration_ms=?,n_tiles=?,size=? "
-                            "WHERE fp=? AND profile=? AND k=? AND sha256=? AND duration_ms=0",
-                            (pts_ms, duration_ms, n_tiles, size, fp, profile, k, digest))
-                self.db.conn.execute(
-                    "INSERT INTO pool_channel_state(channel_id,last_message_id,scanned_at) VALUES(?,?,?) "
-                    "ON CONFLICT(channel_id) DO UPDATE SET last_message_id=excluded.last_message_id, "
-                    "scanned_at=excluded.scanned_at",
-                    (self.channel_id, newest, now))
-                self.db.conn.execute("COMMIT")
-            except BaseException:
-                self.db.conn.execute("ROLLBACK")
-                raise
+            candidates.append(_tile_row(tile, now))
+        indexed = self.store.record_tiles(candidates, channel_id=self.channel_id,
+                                          last_message_id=newest, scanned_at=now)
         return {"scanned": len(messages), "indexed": indexed, "last_message_id": newest, "skipped": False}
 
     def rebuild(self) -> dict:
         with self._lock:
-            with self.db._lock:
-                self.db.conn.execute("BEGIN IMMEDIATE")
-                try:
-                    self.db.conn.execute("DELETE FROM pool_channel_tiles")
-                    self.db.conn.execute("DELETE FROM pool_channel_state WHERE channel_id=?", (self.channel_id,))
-                    self.db.conn.execute("DELETE FROM pool_hints")
-                    self.db.conn.execute("DELETE FROM pool_episode_packages")
-                    self.db.conn.execute("COMMIT")
-                except BaseException:
-                    self.db.conn.execute("ROLLBACK")
-                    raise
+            self.store.clear_channel(self.channel_id)
             total_scanned = total_indexed = 0
             last_message_id = 0
             while True:
@@ -181,9 +153,7 @@ class ChannelIndex:
                 log.warning("Telegram channel refresh failed (%s)", type(exc).__name__)
 
     def _state(self) -> tuple[int, float] | None:
-        rows = self.db.q("SELECT last_message_id,scanned_at FROM pool_channel_state WHERE channel_id=?",
-                         (self.channel_id,))
-        return (int(rows[0][0]), float(rows[0][1])) if rows else None
+        return self.store.state(self.channel_id)
 
     @staticmethod
     def _parse_message(message) -> tuple | None:
@@ -210,23 +180,13 @@ class ChannelIndex:
     def lookup(self, fp: str, profile: str, k: int) -> dict | None:
         if not is_fingerprint(fp) or profile != PROFILE or not isinstance(k, int) or not 0 <= k < 1_000_000:
             raise PoolError(400, "bad_key")
-        rows = self.db.q("SELECT message_id,pts_ms,duration_ms,n_tiles,size,sha256 FROM pool_channel_tiles "
-                         "WHERE fp=? AND profile=? AND k=?", (fp, profile, k))
-        if not rows:
-            return None
-        message_id, pts_ms, duration_ms, n_tiles, size, digest = rows[0]
-        return {"message_id": int(message_id), "pts_ms": int(pts_ms), "duration_ms": int(duration_ms),
-                "n_tiles": int(n_tiles), "size": int(size), "sha256": digest}
+        return self.store.get_tile(fp, profile, k)
 
     def forget(self, fp: str, profile: str, k: int, message_id: int | None = None) -> bool:
         """Drop a stale or corrupt Telegram reference without affecting a newer winner."""
         if not is_fingerprint(fp) or profile != PROFILE or not isinstance(k, int):
             return False
-        if message_id is None:
-            return self.db.x("DELETE FROM pool_channel_tiles WHERE fp=? AND profile=? AND k=?",
-                             (fp, profile, k)) > 0
-        return self.db.x("DELETE FROM pool_channel_tiles WHERE fp=? AND profile=? AND k=? AND message_id=?",
-                         (fp, profile, k, int(message_id))) > 0
+        return self.store.forget_tile(fp, profile, k, message_id)
 
     def record_message(self, message) -> bool:
         """Index a just-reposted librarian tile while preserving the first digest."""
@@ -234,31 +194,10 @@ class ChannelIndex:
         if tile is None:
             return False
         fp, profile, k, pts_ms, duration_ms, n_tiles, size, digest, message_id = tile
-        with self.db._lock:
-            self.db.conn.execute("BEGIN IMMEDIATE")
-            try:
-                existing = self.db.conn.execute(
-                    "SELECT sha256,duration_ms FROM pool_channel_tiles WHERE fp=? AND profile=? AND k=?",
-                    (fp, profile, k)).fetchone()
-                if existing is None:
-                    self.db.conn.execute(
-                        "INSERT INTO pool_channel_tiles "
-                        "(fp,profile,k,pts_ms,duration_ms,n_tiles,size,sha256,message_id,created) "
-                        "VALUES(?,?,?,?,?,?,?,?,?,?)",
-                        (fp, profile, k, pts_ms, duration_ms, n_tiles, size, digest, message_id, self.clock()))
-                    accepted = True
-                else:
-                    accepted = existing[0] == digest
-                    if accepted and existing[1] == 0 and duration_ms > 0:
-                        self.db.conn.execute(
-                            "UPDATE pool_channel_tiles SET pts_ms=?,duration_ms=?,n_tiles=?,size=? "
-                            "WHERE fp=? AND profile=? AND k=? AND sha256=? AND duration_ms=0",
-                            (pts_ms, duration_ms, n_tiles, size, fp, profile, k, digest))
-                self.db.conn.execute("COMMIT")
-                return accepted
-            except BaseException:
-                self.db.conn.execute("ROLLBACK")
-                raise
+        return self.store.record_tile({
+            "fp": fp, "profile": profile, "k": k, "pts_ms": pts_ms,
+            "duration_ms": duration_ms, "n_tiles": n_tiles, "size": size,
+            "sha256": digest, "message_id": message_id, "created": self.clock()})
 
     def record_manifest(self, hints: dict) -> bool:
         """Store validated hints into pool_hints."""
@@ -294,61 +233,41 @@ class ChannelIndex:
             )
         except Exception:
             return False
-        manifest_created = float(created)
-        with self.db._lock:
-            inserted = self.db.x(
-                "INSERT INTO pool_hints(fp,profile,imdb,season,episode,duration_ms,size_bytes,filename_norm,n_tiles,grid,created) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?) "
-                "ON CONFLICT(fp,profile) DO UPDATE SET "
-                "imdb=excluded.imdb,season=excluded.season,episode=excluded.episode,"
-                "duration_ms=excluded.duration_ms,size_bytes=excluded.size_bytes,"
-                "filename_norm=excluded.filename_norm,n_tiles=excluded.n_tiles,"
-                "grid=excluded.grid,created=excluded.created",
-                (fp, profile, validated["imdb"], validated["season"], validated["episode"],
-                 validated["duration_ms"], validated["size_bytes"], validated["filename_norm"],
-                 n_tiles, grid, manifest_created))
-        return inserted > 0
+        return self.store.put_hints({
+            "fp": fp, "profile": profile, "imdb": validated["imdb"],
+            "season": validated["season"], "episode": validated["episode"],
+            "duration_ms": validated["duration_ms"], "size_bytes": validated["size_bytes"],
+            "filename_norm": validated["filename_norm"], "n_tiles": n_tiles,
+            "grid": grid, "created": float(created)})
 
     def manifest(self, fp: str, profile: str) -> dict | None:
         if not is_fingerprint(fp) or profile != PROFILE:
             raise PoolError(400, "bad_key")
-        rows = self.db.q("SELECT k,pts_ms,duration_ms,n_tiles,size,sha256 FROM pool_channel_tiles "
-                         "WHERE fp=? AND profile=? ORDER BY k", (fp, profile))
+        rows = self.store.tiles_for_package(fp, profile)
         if not rows:
             return None
-        known = {(int(row[2]), int(row[3])) for row in rows if int(row[2]) > 0 and int(row[3]) > 0}
+        known = {(row["duration_ms"], row["n_tiles"]) for row in rows
+                 if row["duration_ms"] > 0 and row["n_tiles"] > 0}
         duration_ms, n_tiles = next(iter(known)) if len(known) == 1 else (0, 0)
         return {"fp": fp, "profile": profile, "duration_ms": duration_ms, "n_tiles": n_tiles,
-                "tiles": [{"k": int(row[0]), "pts_ms": int(row[1]), "size": int(row[4]), "sha256": row[5]}
-                          for row in rows]}
+                "tiles": [{"k": row["k"], "pts_ms": row["pts_ms"], "size": row["size"],
+                           "sha256": row["sha256"]} for row in rows]}
 
     def episode_candidates(self, episode_key: str, duration_ms: int, limit: int = 8) -> list[dict]:
         if not _EPISODE_KEY.fullmatch(episode_key or "") or not isinstance(duration_ms, int) or duration_ms <= 0:
             raise PoolError(400, "bad_episode_key")
-        hint_rows = self.db.q(
-            "SELECT h.imdb,h.season,h.episode FROM pool_episode_packages e "
-            "JOIN pool_hints h ON h.fp=e.fp AND h.profile=e.profile "
-            "WHERE e.episode_key=? AND h.imdb IS NOT NULL "
-            "AND EXISTS (SELECT 1 FROM pool_channel_tiles c WHERE c.fp=e.fp AND c.profile=?) "
-            "ORDER BY ABS(e.duration_ms-?) ASC,e.updated DESC LIMIT 1",
-            (episode_key, PROFILE, duration_ms))
-        if hint_rows:
-            imdb, season, episode = hint_rows[0]
+        hint_key = self.store.episode_hint_key(episode_key, duration_ms)
+        if hint_key is not None:
+            imdb, season, episode = hint_key
             candidates = self.candidates(duration_ms=duration_ms, imdb=imdb,
-                                         season=int(season), episode=int(episode), limit=limit)
+                                         season=season, episode=episode, limit=limit)
             for candidate in candidates:
                 candidate["duration_delta_ms"] = abs(candidate["duration_ms"] - duration_ms)
             return candidates
 
         # A manifest-less legacy package still needs the duration-only path.
         tolerance = max(90_000, int(duration_ms * 0.15))
-        rows = self.db.q(
-            "SELECT e.fp,e.profile,e.duration_ms,e.updated,COUNT(c.k) "
-            "FROM pool_episode_packages e JOIN pool_channel_tiles c ON c.fp=e.fp AND c.profile=? "
-            "WHERE e.episode_key=? AND e.duration_ms>0 AND ABS(e.duration_ms-?)<=? "
-            "GROUP BY e.fp,e.profile,e.duration_ms,e.updated "
-            "ORDER BY ABS(e.duration_ms-?) ASC,e.updated DESC LIMIT ?",
-            (PROFILE, episode_key, duration_ms, tolerance, duration_ms, max(1, min(limit, 8))))
+        rows = self.store.episode_packages_for_key(episode_key, duration_ms, tolerance, limit)
         candidates = []
         for fp, profile, source_ms, updated, n_tiles in rows:
             grid = NVMT_PROFILES.get(profile)
@@ -378,28 +297,11 @@ class ChannelIndex:
         if exclude_fp is not None and not is_fingerprint(exclude_fp):
             raise PoolError(400, "bad_key")
         tolerance = max(90_000, int(duration_ms * 0.15))
-        hint_cols = {r[1] for r in self.db.conn.execute("PRAGMA table_info(pool_hints)").fetchall()}
-        has_verified = "verified" in hint_cols
-        ver_col = ",h.verified" if has_verified else ""
-        ver_grp = ",h.verified" if has_verified else ""
-        rows = self.db.q(
-            f"SELECT h.fp,h.profile,h.imdb,h.season,h.episode,h.duration_ms,h.size_bytes,h.filename_norm,"
-            f"h.n_tiles,h.grid,h.created,COUNT(c.k){ver_col} "
-            f"FROM pool_hints h JOIN pool_channel_tiles c ON c.fp=h.fp AND c.profile=? "
-            f"AND c.duration_ms=h.duration_ms "
-            f"WHERE ABS(h.duration_ms-?)<=? AND (? IS NULL OR h.fp<>?) "
-            f"GROUP BY h.fp,h.profile,h.imdb,h.season,h.episode,h.duration_ms,h.size_bytes,"
-            f"h.filename_norm,h.n_tiles,h.grid,h.created{ver_grp}",
-            (PROFILE, duration_ms, tolerance, exclude_fp, exclude_fp))
+        rows = self.store.hint_rows_for_candidates(duration_ms, tolerance, exclude_fp)
         normalized = []
         for row in rows:
-            if has_verified:
-                (fp, profile, row_imdb, row_season, row_episode, source_ms, row_size,
-                 row_filename, _source_tiles, grid, created, channel_tiles, row_verified) = row
-            else:
-                (fp, profile, row_imdb, row_season, row_episode, source_ms, row_size,
-                 row_filename, _source_tiles, grid, created, channel_tiles) = row
-                row_verified = 0
+            (fp, profile, row_imdb, row_season, row_episode, source_ms, row_size,
+             row_filename, _source_tiles, grid, created, channel_tiles, row_verified) = row
             n_slots = (int(source_ms) + int(grid) - 1) // int(grid)
             normalized.append((fp, profile, row_imdb, row_season, row_episode, source_ms, row_size,
                                row_filename, channel_tiles, grid, created, n_slots, row_verified))
@@ -413,16 +315,15 @@ class ChannelIndex:
         grid = NVMT_PROFILES.get(profile)
         if not is_fingerprint(fp) or grid is None:
             raise PoolError(400, "bad_key")
-        rows = self.db.q("SELECT k,pts_ms,duration_ms,n_tiles,size,sha256,message_id "
-                         "FROM pool_channel_tiles WHERE fp=? AND profile=? ORDER BY k", (fp, PROFILE))
-        if not rows or any(int(row[2]) <= 0 or int(row[3]) <= 0 for row in rows):
+        rows = self.store.tiles_for_package(fp, PROFILE)
+        if not rows or any(row["duration_ms"] <= 0 or row["n_tiles"] <= 0 for row in rows):
             return None
-        duration_ms, n_tiles = int(rows[0][2]), int(rows[0][3])
-        if (any(int(row[2]) != duration_ms or int(row[3]) != n_tiles for row in rows) or
+        duration_ms, n_tiles = rows[0]["duration_ms"], rows[0]["n_tiles"]
+        if (any(row["duration_ms"] != duration_ms or row["n_tiles"] != n_tiles for row in rows) or
                 n_tiles != (duration_ms + 9_999) // 10_000 or TILE_INTERVAL_MS % grid):
             raise PoolError(502, "stored_tile_corrupt")
         tile_step = TILE_INTERVAL_MS // grid
-        by_slot = {int(row[0]) * tile_step: row for row in rows}
+        by_slot = {row["k"] * tile_step: row for row in rows}
         selected_rows = {}
         for wanted in dict.fromkeys(slots):
             if wanted in by_slot:
@@ -435,15 +336,14 @@ class ChannelIndex:
             return None
         selected = {}
         for slot, row in selected_rows.items():
-            k, pts_ms, _duration, _n, size, digest, message_id = row
-            data = self.store.get_tile(int(message_id))
-            if len(data) != int(size) or hashlib.sha256(data).hexdigest() != digest:
+            data = self.telegram.get_tile(row["message_id"])
+            if len(data) != row["size"] or hashlib.sha256(data).hexdigest() != row["sha256"]:
                 raise PoolError(502, "stored_tile_corrupt")
             try:
-                validate_tile(fp, PROFILE, int(k), int(pts_ms), duration_ms, n_tiles, data)
+                validate_tile(fp, PROFILE, row["k"], row["pts_ms"], duration_ms, n_tiles, data)
             except PoolError as exc:
                 raise PoolError(502, "stored_tile_corrupt") from exc
-            selected[slot] = (int(pts_ms), data)
+            selected[slot] = (row["pts_ms"], data)
         n_slots = (duration_ms + grid - 1) // grid
         data = encode_nvmt(grid, n_slots, selected)
         return data, {"duration_ms": duration_ms, "n_slots": n_slots, "n_tiles": len(selected),
@@ -451,17 +351,14 @@ class ChannelIndex:
 
     def status(self) -> dict:
         state = self._state()
-        count = self.db.q("SELECT COUNT(*) FROM pool_channel_tiles")
-        hint_count = self.db.q("SELECT COUNT(*) FROM pool_hints")
-        episode_count = self.db.q("SELECT COUNT(*) FROM pool_episode_packages")
+        counts = self.store.counts()
         return {"channel_id": self.channel_id, "last_message_id": state[0] if state else 0,
-                "scanned_at": state[1] if state else 0, "tiles": int(count[0][0]) if count else 0,
-                "hints": int(hint_count[0][0]) if hint_count else 0,
-                "episode_packages": int(episode_count[0][0]) if episode_count else 0,
+                "scanned_at": state[1] if state else 0, "tiles": counts["tiles"],
+                "hints": counts["hints"], "episode_packages": counts["episode_packages"],
                 "last_error": self.last_error,
-                "entity_type": getattr(self.store, "entity_type", "unknown"),
-                "entity_resolved": getattr(self.store, "entity_resolved", None),
-                "history_readable": getattr(self.store, "history_readable", None),
-                "channel_writable": getattr(self.store, "can_post", None),
-                "detected_channel_writable": getattr(self.store, "detected_can_post", None),
-                "post_permission_error": getattr(self.store, "post_permission_error", "")}
+                "entity_type": getattr(self.telegram, "entity_type", "unknown"),
+                "entity_resolved": getattr(self.telegram, "entity_resolved", None),
+                "history_readable": getattr(self.telegram, "history_readable", None),
+                "channel_writable": getattr(self.telegram, "can_post", None),
+                "detected_channel_writable": getattr(self.telegram, "detected_can_post", None),
+                "post_permission_error": getattr(self.telegram, "post_permission_error", "")}
