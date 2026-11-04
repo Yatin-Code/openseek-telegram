@@ -44,6 +44,21 @@ CREATE INDEX IF NOT EXISTS pool_channel_tiles_fp ON pool_channel_tiles(fp, profi
 CREATE TABLE IF NOT EXISTS pool_channel_state (
   channel_id TEXT PRIMARY KEY, last_message_id INTEGER NOT NULL DEFAULT 0,
   scanned_at REAL NOT NULL DEFAULT 0);
+-- Vercel upload staging metadata. Supabase Storage holds the temporary object in the
+-- serverless profile; Telegram remains the durable package store. The row is a
+-- rebuildable status/retry record, never a second package copy.
+CREATE TABLE IF NOT EXISTS pool_uploads (
+  upload_id TEXT PRIMARY KEY, device_id TEXT NOT NULL, fp TEXT NOT NULL, profile TEXT NOT NULL,
+  duration_ms INTEGER NOT NULL, size_bytes INTEGER, imdb TEXT, season INTEGER NOT NULL DEFAULT 0,
+  episode INTEGER NOT NULL DEFAULT 0, filename_norm TEXT, object_path TEXT NOT NULL,
+  state TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL, expires REAL NOT NULL,
+  error TEXT);
+CREATE INDEX IF NOT EXISTS pool_uploads_state ON pool_uploads(state, expires);
+CREATE TABLE IF NOT EXISTS pool_publication_queue (
+  upload_id TEXT PRIMARY KEY, fp TEXT NOT NULL, profile TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0, next_attempt REAL NOT NULL DEFAULT 0,
+  state TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL, error TEXT);
+CREATE INDEX IF NOT EXISTS pool_publication_queue_next ON pool_publication_queue(state, next_attempt);
 -- Separate durable queue so HTTP-host uploads and channel uploads never share retry state.
 CREATE TABLE IF NOT EXISTS pool_channel_outbox (
   fp TEXT NOT NULL, k INTEGER NOT NULL, pts_ms INTEGER NOT NULL, duration_ms INTEGER NOT NULL,
@@ -199,6 +214,14 @@ class DB:
             outbox_rows = self.conn.execute(
                 "SELECT fp,k FROM pool_outbox WHERE created<? AND attempts>?", (outbox_before, max_attempts)
             ).fetchall()
+            now = time.time()
+            upload_rows = self.conn.execute(
+                "SELECT upload_id FROM pool_uploads WHERE expires<? OR state IN ('published','expired')",
+                (now,)).fetchall()
+            publication_rows = self.conn.execute(
+                "SELECT upload_id FROM pool_publication_queue WHERE attempts>? OR "
+                "(state IN ('done','published') AND updated<?)",
+                (max_attempts, outbox_before)).fetchall()
             invalid_tile_keys = set(invalid_tiles)
             invalid_package_keys = set(invalid_packages)
             current_packages = set(package_rows)
@@ -213,6 +236,8 @@ class DB:
                 "pool_episode_packages": len(orphan_episodes),
                 "pool_hints": len(orphan_hints),
                 "pool_outbox": len(outbox_rows),
+                "pool_uploads": len(upload_rows),
+                "pool_publication_queue": len(publication_rows),
             }
             if dry_run:
                 return counts
@@ -230,6 +255,10 @@ class DB:
                     self.conn.execute("DELETE FROM pool_hints WHERE fp=? AND profile=?", (fp, profile))
                 for fp, k in outbox_rows:
                     self.conn.execute("DELETE FROM pool_outbox WHERE fp=? AND k=?", (fp, k))
+                for (upload_id,) in publication_rows:
+                    self.conn.execute("DELETE FROM pool_publication_queue WHERE upload_id=?", (upload_id,))
+                for (upload_id,) in upload_rows:
+                    self.conn.execute("DELETE FROM pool_uploads WHERE upload_id=?", (upload_id,))
                 self.conn.execute("DELETE FROM pool_device_rejections WHERE expires<=?", (time.time(),))
                 self.conn.execute("COMMIT")
             except Exception:

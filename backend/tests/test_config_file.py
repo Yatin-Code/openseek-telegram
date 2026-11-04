@@ -107,3 +107,57 @@ def test_trusted_tls_certificate_pair(tmp_path):
     assert loaded.tls_cert_file == cert and loaded.tls_key_file == key
     with pytest.raises(ConfigError):
         Settings.from_env({"OPENSEEK_TLS_CERT_FILE": str(cert)})
+
+
+def vercel_env(**overrides):
+    env = {
+        "OPENSEEK_POOL_MODE": "channel",
+        "OPENSEEK_TELEGRAM_CHANNEL_ID": "-100123",
+        "OPENSEEK_TELEGRAM_BOT_TOKEN": "123456:test",
+        "OPENSEEK_TELEGRAM_API_ID": "123",
+        "OPENSEEK_TELEGRAM_API_HASH": "a" * 32,
+        "OPENSEEK_SUPABASE_URL": "https://project.supabase.co",
+        "OPENSEEK_SUPABASE_SERVICE_KEY": "service-role-key",
+    }
+    env.update(overrides)
+    return env
+
+
+def test_profile_defaults_to_local():
+    assert Settings().profile == "local"
+    assert Settings.from_env({}).profile == "local"
+    assert Settings.from_env({"OPENSEEK_PROFILE": "local"}).profile == "local"
+
+
+def test_vercel_env_implies_vercel_profile_unless_explicit():
+    assert Settings.from_env({**vercel_env(), "VERCEL": "1"}).profile == "vercel"
+    assert Settings.from_env({**vercel_env(), "VERCEL": "1",
+                              "OPENSEEK_PROFILE": "local"}).profile == "local"
+
+
+def test_vercel_profile_requires_channel_pool_mode():
+    env = vercel_env()
+    env.pop("OPENSEEK_POOL_MODE")
+    with pytest.raises(ConfigError, match="vercel"):
+        Settings.from_env({**env, "OPENSEEK_PROFILE": "vercel"})
+
+
+@pytest.mark.parametrize("overrides", [
+    {"OPENSEEK_SUPABASE_URL": ""},
+    {"OPENSEEK_SUPABASE_SERVICE_KEY": ""},
+    {"OPENSEEK_SUPABASE_URL": "http://project.supabase.co"},
+    {"OPENSEEK_SUPABASE_BUCKET": "../bad"},
+])
+def test_vercel_profile_validates_supabase_settings(overrides):
+    with pytest.raises(ConfigError):
+        Settings.from_env({**vercel_env(**overrides), "OPENSEEK_PROFILE": "vercel"})
+
+
+def test_vercel_profile_accepts_complete_settings():
+    s = Settings.from_env({**vercel_env(), "OPENSEEK_PROFILE": "vercel"})
+    assert s.profile == "vercel" and s.supabase_bucket == "openseek-staging"
+
+
+def test_local_profile_does_not_require_supabase():
+    s = Settings.from_env({"OPENSEEK_PROFILE": "local", "OPENSEEK_SUPABASE_URL": "not-a-url"})
+    assert s.profile == "local" and s.supabase_service_key == ""

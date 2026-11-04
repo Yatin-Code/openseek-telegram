@@ -111,7 +111,8 @@ def _rank_hint_rows(rows: list[tuple], *, duration_ms: int, imdb: str | None, se
                     episode: int, size_bytes: int | None, filename_norm: str | None,
                     device_id: str | None, work_key: str | None, db, limit: int) -> list[dict]:
     """Apply the shared catalog, timing, correction, and tie-break policy to normalized rows."""
-    rejected_fps = db.get_pool_rejections_for_device(device_id, work_key) if (device_id and work_key) else set()
+    rejected_fps = (db.get_pool_rejections_for_device(device_id, work_key)
+                    if (db is not None and device_id and work_key) else set())
     query_tokens = set((filename_norm or "").split(".")) - {""}
     ranked = []
     for (fp, profile, row_imdb, row_season, row_episode, source_ms, row_size,
@@ -146,7 +147,8 @@ def _rank_hint_rows(rows: list[tuple], *, duration_ms: int, imdb: str | None, se
             continue
         size_delta = (abs(int(row_size) - size_bytes) / max(1, size_bytes)
                       if row_size is not None and size_bytes is not None else None)
-        offset_b = (db.get_pool_offset(device_id, work_key, fp) or 0) if (device_id and work_key) else 0
+        offset_b = ((db.get_pool_offset(device_id, work_key, fp) or 0)
+                    if (db is not None and device_id and work_key) else 0)
         ranked.append({
             "fp": fp, "profile": profile, "duration_ms": int(source_ms), "n_slots": int(n_slots),
             "n_tiles": int(n_tiles), "score": score, "match": "+".join(match_parts),

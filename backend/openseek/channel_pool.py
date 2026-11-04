@@ -61,7 +61,7 @@ class ChannelPoolService:
 
     def __init__(self, index: ChannelIndex, read_key: str = "", write_key: str = ""):
         self.index = index
-        self.store = index.store
+        self.telegram = index.telegram
         self.read_key = read_key
         self.write_key = write_key
         self._lock = threading.RLock()
@@ -80,7 +80,7 @@ class ChannelPoolService:
         if row is None:
             return None
         try:
-            data = self.store.get_tile(row["message_id"])
+            data = self.telegram.get_tile(row["message_id"])
         except PoolError as exc:
             if exc.status == 404:
                 self.index.forget(fp, profile, k, row["message_id"])
@@ -159,15 +159,12 @@ class ChannelPoolService:
         if manifest is None or manifest["duration_ms"] <= 0:
             return False
         duration_ms = int(manifest["duration_ms"])
-        self.index.db.x(
-            "INSERT INTO pool_episode_packages(episode_key,fp,profile,duration_ms,updated) VALUES(?,?,?,?,?) "
-            "ON CONFLICT(episode_key,fp,profile) DO UPDATE SET duration_ms=excluded.duration_ms,updated=excluded.updated",
-            (episode_key, fp, profile, duration_ms, time.time()))
+        self.index.store.put_episode_package(episode_key, fp, profile, duration_ms, time.time())
         return True
 
     def upload(self, *args, **kwargs) -> dict:
         fp, profile, k, pts_ms, duration_ms, n_tiles, data = args[:7]
-        if getattr(self.store, "can_post", None) is not True:
+        if getattr(self.telegram, "can_post", None) is not True:
             raise PoolError(403, "read_only_channel")
         digest = validate_tile(fp, profile, k, pts_ms, duration_ms, n_tiles, data)
         existing = self.index.lookup(fp, profile, k)
@@ -177,7 +174,7 @@ class ChannelPoolService:
             return {"stored": False, "duplicate": True, "sha256": digest}
         caption = f"openseek:v1:{fp}:{profile}:{k}:{digest}"
         metadata = {"pts_ms": pts_ms, "duration_ms": duration_ms, "n_tiles": n_tiles}
-        message_id = self.store.put_tile(data, caption, metadata)
+        message_id = self.telegram.put_tile(data, caption, metadata)
         from .telegram_mt import ChannelMessage
         message = ChannelMessage(int(message_id), caption, len(data),
                                  _tile_filename(pts_ms, duration_ms, n_tiles))
@@ -188,7 +185,7 @@ class ChannelPoolService:
                        episode_key: str | None = None, *, imdb: str | None = None,
                        season: int = 0, episode: int = 0, size_bytes: int | None = None,
                        filename: str | None = None) -> dict:
-        if getattr(self.store, "can_post", None) is not True:
+        if getattr(self.telegram, "can_post", None) is not True:
             raise PoolError(403, "read_only_channel")
         hints = validate_pool_hints(imdb, season, episode, duration_ms, size_bytes, filename)
         grid, n_slots, source_tiles = decode_nvmt(fp, profile, duration_ms, data)
@@ -223,7 +220,7 @@ class ChannelPoolService:
                 continue
             caption = f"openseek:v1:{fp}:{PROFILE}:{k}:{digest}"
             metadata = {"pts_ms": pts_ms, "duration_ms": duration_ms, "n_tiles": channel_count}
-            message_id = self.store.put_tile(tile_data, caption, metadata)
+            message_id = self.telegram.put_tile(tile_data, caption, metadata)
             from .telegram_mt import ChannelMessage
             pending_messages.append(ChannelMessage(int(message_id), caption, len(tile_data),
                                                     _tile_filename(pts_ms, duration_ms, channel_count)))
@@ -239,40 +236,23 @@ class ChannelPoolService:
                     "duration_ms": duration_ms, "size_bytes": hints["size_bytes"],
                     "filename_norm": hints["filename_norm"], "n_tiles": len(source_tiles),
                     "grid": grid, "created": created}
-        old_hints = self.index.db.q(
-            "SELECT imdb,season,episode,duration_ms,size_bytes,filename_norm,n_tiles,grid "
-            "FROM pool_hints WHERE fp=? AND profile=?", (fp, profile))
-        same_hints = bool(old_hints and old_hints[0] == (
+        old_hints = self.index.store.get_hints(fp, profile)
+        same_hints = bool(old_hints and old_hints == (
             hints["imdb"], hints["season"], hints["episode"], duration_ms,
             hints["size_bytes"], hints["filename_norm"], len(source_tiles), grid))
         if stored or not same_hints:
             caption = self._manifest_caption(manifest)
-            post = getattr(self.store, "post_message", None)
+            post = getattr(self.telegram, "post_message", None)
             if post is None:
                 raise PoolError(503, "telegram_manifest_unavailable")
             post(caption)
         now = float(created)
-        with self.index.db._lock:
-            self.index.db.conn.execute("BEGIN IMMEDIATE")
-            try:
-                self.index.db.conn.execute(
-                    "INSERT INTO pool_hints(fp,profile,imdb,season,episode,duration_ms,size_bytes,filename_norm,n_tiles,grid,created) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(fp,profile) DO UPDATE SET "
-                    "imdb=excluded.imdb,season=excluded.season,episode=excluded.episode,"
-                    "duration_ms=excluded.duration_ms,"
-                    "size_bytes=excluded.size_bytes,filename_norm=excluded.filename_norm,n_tiles=excluded.n_tiles,"
-                    "grid=excluded.grid,created=excluded.created",
-                    (fp, profile, hints["imdb"], hints["season"], hints["episode"], duration_ms,
-                     hints["size_bytes"], hints["filename_norm"], len(source_tiles), grid, now))
-                if episode_key:
-                    self.index.db.conn.execute(
-                        "INSERT INTO pool_episode_packages(episode_key,fp,profile,duration_ms,updated) VALUES(?,?,?,?,?) "
-                        "ON CONFLICT(episode_key,fp,profile) DO UPDATE SET duration_ms=excluded.duration_ms,updated=excluded.updated",
-                        (episode_key, fp, profile, duration_ms, now))
-                self.index.db.conn.execute("COMMIT")
-            except BaseException:
-                self.index.db.conn.execute("ROLLBACK")
-                raise
+        self.index.store.put_package_index({
+            "fp": fp, "profile": profile, "imdb": hints["imdb"],
+            "season": hints["season"], "episode": hints["episode"],
+            "duration_ms": duration_ms, "size_bytes": hints["size_bytes"],
+            "filename_norm": hints["filename_norm"], "n_tiles": len(source_tiles),
+            "grid": grid, "created": now}, episode_key)
         return {"stored": stored > 0, "duplicate": stored == 0, "tiles": len(source_tiles),
                 "channel_tiles": len(selected), "sha256": hashlib.sha256(data).hexdigest()}
 
