@@ -7,13 +7,14 @@ Each requirement is testable. "Verify" names the automated test or review that p
 
 **SR-1 (MUST) Pairing codes.** 8 symbols from a 31-symbol unambiguous alphabet (~39.6 bits), generated with
 `secrets`. Valid for at most 10 minutes, single use, invalidated after 5 wrong attempts. At most one
-pairing window open at a time, opened only by a local admin action (B5). Global rate limit on pair claims
+pairing window open at a time, opened by a local admin action or the Vercel dashboard after owner-secret authentication (B5). Global rate limit on pair claims
 (≤ 10/min). *Verify:* `test_pair_code_single_use`, `test_pair_code_expiry`, `test_pair_attempt_cap`,
 `test_pair_requires_open_window`.
 
 **SR-2 (MUST) Pairing protocol OSP1** (reference: `poc/pairing_reference.py`).
-1. On first start the backend generates an ECDSA P-256 key and a self-signed certificate (0600). Pin =
-   `sha256//base64(SHA-256(SPKI DER))`.
+1. Local/VPS first start generates an ECDSA P-256 key and self-signed certificate (0600). Its pin is
+   `sha256//base64(SHA-256(SPKI DER))`. On Vercel, TLS terminates at the deployment edge; `OPENSEEK_PUBLIC_TLS_PIN`
+   supplies the public certificate pin that the client uses.
 2. `POST /v1/pair/start` (TLS, not yet pinned) → `{pair_id, salt, spki_pin, iterations}`. No secret.
 3. TV derives `K = PBKDF2-HMAC-SHA256(code, "OSP1"‖pair_id‖salt‖spki_pin, iterations)`; refuses iterations < 200 000.
 4. `POST /v1/pair/claim` **over TLS pinned to spki_pin** with `client_proof = HMAC(K, "client"‖pair_id‖device_name)`.
@@ -33,12 +34,12 @@ string or path. If pinning is unavailable on the device, the client does not sen
 *Verify:* Nuvio code review + `test_jobs_reject_url_in_query`.
 
 **SR-5 (MUST) Device tokens.** 256-bit random; server stores only SHA-256(token); constant-time comparison;
-revocable per device by local admin. *Verify:* `test_token_hash_only_on_disk`, `test_revoked_token_401`.
+revocable per device by the local admin or the owner-secret-protected Vercel dashboard. *Verify:* `test_token_hash_only_on_disk`, `test_revoked_token_401`.
 
 ## Authorisation
 
-**SR-6 (MUST) Every endpoint except `GET /v1/health` and the two pairing endpoints requires a valid Bearer token**
-(401 otherwise, no detail). *Verify:* `test_every_route_requires_auth` (enumerates the OpenAPI schema).
+**SR-6 (MUST) Local/VPS `/v1/*` endpoints except `GET /v1/health` and the two pairing endpoints require a valid Bearer token**
+(401 otherwise, no detail). Vercel's tick requires its cron secret; all `/admin/*` operations require the owner secret, while the root dashboard shell is static. *Verify:* `test_every_route_requires_auth` (enumerates the OpenAPI schema).
 
 **SR-7 (MUST) Data URLs (VTT, sheets)** use capability paths `/v1/c/{cap}/...` where `cap` = HMAC(server key,
 device_id‖job_id‖exp), expiring in ≤ 6 h and bound to the job. They are only ever served over the pinned TLS port.

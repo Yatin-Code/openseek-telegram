@@ -19,12 +19,15 @@ import pytest
 
 import openseek.app as app_module
 from openseek.app import Core, create_api_app
+from openseek.auth import DeviceAuth
 from openseek.channel_index import ChannelIndex
 from openseek.channel_pool import ChannelPoolService
 from openseek.config import Settings
 from openseek.db import DB
+from openseek.pairing import InviteManager, client_proof
 from openseek.pool import MAX_DURATION_MS, MAX_NVMT_BYTES, PoolError, decode_nvmt, encode_nvmt
 from openseek.remote import RemoteStoreError, RemoteUploadQueueStore, SupabaseClient
+from openseek.remote_admin import RemoteAdminStore
 from openseek.store import ChannelStore, UploadQueueStore
 from openseek.uploads import UploadService
 from test_pool_channel import MemoryChannel, jpeg
@@ -41,7 +44,8 @@ class FakeSupabase:
     """PostgREST tables + Storage objects behind httpx.MockTransport."""
 
     def __init__(self):
-        self.tables = {"pool_uploads": [], "pool_publication_queue": []}
+        self.tables = {"pool_uploads": [], "pool_publication_queue": [], "pool_devices": [],
+                       "pool_invites": [], "pool_owner_settings": []}
         self.objects: dict[str, bytes] = {}
         self.sign_calls: list[tuple[str, int]] = []
         self.deleted_objects: list[str] = []
@@ -63,10 +67,19 @@ class FakeSupabase:
                 continue
             if value.startswith("eq."):
                 wanted = value[3:]
-                out = [r for r in out if str(r.get(key)) == wanted]
+                out = [r for r in out if (str(r.get(key)).lower() == wanted.lower()
+                                          if isinstance(r.get(key), bool) else str(r.get(key)) == wanted)]
+            elif value.startswith("in.(") and value.endswith(")"):
+                wanted = {item.strip().strip('"') for item in value[4:-1].split(",")}
+                out = [r for r in out if str(r.get(key)) in wanted]
             elif value.startswith("neq."):
                 wanted = value[4:]
                 out = [r for r in out if str(r.get(key)) != wanted]
+            elif value == "is.null":
+                out = [r for r in out if r.get(key) is None]
+            elif value.startswith("lt."):
+                wanted = float(value[3:])
+                out = [r for r in out if r.get(key) is not None and float(r[key]) < wanted]
             elif value.startswith("lte."):
                 wanted = float(value[4:])
                 out = [r for r in out if r.get(key) is not None and float(r[key]) <= wanted]
@@ -115,11 +128,22 @@ class FakeSupabase:
                 "attempts": 0, "next_attempt": now, "state": "queued",
                 "created": now, "updated": now, "error": None})
             return httpx.Response(200, json=True)
+        if path == "/rest/v1/rpc/record_pool_invite_failure" and request.method == "POST":
+            pair_id = json.loads(request.content or b"{}")["p_pair_id"]
+            row = next((r for r in self.tables["pool_invites"] if r["pair_id"] == pair_id), None)
+            changed = bool(row is not None and row["attempts"] < 5)
+            if changed:
+                row["attempts"] += 1
+            return httpx.Response(200, json=changed)
         if path.startswith("/rest/v1/"):
             table = self._table(path)
             rows = self.tables[table]
             if request.method == "GET":
-                return httpx.Response(200, json=self._ordered(self._filter(rows, params), params))
+                matched = self._filter(rows, params)
+                headers = {}
+                if "count=exact" in request.headers.get("prefer", ""):
+                    headers["content-range"] = f"0-0/{len(matched)}"
+                return httpx.Response(200, json=self._ordered(matched, params), headers=headers)
             if request.method == "POST":
                 payload = json.loads(request.content or b"[]")
                 payload = payload if isinstance(payload, list) else [payload]
@@ -780,6 +804,52 @@ def test_remote_queue_store_optimistic_claim_retry_and_complete(tmp_path):
         client.close()
 
 
+def test_remote_upload_queue_pending_count_includes_active_states(tmp_path):
+    fake = FakeSupabase()
+    client = SupabaseClient(SUPABASE_URL, SERVICE_KEY, transport=httpx.MockTransport(fake))
+    store = RemoteUploadQueueStore(client)
+    fake.tables["pool_uploads"].extend([
+        {"upload_id": "pending", "state": "pending"},
+        {"upload_id": "queued", "state": "queued"},
+        {"upload_id": "publishing", "state": "publishing"},
+        {"upload_id": "accepted", "state": "accepted"},
+    ])
+    try:
+        assert store.pending_count() == 3
+    finally:
+        client.close()
+
+
+def test_remote_admin_store_persists_invites_devices_and_owner_settings(tmp_path):
+    fake = FakeSupabase()
+    client = SupabaseClient(SUPABASE_URL, SERVICE_KEY, transport=httpx.MockTransport(fake))
+    store = RemoteAdminStore(client)
+    db = DB(tmp_path / "ephemeral.db")
+    auth = DeviceAuth(db, store=store)
+    invites = InviteManager(store, "sha256//test-pin", auth.register, iterations=200_000)
+    try:
+        invite = invites.create("Nuvio", ttl_s=600, role="owner", contribute=False)
+        state = invites.start(invite["invite_id"])
+        stored = store.invite(invite["invite_id"])
+        assert invite["secret"] not in repr(stored)
+        key = bytes.fromhex(stored["k_hex"])
+        name = "Living room TV"
+        claimed = invites.claim(invite["invite_id"], name,
+                                client_proof(key, invite["invite_id"], name))
+
+        restarted_auth = DeviceAuth(db, store=RemoteAdminStore(client))
+        assert restarted_auth.authenticate("Bearer " + claimed["token"]) == claimed["device_id"]
+        assert restarted_auth.devices()[0]["name"] == name
+        assert state["pair_id"] == invite["invite_id"]
+        assert store.invite(invite["invite_id"])["uses"] == 1
+
+        store.set_setting("sharing_enabled", "1")
+        assert store.get_setting("sharing_enabled") == "1"
+    finally:
+        db.close()
+        client.close()
+
+
 def test_local_queue_store_same_state_machine(tmp_path):
     db = DB(tmp_path / "local-queue.db")
     store = UploadQueueStore(db)
@@ -790,6 +860,7 @@ def test_local_queue_store_same_state_machine(tmp_path):
                              "imdb": None, "season": 0, "episode": 0, "filename_norm": None,
                              "object_path": "uploads/u_local1.nvmt", "state": "pending",
                              "created": now, "updated": now, "expires": now + 900, "error": None})
+        assert store.pending_count() == 1
         assert store.enqueue("u_local1", now) is True
         assert store.enqueue("u_local1", now) is False
         claimed = store.claim(now)
@@ -803,6 +874,7 @@ def test_local_queue_store_same_state_machine(tmp_path):
         assert store.claim(now + 3)["attempts"] == 1
         store.complete("u_local1", now + 4)
         assert store.get_upload("u_local1")["state"] == "accepted"
+        assert store.pending_count() == 0
         assert db.q("SELECT state FROM pool_publication_queue WHERE upload_id=?",
                     ("u_local1",))[0][0] == "done"
         assert store.expire("u_missing", now) is False

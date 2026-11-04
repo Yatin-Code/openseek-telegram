@@ -6,8 +6,10 @@ See `docs/SECURITY-MODEL.md` for the security properties. Clients can be written
 ## Transport
 - One HTTPS listener (default `0.0.0.0:8787`, LAN). Self-signed ECDSA P-256 cert generated on first start;
   pin = `sha256//` + base64(SHA-256(SPKI DER)). No plain-HTTP API.
-- Admin UI/CLI: `http://127.0.0.1:8788` (loopback only) shows the pairing code, server address and pin
-  fingerprint, paired devices (revoke), cache stats. CLI: `openseek pair`, `openseek devices`, `openseek revoke <id>`.
+- Local/VPS admin UI/CLI: `http://127.0.0.1:8788` (loopback only) shows the pairing code, server address and pin
+  fingerprint, paired devices (revoke), cache stats. Vercel serves the same dashboard over HTTPS; `/admin/*`
+  operations require `OPENSEEK_ADMIN_TOKEN` in `X-OpenSeek-Admin`, and clients use the public edge pin from
+  `OPENSEEK_PUBLIC_TLS_PIN`. CLI: `openseek pair`, `openseek devices`, `openseek revoke <id>`.
 - JSON bodies ≤ 16 KiB, `Content-Type: application/json`; shared NVMT packages are binary and capped at 16 MiB.
   Errors: `{"error": "<code>"}` — stable snake_case
   codes, never echoing input.

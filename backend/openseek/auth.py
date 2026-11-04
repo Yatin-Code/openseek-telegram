@@ -21,23 +21,26 @@ class DeviceAuth:
     """Bearer token -> device_id. Only SHA-256(token) is stored; comparisons are constant-time
     over every registered hash."""
 
-    def __init__(self, db: DB):
+    def __init__(self, db: DB, store=None):
         self.db = db
+        self.store = store or db
+        self._live_store = store is not None
         self._lock = threading.Lock()
         self._hashes: list[tuple[str, str]] = []
         self._roles: dict[str, tuple[str, float | None]] = {}
-        self.reload()
+        if not self._live_store:
+            self.reload()
 
     def reload(self) -> None:
         with self._lock:
-            rows = self.db.auth_rows()
+            rows = self.store.auth_rows()
             self._hashes = [(h, d) for h, d, _r, _e in rows]
             self._roles = {d: (r, e) for _h, d, r, e in rows}
 
     def register(self, device_name: str, token_hash: str, role: str = "owner", expires: float | None = None,
                  invite_id: str | None = None) -> str:
         device_id = new_device_id()
-        self.db.add_device(device_id, device_name, token_hash, role, expires, invite_id)
+        self.store.add_device(device_id, device_name, token_hash, role, expires, invite_id)
         self.reload()
         return device_id
 
@@ -52,7 +55,7 @@ class DeviceAuth:
         return r[0]
 
     def revoke(self, device_id: str) -> bool:
-        ok = self.db.remove_device(device_id)
+        ok = self.store.remove_device(device_id)
         self.reload()
         return ok
 
@@ -63,12 +66,26 @@ class DeviceAuth:
         if not _TOKEN.fullmatch(token):
             return None
         h = hashlib.sha256(token.encode()).hexdigest()
+        if self._live_store:
+            self.reload()                 # another serverless instance may have added/revoked a device
         found = None
         with self._lock:
             for stored, device_id in self._hashes:
                 if hmac.compare_digest(stored, h):
                     found = device_id
         return found if self.role_of(found) is not None else None          # an expired guest is no device at all
+
+    def devices(self) -> list[dict]:
+        return self.store.devices()
+
+    def touch_device(self, device_id: str) -> None:
+        self.store.touch_device(device_id)
+
+    def can_contribute(self, device_id: str) -> bool:
+        return self.store.can_contribute(device_id)
+
+    def set_contribute(self, device_id: str, enabled: bool) -> bool:
+        return self.store.set_contribute(device_id, enabled)
 
 
 class CapSigner:

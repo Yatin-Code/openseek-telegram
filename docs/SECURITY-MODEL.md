@@ -13,13 +13,14 @@ reference scripts are in `docs/security/poc/`.
 3. Server to decoder: the decoder (PyAV/ffmpeg libraries) parses untrusted media in a separate worker process started with an argument list (no shell), a minimal environment, below-normal priority, and
    access only to a loopback proxy capability, not the real URL. There is no OS-level sandbox; use container or OS limits.
 4. Server to disk: only derived thumbnails and opaque ids are written; path components are generated from validated hex ids.
-5. Admin: loopback only, never reachable from the LAN or the internet.
+5. Admin: loopback only on local/VPS installs. Vercel serves the dashboard over HTTPS; its owner operations require the configured owner secret.
 
 ## Listeners and exposure
 
 * Owner API (8787): HTTPS. By default it refuses client addresses that are not private or loopback (`X-Forwarded-For` is not trusted) and refuses any request that carries proxy headers (`403 proxy_refused`): it is direct-connection only. `OPENSEEK_ALLOW_PUBLIC_CLIENTS=1` additionally requires `OPENSEEK_ALLOW_PUBLIC_CLIENTS_ACK=owner-api-is-public`. On Windows the server refuses to start if other local users can write to the data directory (`OPENSEEK_ALLOW_SHARED_DATA_DIR=1` overrides). Every route except health and pairing needs a device token regardless of the client address. Do not forward it from your router.
 * Admin (8788): bound to 127.0.0.1; foreign Host or Origin headers are rejected (DNS rebinding) and every call except the static dashboard page needs the per-install admin secret in `X-OpenSeek-Admin`
   (random, kept in `<data>/admin.token`, or `OPENSEEK_ADMIN_TOKEN`). Without it, any local process, other local user or container that can reach the host's loopback could pair itself as the owner. The dashboard receives the secret in the URL fragment, which browsers never send to the server.
+* Vercel dashboard/admin: the root page is a public static shell with no pool or device data. Every `/admin/*` operation requires `OPENSEEK_ADMIN_TOKEN` in `X-OpenSeek-Admin`; requests are restricted to the deployment host and same-origin browser calls. The secret is separate from Nuvio device and pool keys. This is the hosted-profile exception to local-only admin access; it does not add user accounts or Supabase Auth. Vercel terminates TLS at its edge, so Nuvio pins the public certificate SPKI configured as `OPENSEEK_PUBLIC_TLS_PIN`, not the function's scratch certificate.
 * Guest listener (off by default): exact method+path allow-list, everything else a uniform 404. Owner tokens are refused on it. Per-address limits (per minute: health 30, pairing 12,
   guest API 300, capability URLs 900, unknown routes 30); 20 refused requests in 10 minutes block an address for 15 minutes. Capability URLs are built from `OPENSEEK_PUBLIC_HOST`, not from client headers.
   It shares a process with the extractor, so a flood could slow it; the listener caps concurrency at 64 connections.
@@ -36,7 +37,7 @@ reference scripts are in `docs/security/poc/`.
 * Capabilities: `/v1/c/<cap>/...` where `cap` is an HMAC over device, preview and expiry (at most 6 hours), served only over TLS.
 * Invitations (guests): created locally, expiring (10 minutes to 7 days), single use by default, stored as the derived key, burned after 5 wrong proofs, revocable. They cannot be redeemed while sharing is off.
   Typed codes bind the pin into the derivation, so a server that does not hold the invited key cannot produce a valid proof.
-* Every route except health and the pairing endpoints requires a token; a test enumerates the OpenAPI routes. The guest permission list is an explicit allow-list enforced before routing.
+* Local/VPS `/v1/*` routes except health and pairing require a device token; Vercel's internal tick requires its cron secret. `/admin/*` operations require the owner secret, apart from the public static dashboard shell. A test enumerates the local API routes. The guest permission list is an explicit allow-list enforced before routing.
 
 ## Outbound fetching (SSRF policy)
 

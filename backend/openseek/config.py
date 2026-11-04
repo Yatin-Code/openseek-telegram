@@ -16,6 +16,8 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from .envfile import read_env_file
+
 GiB = 1 << 30
 MiB = 1 << 20
 
@@ -163,6 +165,7 @@ class Settings:
     public_host: str = ""                  # advertised in invitations / borrowed URLs: "name.duckdns.org:443"
     tls_cert_file: Path | None = None      # optional trusted certificate for public pool HTTPS
     tls_key_file: Path | None = None       # matching private key; otherwise use the generated self-signed cert
+    public_tls_pin: str = ""                # Vercel edge certificate SPKI pin used by paired Nuvio clients
     max_active_sources: int = 2            # global cap on sources with a live worker (429 busy)
     workers_per_source: int = 1            # bounded parallel extraction workers per active source (1..4)
     max_jobs_per_device: int = 1           # older active job of that device is stopped
@@ -224,7 +227,14 @@ class Settings:
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Settings":
+        explicit = env is not None
         env = dict(os.environ if env is None else env)
+        if env.get("VERCEL", "").strip().lower() not in ("1", "true", "yes", "on"):
+            env_file = env.get("OPENSEEK_ENV_FILE")
+            if env_file or not explicit:
+                path = Path(env_file) if env_file else Path(env.get("OPENSEEK_DATA_DIR", "data")) / ".env"
+                for key, value in read_env_file(path).items():
+                    env.setdefault(key, value)         # process environment wins over the protected file
         s = cls()
         conv = {
             "DATA_DIR": ("data_dir", Path),
@@ -278,6 +288,7 @@ class Settings:
             "PUBLIC_HOST": ("public_host", str),
             "TLS_CERT_FILE": ("tls_cert_file", Path),
             "TLS_KEY_FILE": ("tls_key_file", Path),
+            "PUBLIC_TLS_PIN": ("public_tls_pin", str),
             "MAX_ACTIVE_SOURCES": ("max_active_sources", int),
             "WORKERS_PER_SOURCE": ("workers_per_source", int),
             "MAX_JOBS_PER_DEVICE": ("max_jobs_per_device", int),
@@ -386,6 +397,11 @@ class Settings:
         if self.profile not in ("local", "vercel"):
             raise ConfigError("OPENSEEK_PROFILE must be local or vercel")
         if self.profile == "vercel":
+            from .tls import valid_spki_pin
+            if not valid_spki_pin(self.public_tls_pin):
+                raise ConfigError("OPENSEEK_PROFILE=vercel requires OPENSEEK_PUBLIC_TLS_PIN (sha256// SPKI pin)")
+            if len(self.admin_token) < 16:
+                raise ConfigError("OPENSEEK_PROFILE=vercel requires OPENSEEK_ADMIN_TOKEN with at least 16 characters")
             if self.effective_pool_mode != "channel":
                 raise ConfigError("OPENSEEK_PROFILE=vercel requires OPENSEEK_POOL_MODE=channel")
             if not self.telegram_channel_id:

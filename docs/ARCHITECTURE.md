@@ -12,6 +12,8 @@ as WebVTT cues and tile sheets. The HTTP API is specified in `api/CONTRACT-v1.md
 | Admin | HTTP `127.0.0.1:8788` | the owner (CLI, browser dashboard) | loopback only; rejects foreign Host/Origin; every call except the static dashboard page needs the per-install admin secret in `X-OpenSeek-Admin` |
 | Guest (public) | HTTPS, off unless `OPENSEEK_PUBLIC_PORT` is set | invited guest devices only | same certificate and pin, deny-by-default routes, per-address limits |
 
+The Vercel profile serves the same dashboard and API over the deployment's HTTPS host. Its public root is only a static shell; owner operations under `/admin/*` require `OPENSEEK_ADMIN_TOKEN` in `X-OpenSeek-Admin` and same-host/same-origin checks. Vercel edge TLS uses `OPENSEEK_PUBLIC_TLS_PIN`; local/VPS installs keep the loopback admin listener and their generated certificate.
+
 ## Modules (`backend/openseek/`)
 
 | Module | Role |

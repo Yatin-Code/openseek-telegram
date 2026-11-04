@@ -102,6 +102,63 @@ create table if not exists public.pool_publication_queue (
 create index if not exists pool_publication_queue_next
   on public.pool_publication_queue (state, next_attempt);
 
+-- Owner/device state must survive Vercel instance recycling. These records contain
+-- only hashed device tokens and derived invite keys, never raw bearer tokens/codes.
+create table if not exists public.pool_devices (
+  device_id text primary key,
+  name text not null,
+  token_hash text not null unique,
+  created double precision not null,
+  last_seen double precision not null,
+  role text not null,
+  expires double precision,
+  invite_id text,
+  contribute boolean not null default false
+);
+
+create table if not exists public.pool_invites (
+  pair_id text primary key,
+  label text not null,
+  role text not null,
+  salt text not null,
+  iterations integer not null,
+  k_hex text not null,
+  created double precision not null,
+  expires double precision not null,
+  max_uses integer not null default 1,
+  uses integer not null default 0,
+  attempts integer not null default 0,
+  revoked double precision,
+  device_days double precision,
+  tag text,
+  contribute boolean not null default false
+);
+create index if not exists pool_invites_tag on public.pool_invites (tag, created desc);
+
+create table if not exists public.pool_owner_settings (
+  k text primary key,
+  v text not null
+);
+
+create or replace function public.record_pool_invite_failure(p_pair_id text)
+returns boolean
+language plpgsql
+security definer
+set search_path = pg_catalog
+as $$
+declare
+  changed integer;
+begin
+  update public.pool_invites
+     set attempts = attempts + 1
+   where pair_id = p_pair_id and attempts < 5;
+  get diagnostics changed = row_count;
+  return changed = 1;
+end;
+$$;
+revoke all on function public.record_pool_invite_failure(text) from public;
+grant execute on function public.record_pool_invite_failure(text) to service_role;
+
 -- Finalize a staged upload and create its retry row in one database transaction.
 -- Only the server's service role can call this function.
 create or replace function public.enqueue_pool_publication(p_upload_id text, p_now double precision)
@@ -138,3 +195,6 @@ alter table public.pool_hints enable row level security;
 alter table public.pool_episode_packages enable row level security;
 alter table public.pool_uploads enable row level security;
 alter table public.pool_publication_queue enable row level security;
+alter table public.pool_devices enable row level security;
+alter table public.pool_invites enable row level security;
+alter table public.pool_owner_settings enable row level security;

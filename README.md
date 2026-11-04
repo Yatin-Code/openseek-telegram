@@ -105,14 +105,15 @@ For the Vercel channel-pool profile, see [docs/VERCEL.md](docs/VERCEL.md).
 
 ## Configuration
 
-All settings are environment variables read at start-up. Invalid values stop the server with a configuration error.
+All settings are environment variables read at start-up. Invalid values stop the server with a configuration error. The browser setup wizard saves Telegram settings in the owner-only `<data>/.env` file; process environment variables override values from that file.
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `OPENSEEK_DATA_DIR` | `data` | Database, secret key, TLS identity, cache |
 | `OPENSEEK_HOST` / `OPENSEEK_PORT` | `0.0.0.0` / `8787` | HTTPS API listener |
 | `OPENSEEK_ADMIN_PORT` | `8788` | Admin listener, always bound to 127.0.0.1; every call except the dashboard page needs the admin secret |
-| `OPENSEEK_ADMIN_TOKEN` | random, in `<data>/admin.token` | Optional explicit admin secret (at least 16 characters). Normally leave unset |
+| `OPENSEEK_ADMIN_TOKEN` | random, in `<data>/admin.token` | Local/VPS optional override; required owner secret on Vercel (at least 16 characters) |
+| `OPENSEEK_PUBLIC_TLS_PIN` | unset | Vercel only: deployed HTTPS certificate SPKI pin used by paired Nuvio clients |
 | `OPENSEEK_CRON_SECRET` or `CRON_SECRET` | empty | Bearer secret for the Vercel tick (`GET` for scheduled calls; `POST` for manual calls). `CRON_SECRET` is the Vercel Cron name. When empty, the generated admin token is the only accepted credential |
 | `OPENSEEK_PUBLIC_PORT` | `0` (off) | Internet-facing guest listener; must differ from the other ports |
 | `OPENSEEK_PUBLIC_BIND` | `0.0.0.0` | Bind address of the guest listener |

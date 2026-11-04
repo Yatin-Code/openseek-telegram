@@ -84,15 +84,16 @@ def to_guest_time(t_cache_ms: float, a: float, b: float) -> float:
 
 
 class Library:
-    def __init__(self, db: DB, cache, clock=time.time):
+    def __init__(self, db: DB, cache, clock=time.time, settings_store=None):
         self.db, self.cache, self.clock = db, cache, clock
+        self.settings_store = settings_store or db
 
     # ------------------------------------------------------------------ owner opt-in
     def enabled(self) -> bool:
-        return self.db.get_setting("metadata_index") == "1"
+        return self.settings_store.get_setting("metadata_index") == "1"
 
     def set_enabled(self, on: bool, purge: bool = False) -> None:
-        self.db.set_setting("metadata_index", "1" if on else "0")
+        self.settings_store.set_setting("metadata_index", "1" if on else "0")
         if purge:
             self.db.purge_release_meta()
 

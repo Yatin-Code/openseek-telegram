@@ -5,6 +5,17 @@ Supabase PostgreSQL stores a rebuildable channel index and upload status/queue r
 Supabase Storage holds an NVMT upload only until Telegram accepts it. OpenSeek does not
 store permanent package copies in Supabase.
 
+The same browser dashboard serves local/VPS and Vercel. Set one owner secret with
+`OPENSEEK_ADMIN_TOKEN`; it protects dashboard operations and is separate from the
+Nuvio pool read/write keys and device tokens. If required deployment settings are
+missing, the root page shows the variables to configure and the error to fix. Return
+after redeploying to open the dashboard.
+
+The Vercel root page is a public static shell and contains no pool/device data. Every
+dashboard operation requires the owner secret; opening `/admin/*` without it is
+rejected. This hosted profile has one owner secret and no user-account or multi-user
+sign-in system. Local/VPS dashboard access remains loopback-only.
+
 ## 1. Prepare Supabase
 
 1. Create a Supabase project.
@@ -37,6 +48,8 @@ Add these environment variables to the Production environment:
 |---|---|
 | `OPENSEEK_PROFILE` | `vercel` |
 | `OPENSEEK_POOL_MODE` | `channel` |
+| `OPENSEEK_ADMIN_TOKEN` | Owner secret, at least 16 random characters |
+| `OPENSEEK_PUBLIC_TLS_PIN` | The deployed domain's certificate SPKI pin (`sha256//...`) |
 | `OPENSEEK_TELEGRAM_CHANNEL_ID` | The channel ID, such as `-1001234567890` |
 | `OPENSEEK_TELEGRAM_API_ID` | Telegram API ID |
 | `OPENSEEK_TELEGRAM_API_HASH` | Telegram API hash |
@@ -51,6 +64,22 @@ Add these environment variables to the Production environment:
 Set the same values in Preview only if you want preview deployments to access the real
 Telegram channel and Supabase project. The cron runs only on Production deployments.
 
+Vercel terminates HTTPS before the Python function runs, so the function's generated
+local certificate cannot be used by paired Nuvio clients. Get the public domain's
+current certificate pin and set it as `OPENSEEK_PUBLIC_TLS_PIN`:
+
+```sh
+openssl s_client -servername your-project.vercel.app -connect your-project.vercel.app:443 </dev/null 2>/dev/null \
+  | openssl x509 -pubkey -noout \
+  | openssl pkey -pubin -outform DER \
+  | openssl dgst -sha256 -binary \
+  | openssl base64 -A
+```
+
+Prefix the output with `sha256//`. Nuvio's server TLS pin must match this value. If
+Vercel rotates the domain certificate's public key, update this variable and redeploy;
+re-pair clients if the pin changes.
+
 The Vercel function uses `/tmp/openseek` for scratch state when `OPENSEEK_DATA_DIR` is
 unset. This directory is disposable and is not shared between function instances. The
 channel index and upload queue are stored in Supabase instead.
@@ -63,7 +92,11 @@ pages, removes expired staging objects, and publishes queued uploads to Telegram
 retries temporary publication failures. The route also accepts an authenticated `POST`
 for a manual tick.
 
-After deployment, check `GET /v1/health`. Then use the configured read key with the
+After deployment, open the root URL with the owner secret in the fragment once, for
+example `https://your-project.vercel.app/#<OPENSEEK_ADMIN_TOKEN>`. The dashboard stores
+it in that browser's session storage and removes it from the address bar. Use this owner
+secret only for dashboard calls; Nuvio continues to use the separate pool keys or its
+device token. Check `GET /v1/health`, then use the configured read key with the
 `/v1/pool/*` API. For a contribution, OpenSeek returns a short-lived Supabase upload URL;
 Nuvio uploads bytes directly there, finalizes the upload with OpenSeek, and polls its
 upload ID until Telegram accepts the package.
@@ -82,8 +115,9 @@ deployments continue to use SQLite and direct upload; they do not need Supabase.
   large history may take multiple ticks to index fully.
 - Telegram outages leave uploads queued for retry. Nuvio reports success only after the
   upload status becomes `accepted`.
-- The Vercel function does not start the local/VPS background job workers. Dashboard
-  setup and owner operations are tracked by F2.
+- The Vercel function does not start the local/VPS background job workers. Device
+  records, invitations, and sharing settings use Supabase PostgreSQL so they survive
+  instance recycling.
 
 Vercel's [Python runtime](https://vercel.com/docs/functions/runtimes/python) supports
 ASGI apps and streaming responses. Vercel Cron sends an HTTP `GET` to the configured

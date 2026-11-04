@@ -125,6 +125,8 @@ def vercel_env(**overrides):
         "OPENSEEK_TELEGRAM_API_HASH": "a" * 32,
         "OPENSEEK_SUPABASE_URL": "https://project.supabase.co",
         "OPENSEEK_SUPABASE_SERVICE_KEY": "service-role-key",
+        "OPENSEEK_ADMIN_TOKEN": "owner-secret-is-long-enough",
+        "OPENSEEK_PUBLIC_TLS_PIN": "sha256//" + "A" * 43 + "=",
     }
     env.update(overrides)
     return env
@@ -160,6 +162,8 @@ def test_vercel_profile_requires_channel_pool_mode():
 @pytest.mark.parametrize("overrides", [
     {"OPENSEEK_SUPABASE_URL": ""},
     {"OPENSEEK_SUPABASE_SERVICE_KEY": ""},
+    {"OPENSEEK_PUBLIC_TLS_PIN": ""},
+    {"OPENSEEK_PUBLIC_TLS_PIN": "sha256//not-a-pin"},
     {"OPENSEEK_SUPABASE_URL": "http://project.supabase.co"},
     {"OPENSEEK_SUPABASE_BUCKET": "../bad"},
 ])

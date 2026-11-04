@@ -15,9 +15,10 @@ import re
 import socket
 import time
 from collections import deque
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -36,6 +37,7 @@ from .auth import CapSigner, DeviceAuth, admin_token, load_or_create_secret
 from .cache import Cache, secure_mkdir
 from .config import Settings
 from .db import DB
+from .envfile import write_env_file
 from .fetch import RangeProxy
 from .ids import is_cap, is_device_id, is_fingerprint, is_preview_id, parse_index
 from .jobs import Busy, Job, JobManager, SourceForbidden
@@ -48,6 +50,7 @@ from .pool import (MAX_NVMT_BYTES, ChannelPoolClient, ChannelPoolSync, PoolClien
 from .channel_index import ChannelIndex
 from .channel_pool import ChannelPoolService, PoolWritePolicy
 from .remote import RemoteChannelStore, RemoteUploadQueueStore, SupabaseClient
+from .remote_admin import RemoteAdminStore
 from .store import ChannelStore, UploadQueueStore
 from .uploads import UploadError, UploadService
 from .telegram_mt import TelegramMTProtoStore
@@ -91,6 +94,7 @@ class Core:
         self.channel_index = None
         self.librarian = None
         self.supabase = None
+        self.state_store = self.db
         self.uploads = None
         mode = settings.effective_pool_mode
         self.pool_write_policy = PoolWritePolicy(mode)
@@ -99,49 +103,20 @@ class Core:
                                                        settings.upstream_timeout_s)
             self.pool = PoolService(self.db, storage, settings.pool_read_key, settings.pool_write_key)
         if mode == "channel":
-            self.channel_store = pool_storage or TelegramMTProtoStore(settings)
-            self.pool_write_policy = PoolWritePolicy(
-                mode,
-                store=self.channel_store,
-                proxy_url=settings.pool_contrib_url,
-                librarian_url=_librarian_url(settings) or "")
-            if settings.profile == "vercel" or (settings.supabase_url and settings.supabase_service_key):
-                self.supabase = SupabaseClient(
-                    settings.supabase_url, settings.supabase_service_key,
-                    bucket=settings.supabase_bucket)
-            if settings.profile == "vercel":
-                index_store = RemoteChannelStore(self.supabase)
-                index_db = None
-            else:
-                index_store = ChannelStore(self.db)
-                index_db = self.db
-            self.channel_index = ChannelIndex(
-                index_store, self.channel_store, db=index_db,
-                channel_id=settings.telegram_channel_id,
-                scan_limit=settings.pool_channel_scan_limit, refresh_s=settings.pool_index_refresh_s)
-            self.pool = ChannelPoolService(self.channel_index, settings.pool_read_key, settings.pool_write_key)
-            if settings.profile == "vercel" or self.supabase is not None:
-                upload_store = (RemoteUploadQueueStore(self.supabase) if self.supabase is not None
-                                else UploadQueueStore(self.db))
-                self.uploads = UploadService(settings, self.supabase, self.pool, upload_store)
-            if settings.librarian_enabled and hasattr(self.channel_store, "set_message_handler"):
-                self.librarian = TelegramLibrarian(self.channel_store, self.channel_index)
-                self.librarian.attach()
-            self.pool_client = ChannelPoolClient(self.cache, self.channel_index, self.channel_store)
-            self.pool_sync = (ChannelPoolSync(self.db, self.cache, self.channel_store, self.channel_index)
-                              if settings.contribution else None)
+            self._configure_channel_pool(settings, pool_storage)
         else:
             self.pool_client = (PoolClient(settings.pool_url, settings.pool_read_key, settings.pool_write_key,
                                            settings.pool_timeout_s)
                                 if mode == "host" and settings.pool_url and settings.pool_read_key else None)
             self.pool_sync = (PoolSync(self.db, self.cache, self.pool_client)
                               if self.pool_client and settings.pool_share else None)
-        self.cert_path, self.key_path, self.spki_pin = ensure_certificate(
+        self.cert_path, self.key_path, generated_pin = ensure_certificate(
             self.data_dir, settings.tls_cert_file, settings.tls_key_file)
+        self.spki_pin = settings.public_tls_pin if settings.profile == "vercel" else generated_pin
         self.caps = CapSigner(load_or_create_secret(self.data_dir / "secret.key"))
         self.admin_token = admin_token(self.data_dir, settings.admin_token)
-        self.auth = DeviceAuth(self.db)
-        self.invites = InviteManager(self.db, self.spki_pin, self.auth.register)
+        self.auth = DeviceAuth(self.db, store=self.state_store if settings.profile == "vercel" else None)
+        self.invites = InviteManager(self.state_store, self.spki_pin, self.auth.register)
         self.pairing = PairingManager(self.spki_pin, self.auth.register, invites=self.invites)
         self.pairing.sharing_enabled = self.sharing_enabled
         self.public_limiter = PublicLimiter()
@@ -152,17 +127,57 @@ class Core:
         self.jobs = JobManager(settings, self.policy, self.cache, self.db, self.proxy, engine_factory)
         self.jobs.pool_client = self.pool_client
         self.jobs.pool_sync = self.pool_sync
-        self.library = Library(self.db, self.cache)
+        self.library = Library(self.db, self.cache, settings_store=self.state_store)
         self.jobs.library = self.library
         self.started = time.time()
         self.closing = False
         self.ffmpeg = _engine_available()
 
+    def _configure_channel_pool(self, settings: Settings, channel_store=None) -> None:
+        """Wire the channel pool for startup or for the local browser setup wizard."""
+        self.settings = settings
+        self.channel_store = channel_store or TelegramMTProtoStore(settings)
+        self.pool_write_policy = PoolWritePolicy(
+            "channel", store=self.channel_store, proxy_url=settings.pool_contrib_url,
+            librarian_url=_librarian_url(settings) or "")
+        if settings.profile == "vercel" or (settings.supabase_url and settings.supabase_service_key):
+            self.supabase = SupabaseClient(settings.supabase_url, settings.supabase_service_key,
+                                           bucket=settings.supabase_bucket)
+        if settings.profile == "vercel":
+            index_store = RemoteChannelStore(self.supabase)
+            index_db = None
+            self.state_store = RemoteAdminStore(self.supabase)
+        else:
+            index_store = ChannelStore(self.db)
+            index_db = self.db
+            self.state_store = self.db
+        self.channel_index = ChannelIndex(
+            index_store, self.channel_store, db=index_db,
+            channel_id=settings.telegram_channel_id,
+            scan_limit=settings.pool_channel_scan_limit, refresh_s=settings.pool_index_refresh_s)
+        self.pool = ChannelPoolService(self.channel_index, settings.pool_read_key, settings.pool_write_key)
+        if settings.profile == "vercel" or self.supabase is not None:
+            upload_store = (RemoteUploadQueueStore(self.supabase) if self.supabase is not None
+                            else UploadQueueStore(self.db))
+            self.uploads = UploadService(settings, self.supabase, self.pool, upload_store)
+        else:
+            self.uploads = None
+        if settings.librarian_enabled and hasattr(self.channel_store, "set_message_handler"):
+            self.librarian = TelegramLibrarian(self.channel_store, self.channel_index)
+            self.librarian.attach()
+        self.pool_client = ChannelPoolClient(self.cache, self.channel_index, self.channel_store)
+        self.pool_sync = (ChannelPoolSync(self.db, self.cache, self.channel_store, self.channel_index)
+                          if settings.contribution else None)
+        if hasattr(self, "jobs"):
+            self.jobs.settings = settings
+            self.jobs.pool_client = self.pool_client
+            self.jobs.pool_sync = self.pool_sync
+
     def contributions_enabled(self) -> bool:
-        return self.sharing_enabled() and self.db.get_setting("contrib_enabled") == "1"
+        return self.sharing_enabled() and self.state_store.get_setting("contrib_enabled") == "1"
 
     def contrib_hosts(self) -> list[str]:
-        raw = self.db.get_setting("contrib_hosts")
+        raw = self.state_store.get_setting("contrib_hosts")
         if raw is not None:
             try:
                 return clean_hosts(json.loads(raw))
@@ -172,11 +187,11 @@ class Core:
 
     def can_contribute(self, device_id: str | None) -> bool:
         return bool(device_id and self.contributions_enabled() and self.auth.role_of(device_id) == "guest"
-                    and self.db.can_contribute(device_id))
+                    and self.auth.can_contribute(device_id))
 
     def sharing_enabled(self) -> bool:
         """The owner's kill switch for everything a guest can do. Off unless the owner turned it on."""
-        return self.db.get_setting("sharing_enabled") == "1"
+        return self.state_store.get_setting("sharing_enabled") == "1"
 
     def start(self) -> "Core":
         self.proxy.start()
@@ -311,7 +326,7 @@ class Guard:
             ph = self.core.settings.public_host
             if ph:
                 scope["openseek.base"] = f"https://{ph}"
-        elif self.admin:
+        elif self.admin and self.core.settings.profile != "vercel":
             if not client_ip_allowed(client[0], False) or not ipaddress.ip_address(
                     (client[0] or "0.0.0.0").split("%")[0]).is_loopback:
                 return await _send_json(send, 403, {"error": "forbidden"})
@@ -323,7 +338,7 @@ class Guard:
         # Vercel's platform proxy always adds forwarded headers; refusing them would make the
         # profile unusable. They are never consulted for auth, rate limits, or base URLs. The
         # loopback admin listener keeps the strict local-only rules (F2 owns its surface).
-        forwarded_allowed = not self.admin and self.core.settings.profile == "vercel"
+        forwarded_allowed = self.core.settings.profile == "vercel"
         if not self.public and not forwarded_allowed and any(h in headers for h in PROXY_HEADERS):
             return await _send_json(send, 403, {"error": "proxy_refused"})
         clen = headers.get("content-length")
@@ -359,7 +374,11 @@ class Guard:
         else:
             path = scope.get("path", "")
             state = scope.setdefault("state", {})
-            device = self.core.auth.authenticate(headers.get("authorization"))
+            try:
+                device = self.core.auth.authenticate(headers.get("authorization"))
+            except Exception as exc:
+                log.warning("device authentication unavailable (%s)", type(exc).__name__)
+                return await _send_json(send, 503, {"error": "auth_unavailable"})
             state["device_id"] = device
             is_pool_route = path.startswith("/v1/pool/")
             if path not in PUBLIC_PATHS and not path.startswith("/v1/c/") and not is_pool_route and device is None:
@@ -406,13 +425,28 @@ class Guard:
         await self.app(scope, replay, send_wrapper)
 
     def _admin_check(self, scope, headers) -> str | None:
-        port = self.core.settings.admin_port
         host = headers.get("host", "")
-        if host not in (f"127.0.0.1:{port}", f"localhost:{port}", f"[::1]:{port}"):
-            return "bad_host"                 # DNS-rebinding guard
+        if self.core.settings.profile == "vercel":
+            if not host or any(ch in host for ch in "\r\n/\\"):
+                return "bad_host"
+            origin = headers.get("origin")
+            if origin:
+                try:
+                    parsed = urlsplit(origin)
+                except ValueError:
+                    return "bad_origin"
+                if (parsed.scheme != "https" or parsed.netloc.casefold() != host.casefold() or
+                        parsed.path or parsed.query or parsed.fragment):
+                    return "bad_origin"
+        else:
+            port = self.core.settings.admin_port
+            if host not in (f"127.0.0.1:{port}", f"localhost:{port}", f"[::1]:{port}"):
+                return "bad_host"             # DNS-rebinding guard
         origin = headers.get("origin")
-        if origin is not None and origin not in (f"http://127.0.0.1:{port}", f"http://localhost:{port}"):
-            return "bad_origin"
+        if self.core.settings.profile != "vercel" and origin is not None:
+            if origin not in (f"http://127.0.0.1:{self.core.settings.admin_port}",
+                              f"http://localhost:{self.core.settings.admin_port}"):
+                return "bad_origin"
         if scope["method"] == "GET" and scope.get("path") == "/":
             return None                       # the static dashboard shell: no data, no secret; its script gets the token from the URL fragment
         given = headers.get("x-openseek-admin", "")
@@ -446,6 +480,11 @@ def base_url(request: Request) -> str | None:
     if not _HOST_RE.match(host):
         return None
     return f"{request.url.scheme}://{host}"
+
+
+def request_host(request: Request) -> str | None:
+    host = request.headers.get("host", "")
+    return host if _HOST_RE.fullmatch(host) else None
 
 
 # ===================================================================== models
@@ -582,6 +621,15 @@ class InviteIn(BaseModel):
     device_days: StrictInt | None = Field(default=None, ge=1, le=3650)
     public: StrictBool = False        # embed the PUBLIC host:port (OPENSEEK_PUBLIC_HOST) instead of the LAN address
     read_only: StrictBool = False     # explicit Reader: by default an invited guest is a Contributor once the host enables contributions
+
+
+class AdminSetupIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    telegram_channel_id: StrictStr = Field(min_length=1, max_length=128)
+    telegram_api_id: StrictInt = Field(gt=0)
+    telegram_api_hash: StrictStr = Field(min_length=8, max_length=256)
+    telegram_bot_token: StrictStr | None = Field(default=None, max_length=256)
+    telegram_session: StrictStr | None = Field(default=None, max_length=8192)
 
 
 class EntryTagIn(BaseModel):
@@ -756,8 +804,8 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
     @app.get("/v1/pair/status")
     async def pair_status(request: Request):
         d = device(request)
-        name = next((x["name"] for x in core.db.devices() if x["device_id"] == d), None)
-        core.db.touch_device(d)
+        name = next((x["name"] for x in core.auth.devices() if x["device_id"] == d), None)
+        core.auth.touch_device(d)
         return {"device_id": d, "device_name": name, "contribute": core.can_contribute(d)}
 
     @app.delete("/v1/pair", status_code=204)
@@ -1433,22 +1481,46 @@ table{border-collapse:collapse}td,th{border:1px solid #ccc;padding:.3em .6em}.co
 letter-spacing:.15em;font-family:monospace}button{font-size:1em;margin:.2em}</style></head><body>
 <h1>OpenSeek</h1><div id=s>loading…</div>
 <script>
+const PROFILE='__PROFILE__';
 const T=(location.hash||'').slice(1)||sessionStorage.getItem('osk')||'';if(T)sessionStorage.setItem('osk',T);history.replaceState(null,'',location.pathname);
 const H={'X-OpenSeek-Admin':T};
+const PAIR_KEY='oskPairing';
 function esc(t){return String(t).replace(/[&<>"']/g,c=>'&#'+c.charCodeAt(0)+';')}
-async function act(m,u){await fetch(u,{method:m,headers:H});load()}
+function setupErrorText(code){const messages={telegram_access_denied:'OpenSeek cannot read this channel. Add the bot or account to the channel and grant access to its message history.',telegram_login_required:'Telegram rejected these credentials. Check the bot token or StringSession and Telegram API ID/hash.',telegram_unavailable:'Telegram could not be reached. Check the network and try again.',telegram_error:'Telegram could not verify this channel. Check the channel ID and account permissions.'};return messages[code]||('Setup failed ('+code+'). Check the channel ID, Telegram credentials, and channel permissions.')}
+async function act(m,u){await fetch(u,{method:m,headers:H});if(m==='DELETE'&&u==='/admin/pair'){sessionStorage.removeItem(PAIR_KEY);window.lastPairing=''}load()}
+async function openPair(){const r=await fetch('/admin/pair',{method:'POST',headers:H});const j=await r.json();
+window.lastPairing=r.ok?('Nuvio code: '+j.code+' | TLS pin: '+j.spki_pin+(j.join?' | Join link: '+j.join:'')):'Could not open pairing: '+(j.error||'request_failed');
+if(r.ok)sessionStorage.setItem(PAIR_KEY,window.lastPairing);else sessionStorage.removeItem(PAIR_KEY);load()}
 async function sharing(on){await fetch('/admin/sharing',{method:'PUT',headers:Object.assign({'Content-Type':'application/json'},H),body:JSON.stringify({enabled:on})});load()}
 async function meta(on){await fetch('/admin/library',{method:'PUT',headers:Object.assign({'Content-Type':'application/json'},H),body:JSON.stringify({metadata_index:on})});load()}
 async function mkinvite(){const r=await fetch('/admin/invites',{method:'POST',headers:Object.assign({'Content-Type':'application/json'},H),body:JSON.stringify({public:!!window.pubOn})});
 const j=await r.json();window.lastInvite=r.ok?('Server '+j.address+' - code '+j.code+' (valid '+Math.round(j.expires_in_s/3600)+' h, one use). Join string: '+j.join):'Could not create: '+j.error;load()}
-async function load(){if(!T){document.getElementById('s').textContent='Open this page with: python -m openseek dashboard';return}
-const r=await (await fetch('/admin/status',{headers:H})).json();let h='';
-h+='<h2>Server</h2><p>API port <code>'+esc(r.server.port)+'</code>, addresses: <code>'+esc(r.server.addresses.join(', '))+
-'</code><br>Pin: <code>'+esc(r.server.spki_pin)+'</code></p><h2>Pairing</h2>';
-if(r.pairing.open){h+='<p class=code>'+esc(r.pairing.code)+'</p><p>expires in '+esc(r.pairing.expires_in_s)+
+window.setupScreen=false;
+async function setupSubmit(event){event.preventDefault();const f=event.currentTarget;const d=Object.fromEntries(new FormData(f));d.telegram_api_id=Number(d.telegram_api_id);
+const r=await fetch('/admin/setup',{method:'POST',headers:Object.assign({'Content-Type':'application/json'},H),body:JSON.stringify(d)});const j=await r.json();
+if(!r.ok){document.getElementById('setupError').textContent=setupErrorText(j.error||'setup_failed');return}
+window.setupMessage='Telegram history is readable. Initial scan indexed '+j.initial_scan.indexed+' tiles; '+(j.channel_writable?'channel posting is available.':'this channel is read-only, so uploads are disabled. Grant the bot Post Messages permission to enable uploads.');window.setupScreen=false;load()}
+async function load(){if(!T){document.getElementById('s').textContent=PROFILE==='vercel'?'Open this page with the admin secret in the URL fragment: https://'+location.host+'/#<OPENSEEK_ADMIN_TOKEN>':'Open this page with: python -m openseek dashboard';return}
+const cfg=await (await fetch('/admin/setup',{headers:H})).json();if(cfg.setup_required){if(!window.setupScreen){window.setupScreen=true;document.getElementById('s').innerHTML=
+'<h2>Connect the Telegram pool</h2><p>OpenSeek stores packages in Telegram. Enter the channel and Telegram API details. Provide one identity: a bot token or a StringSession. The channel must allow history access; posting permission enables uploads.</p>'+
+'<form onsubmit="setupSubmit(event)"><p><label>Channel ID or username<br><input name="telegram_channel_id" required maxlength="128"></label></p>'+
+'<p><label>Telegram API ID<br><input name="telegram_api_id" type="number" min="1" required></label></p>'+
+'<p><label>Telegram API hash<br><input name="telegram_api_hash" type="password" autocomplete="off" required></label></p>'+
+'<p><label>Bot token (leave blank when using a StringSession)<br><input name="telegram_bot_token" type="password" autocomplete="off"></label></p>'+
+'<p><label>StringSession (leave blank when using a bot token)<br><input name="telegram_session" type="password" autocomplete="off"></label></p>'+
+'<p>Credentials are saved in the per-install private .env file. They are never shown in logs or returned by the server.</p>'+
+'<button type="submit">Verify channel and start scan</button> <span id="setupError" role="alert"></span></form>';}return}
+window.setupScreen=false;const r=await (await fetch('/admin/status',{headers:H})).json();
+if(!r.pairing.open){sessionStorage.removeItem(PAIR_KEY);window.lastPairing=''}else if(!window.lastPairing){window.lastPairing=sessionStorage.getItem(PAIR_KEY)||''}
+let h='';
+if(window.setupMessage){h+='<p>'+esc(window.setupMessage)+'</p>';window.setupMessage=''}
+h+='<h2>Server</h2><p>'+(r.server.profile==='vercel'?'Dashboard host <code>'+esc(location.host)+'</code>':'API port <code>'+esc(r.server.port)+'</code>, addresses: <code>'+esc(r.server.addresses.join(', '))+'</code>')+
+'<br>Pin: <code>'+esc(r.server.spki_pin)+'</code></p><h2>Pairing</h2>';
+if(window.lastPairing)h+='<p>'+esc(window.lastPairing)+'</p>';
+if(r.pairing.open){h+=(r.pairing.code?'<p class=code>'+esc(r.pairing.code)+'</p>':'')+'<p>expires in '+esc(r.pairing.expires_in_s)+
 ' s, attempts left '+esc(r.pairing.attempts_left)+'</p><button onclick="act(\\'DELETE\\',\\'/admin/pair\\')">Close</button>'}
 else{h+=(r.pairing.burned?'<p><b>Last window burned after too many wrong codes.</b></p>':'')+
-'<button onclick="act(\\'POST\\',\\'/admin/pair\\')">Open pairing window</button>'}
+'<button onclick="openPair()">Open pairing window</button>'}
 h+='<h2>Devices</h2><table><tr><th>id</th><th>name</th><th></th></tr>';
 for(const d of r.devices){h+='<tr><td><code>'+esc(d.device_id)+'</code></td><td>'+esc(d.name)+
 '</td><td><button onclick="act(\\'DELETE\\',\\'/admin/devices/'+esc(d.device_id)+'\\')">Revoke</button></td></tr>'}
@@ -1461,10 +1533,12 @@ for(const i of sh.invites){h+='<tr><td>'+esc(i.label||i.invite_id.slice(0,8))+'<
 (i.state=='open'?'<button onclick="act(\\'DELETE\\',\\'/admin/invites/'+esc(i.invite_id)+'\\')">Revoke</button>':'')+'</td></tr>'}
 h+='</table>'}
 h+='<h2>Pool</h2>';
-const p=await (await fetch('/admin/pool/status',{headers:H})).json();
+const pr=await fetch('/admin/pool/status',{headers:H});const p=await pr.json();
+if(!pr.ok)h+='<p role="alert">Pool setup check failed: '+esc(setupErrorText(p.reason||p.error||'setup_failed'))+'</p>';
 h+='<p>Mode <b>'+esc(p.mode)+'</b>';
-if(p.mode==='channel'){h+='; channel <code>'+esc(p.channel_id)+'</code>; '+esc(p.tiles)+' tiles; last message '+
-esc(p.last_message_id)+'; pending uploads '+esc(p.outbox)+' <button onclick="act(\\'POST\\',\\'/admin/pool/scan\\')">Scan</button> '+
+if(p.mode==='channel'){h+='; channel <code>'+esc(p.channel_id)+'</code>; '+esc(p.tiles)+' tiles; history '+
+(p.history_readable?'readable':'unavailable')+'; posting '+(p.channel_writable?'available':'read-only')+(p.channel_writable?'':'; grant the bot Post Messages permission to enable uploads')+'; last message '+
+esc(p.last_message_id)+'; pending uploads '+esc(p.outbox)+(p.last_error?'; last error '+esc(setupErrorText(p.last_error)):'')+' <button onclick="act(\\'POST\\',\\'/admin/pool/scan\\')">Scan</button> '+
 '<button onclick="act(\\'POST\\',\\'/admin/pool/rebuild\\')">Rebuild index</button>'}
 else if(p.mode==='host'){h+='; API '+(p.api_enabled?'enabled':'disabled')+(p.api_url?'; URL <code>'+esc(p.api_url)+'</code>':'')+
 '; '+esc(p.tiles)+' tiles; '+
@@ -1499,14 +1573,82 @@ def create_admin_app(core: Core) -> FastAPI:
 
     @app.get("/", response_class=HTMLResponse)
     async def index():
-        return HTMLResponse(_ADMIN_HTML, headers={
+        return HTMLResponse(_ADMIN_HTML.replace("const PROFILE='__PROFILE__';",
+                                               f"const PROFILE='{core.settings.profile}';"), headers={
             "Content-Security-Policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
                                        "connect-src 'self'; frame-ancestors 'none'"})
 
+    @app.get("/admin/setup")
+    async def setup_status():
+        return {"profile": core.settings.profile,
+                "setup_required": core.settings.profile == "local" and
+                                 core.settings.effective_pool_mode == "local"}
+
+    @app.post("/admin/setup")
+    async def setup(body: AdminSetupIn):
+        if core.settings.profile == "vercel":
+            return err(409, "set_environment_variables_in_vercel")
+        if core.channel_index is not None:
+            return err(409, "already_configured")
+        channel_id = body.telegram_channel_id.strip()
+        bot_token = (body.telegram_bot_token or "").strip()
+        session = (body.telegram_session or "").strip()
+        if not channel_id or bool(bot_token) == bool(session):
+            return err(400, "bad_telegram_settings")
+        if session and (any(sep in session for sep in ("/", "\\")) or
+                        session.startswith("~") or session.endswith(".session")):
+            return err(400, "telegram_session_must_be_a_string_session")
+
+        settings = replace(core.settings, profile="local", pool_mode="channel", pool_enabled=False,
+                           telegram_channel_id=channel_id, telegram_api_id=body.telegram_api_id,
+                           telegram_api_hash=body.telegram_api_hash.strip(), telegram_bot_token=bot_token,
+                           telegram_session=session, telegram_session_file=None, contribution=False,
+                           pool_channel_writable="auto")
+        try:
+            settings.validate()
+            probe = TelegramMTProtoStore(settings)
+            probe.start()                         # resolves the channel and checks readable history + posting rights
+            probe.scan(0, 1)                      # verify that history can actually be read
+        except (ValueError, PoolError) as exc:
+            if "probe" in locals():
+                probe.close()
+            return err(400 if isinstance(exc, ValueError) else exc.status,
+                       getattr(exc, "code", "bad_telegram_settings"))
+
+        try:
+            write_env_file(core.data_dir / ".env", {
+                "OPENSEEK_PROFILE": "local", "OPENSEEK_POOL_MODE": "channel",
+                "OPENSEEK_TELEGRAM_CHANNEL_ID": channel_id,
+                "OPENSEEK_TELEGRAM_API_ID": str(body.telegram_api_id),
+                "OPENSEEK_TELEGRAM_API_HASH": settings.telegram_api_hash,
+                "OPENSEEK_TELEGRAM_BOT_TOKEN": bot_token,
+                "OPENSEEK_TELEGRAM_SESSION": session,
+                "OPENSEEK_POOL_CHANNEL_WRITABLE": "auto",
+                "OPENSEEK_CONTRIBUTION": "0",
+            })
+            core._configure_channel_pool(settings, probe)
+            scan = await asyncio.to_thread(core.channel_index.refresh, True)
+            core.channel_index.start()
+        except (OSError, PoolError) as exc:
+            if core.channel_store is not probe:
+                probe.close()
+            log.warning("browser Telegram setup failed (%s)", type(exc).__name__)
+            return err(503, getattr(exc, "code", "setup_failed"))
+        return {"configured": True, "profile": "local", "history_readable": probe.history_readable,
+                "channel_writable": probe.can_post, "initial_scan": scan}
+
     @app.get("/admin/status")
     async def status():
-        return {"server": {"port": core.settings.port, "addresses": lan_addresses(), "spki_pin": core.spki_pin},
-                "pairing": core.pairing.admin_status(), "devices": core.db.devices(),
+        pairing = core.pairing.admin_status()
+        if core.settings.profile == "vercel":
+            active = [invite for invite in core.invites.listing()
+                      if invite["role"] == "owner" and invite["state"] == "open"]
+            pairing = {"open": bool(active), "expires_in_s": max(
+                (invite["expires_in_s"] for invite in active), default=0),
+                "attempts_left": min((invite["attempts_left"] for invite in active), default=0)}
+        return {"server": {"profile": core.settings.profile, "port": core.settings.port,
+                            "addresses": lan_addresses(), "spki_pin": core.spki_pin},
+                "pairing": pairing, "devices": core.auth.devices(),
                 "cache": core.cache.stats(), "active_sources": len(core.jobs.running_sources())}
 
     @app.get("/admin/metrics")
@@ -1602,7 +1744,7 @@ def create_admin_app(core: Core) -> FastAPI:
                 "public": {"listening": bool(core.settings.public_port), "port": core.settings.public_port,
                            "host": core.settings.public_host, **core.public_limiter.snapshot()},
                 "invites": core.invites.listing(),
-                "guests": [d for d in core.db.devices() if d["role"] == "guest"]}
+                "guests": [d for d in core.auth.devices() if d["role"] == "guest"]}
 
     @app.delete("/admin/public/blocks", status_code=204)
     async def public_unblock():
@@ -1611,26 +1753,26 @@ def create_admin_app(core: Core) -> FastAPI:
 
     @app.put("/admin/sharing")
     async def sharing_set(body: SharingIn):
-        core.db.set_setting("sharing_enabled", "1" if body.enabled else "0")
+        core.state_store.set_setting("sharing_enabled", "1" if body.enabled else "0")
         if not body.enabled:
             await asyncio.to_thread(core.jobs.stop_contributions)       # the kill switch stops guest extraction too
         return {"enabled": core.sharing_enabled()}
 
     @app.get("/admin/contributions")
     async def contributions_get():
-        return {"enabled": core.db.get_setting("contrib_enabled") == "1", "effective": core.contributions_enabled(),
+        return {"enabled": core.state_store.get_setting("contrib_enabled") == "1", "effective": core.contributions_enabled(),
                 "hosts": core.contrib_hosts(), "max_sources": core.settings.contrib_max_sources, "mbps": core.settings.contrib_mbps,
                 "denied_hosts": sorted({h for _, h in core.contrib_denied}), "jobs": core.jobs.contributed_jobs(),
-                "contributors": [d["device_id"] for d in core.db.devices() if d["contribute"]]}
+                "contributors": [d["device_id"] for d in core.auth.devices() if d["contribute"]]}
 
     @app.put("/admin/contributions")
     async def contributions_set(body: ContribAdminIn):
         if body.enabled is not None:
-            core.db.set_setting("contrib_enabled", "1" if body.enabled else "0")
+            core.state_store.set_setting("contrib_enabled", "1" if body.enabled else "0")
             if not body.enabled:
                 await asyncio.to_thread(core.jobs.stop_contributions)
         if body.hosts is not None:
-            core.db.set_setting("contrib_hosts", json.dumps(clean_hosts(body.hosts)))
+            core.state_store.set_setting("contrib_hosts", json.dumps(clean_hosts(body.hosts)))
         return await contributions_get()
 
     @app.delete("/admin/contributions/{preview_id}", status_code=204)
@@ -1641,7 +1783,7 @@ def create_admin_app(core: Core) -> FastAPI:
 
     @app.put("/admin/devices/{device_id}/permissions")
     async def device_permissions(device_id: str, body: PermIn):
-        if not is_device_id(device_id) or not core.db.set_contribute(device_id, body.contribute):
+        if not is_device_id(device_id) or not core.auth.set_contribute(device_id, body.contribute):
             return err(404, "not_found")          # unknown device, or an owner (owners never need it)
         if not body.contribute:
             await asyncio.to_thread(core.jobs.stop_contributions, device_id)
@@ -1655,8 +1797,14 @@ def create_admin_app(core: Core) -> FastAPI:
         if b.public and not (core.settings.public_port and core.settings.public_host):
             return err(409, "public_endpoint_not_configured")
         inv = await asyncio.to_thread(core.invites.create, b.label, b.ttl_s or 86400, "guest", b.device_days, not b.read_only)
-        addrs = lan_addresses()
-        host = core.settings.public_host if b.public else f"{addrs[0]}:{core.settings.port}"
+        if core.settings.profile == "vercel":
+            host = request_host(request)
+            if host is None:
+                await asyncio.to_thread(core.invites.revoke, inv["invite_id"])
+                return err(400, "bad_host")
+        else:
+            addrs = lan_addresses()
+            host = core.settings.public_host if b.public else f"{addrs[0]}:{core.settings.port}"
         from urllib.parse import quote
         inv["address"] = host
         inv["join"] = (f"openseek://join/1?h={quote(host, safe='')}&p={quote(core.spki_pin, safe='')}"
@@ -1752,8 +1900,11 @@ def create_admin_app(core: Core) -> FastAPI:
         else:
             result = {"mode": mode, "api_enabled": False}
         if mode == "channel":
-            pending = core.db.q("SELECT COUNT(*) FROM pool_channel_outbox")
-            result["outbox"] = int(pending[0][0]) if pending else 0
+            if core.uploads is not None:
+                result["outbox"] = await asyncio.to_thread(core.uploads.store.pending_count)
+            else:
+                pending = core.db.q("SELECT COUNT(*) FROM pool_channel_outbox")
+                result["outbox"] = int(pending[0][0]) if pending else 0
             result["last_error"] = (core.pool_sync.last_error if core.pool_sync else
                                     core.channel_index.last_error if core.channel_index else "")
         return result
@@ -1781,18 +1932,37 @@ def create_admin_app(core: Core) -> FastAPI:
         return {"released": core.jobs.alt_release()}
 
     @app.post("/admin/pair")
-    async def open_pair():
+    async def open_pair(request: Request):
+        if core.settings.profile == "vercel":
+            host = request_host(request)
+            if host is None:
+                return err(400, "bad_host")
+            if any(invite["role"] == "owner" and invite["state"] == "open"
+                   for invite in core.invites.listing()):
+                return err(409, "pairing_already_open")
+            invite = await asyncio.to_thread(
+                core.invites.create, "Nuvio device", 600, "owner", None, False)
+            from urllib.parse import quote
+            join = (f"openseek://join/1?h={quote(host, safe='')}&p={quote(core.spki_pin, safe='')}"
+                    f"&i={invite['invite_id']}&c={quote(invite['secret'], safe='')}")
+            return {"code": invite["code"], "join": join, "invite_id": invite["invite_id"],
+                    "expires_in_s": invite["expires_in_s"], "spki_pin": core.spki_pin}
         code, ttl = await asyncio.to_thread(core.pairing.open_window)
         return {"code": code, "expires_in_s": int(ttl), "spki_pin": core.spki_pin}
 
     @app.delete("/admin/pair", status_code=204)
     async def close_pair():
-        core.pairing.close_window()
+        if core.settings.profile == "vercel":
+            for invite in core.invites.listing():
+                if invite["role"] == "owner" and invite["state"] == "open":
+                    await asyncio.to_thread(core.invites.revoke, invite["invite_id"])
+        else:
+            core.pairing.close_window()
         return Response(status_code=204)
 
     @app.get("/admin/devices")
     async def devices():
-        return {"devices": core.db.devices()}
+        return {"devices": core.auth.devices()}
 
     @app.delete("/admin/devices/{device_id}", status_code=204)
     async def revoke(device_id: str):

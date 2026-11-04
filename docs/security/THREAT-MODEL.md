@@ -73,7 +73,7 @@ open-proxy pivot.
 - **B2 backend ↔ internet origin.** The backend makes outbound fetches on behalf of a client; every destination is vetted after DNS resolution and on every redirect hop.
 - **B3 backend ↔ ffmpeg.** ffmpeg is treated as an untrusted parser: it never sees the real URL, only a loopback range-proxy capability; protocol and format allowlists, resource limits, killed on timeout.
 - **B4 backend ↔ disk.** Only derived thumbnails and opaque keys are written; path components are generated, never client-supplied.
-- **B5 admin ↔ backend.** Pairing windows and revocation are local actions (loopback UI or CLI inside the container), never available to a LAN client.
+- **B5 admin ↔ backend.** Local/VPS pairing and revocation use the loopback UI or CLI. The Vercel profile exposes these owner operations over HTTPS and requires the separate owner secret on every operation; device tokens and pool keys do not grant admin access.
 
 ## 5. STRIDE summary
 
