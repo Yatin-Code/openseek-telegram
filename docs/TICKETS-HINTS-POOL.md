@@ -10,7 +10,7 @@ Scope rule: `/v1/pool/*` and the Vercel upload lifecycle are the client contract
    JPEG tiles wrapped in it. No VTT endpoint, WebVTT parsing, sprite-sheet URL protocol, or
    `/v1/previews` or `/v1/lookup` dependency. Nuvio generates NVMT on a playback miss. OpenSeek may
    generate NVMT only after an owner starts that action in the admin dashboard; it never generates
-   on a player request. F4 retires the desktop app and legacy preview/VTT product paths while
+   on a player request. F4 retires the native Windows admin app and legacy preview/VTT product paths while
    preserving only the generation code needed by the dashboard.
 2. `fp` is the exact blob key. Hints never replace it.
 3. No full-file hash, no hash of hints, no video URL or header ever reaches the pool.
@@ -367,15 +367,15 @@ client never enters the sample-verification loop.
 **Acceptance:** an owner can start and complete generation from the same dashboard in local/VPS and Vercel profiles; Telegram receives a valid package and manifest; a pool/player request causes zero video decoding.
 **Depends:** F1, F2. **Size:** L.
 
-### F4 — Remove the desktop app and legacy player preview/VTT product
+### F4 — Remove the native Windows admin app and legacy player preview/VTT product
 **Why:** the browser dashboard is the only admin interface, and the shared product uses NVMT rather than the old player VTT pipeline.
-**Scope:** `desktop/`, desktop packaging/installer references, `/v1/previews`, `/v1/lookup`, VTT/sprite routes and code, docs/tests for those surfaces.
+**Scope:** the former native Windows admin tree, its packaging/installer references, `/v1/previews`, `/v1/lookup`, VTT/sprite routes and code, docs/tests for those surfaces.
 **Do:**
-- Remove the Windows desktop application and its build/release paths.
+- Remove the native Windows admin application and its build/release paths.
 - Remove the old player preview, VTT, lookup, and sprite-sheet product surfaces and the generation code used only by them.
 - Retain and adapt only the media extraction and packaging pieces needed by F3's explicit dashboard NVMT generation.
 - Remove obsolete docs, tests, dependencies, and packaging references without changing `/v1/pool/*` behavior.
-**Acceptance:** no desktop app or player VTT/preview surface is shipped; the dashboard can still generate and publish NVMT; Nuvio can still generate on a playback miss and use the shared pool.
+**Acceptance:** no native Windows admin app or player VTT/preview surface is shipped; the dashboard can still generate and publish NVMT; Nuvio can still generate on a playback miss and use the shared pool.
 **Depends:** F2, F3. **Size:** L.
 
 ---

@@ -5,8 +5,8 @@
     openseek-service.ps1 -Action Uninstall -InstallDir <dir> [-DeleteData]
 
   Install: sets OpenSeek up as an automatic Windows service running under its own restricted virtual account (NT SERVICE\OpenSeek),
-  creates a private data folder, a LAN-only firewall rule, lets the installing user start/stop the service and read the data (for the
-  desktop app), picks free ports if the defaults are taken, and waits until the server answers.
+  creates a private data folder, a LAN-only firewall rule, lets the installing user start/stop the service and read the admin secret,
+  picks free ports if the defaults are taken, and waits until the server answers.
   It never opens router ports, never enables internet sharing and never exposes the admin port (it binds 127.0.0.1 only).
 #>
 param(
@@ -111,7 +111,7 @@ $apiPort = Pick-Port (@($wantApi) + 18787, 28787, 38787, 48787) @()
 $admPort = Pick-Port (@($wantAdm) + 18788, 28788, 38788, 48788) @($apiPort)
 Say "Ports: owner API $apiPort, admin $admPort (127.0.0.1 only)"
 
-# server settings file (the desktop app edits it; the server only honours an allowlist of keys from it)
+# server settings file (the owner may edit it; the server only honours an allowlist of keys from it)
 $conf = [ordered]@{}
 if ($old -is [System.Management.Automation.PSCustomObject]) { foreach ($pr in $old.PSObject.Properties) { $conf[$pr.Name] = $pr.Value } }
 $conf["port"] = $apiPort
@@ -155,7 +155,7 @@ Say "Service installed (automatic, delayed start, restarts itself after a crash)
 $system, $admins = "*S-1-5-18", "*S-1-5-32-544"
 & icacls.exe $Root /inheritance:r /grant:r "${system}:(OI)(CI)F" "${admins}:(OI)(CI)F" "*${userSid}:(OI)(CI)RX" "NT SERVICE\${Svc}:(RX)" | Out-Null
 & icacls.exe $Data /grant:r "NT SERVICE\${Svc}:(OI)(CI)M" | Out-Null
-& icacls.exe $Cfg /grant:r "*${userSid}:M" "NT SERVICE\${Svc}:R" | Out-Null      # the desktop app may edit the settings file
+& icacls.exe $Cfg /grant:r "*${userSid}:M" "NT SERVICE\${Svc}:R" | Out-Null      # the installing user may edit the settings file
 Say "Data folder permissions set (private to SYSTEM, Administrators, the service and $User)"
 
 # the installing user may start/stop/query the service (not reconfigure or delete it)

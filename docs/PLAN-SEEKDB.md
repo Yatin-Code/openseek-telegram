@@ -191,7 +191,7 @@ Telegram stream.
 | 3 | C1–C3 | Librarian intake, quotas/verified, per-device offsets/rejections |
 | 4 | D0–D8 | Nuvio: film work key, hints, ranked candidate, linear mapping, read-only and Vercel uploads |
 | 5 | E1–E3 | This plan, operator docs, migration note |
-| 6 | F1–F4 | Vercel profile, one shared dashboard, dashboard NVMT generation, retire desktop/legacy preview paths |
+| 6 | F1–F4 | Vercel profile, one shared dashboard, dashboard NVMT generation, retire the native Windows admin app/legacy preview paths |
 
 Server tickets: GitHub issues #1–#23. Client tickets: `Nuvio-native-tizen-fixes/.scratch/hints-pool/`.
 

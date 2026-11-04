@@ -1,4 +1,4 @@
-"""Desktop app support: identify (tag) and delete ONE cache entry through the loopback admin API."""
+"""Server-side admin API: identify (tag) and delete ONE cache entry through the loopback admin API."""
 from __future__ import annotations
 
 import time
