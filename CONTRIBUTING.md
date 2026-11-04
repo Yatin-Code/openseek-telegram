@@ -21,7 +21,7 @@ cd backend
 
 Tests start their own servers on free local ports with temporary data directories; do not point them at a real installation.
 Some tests depend on optional local fixtures or on other projects and may be skipped or need environment variables; see the test file headers.
-The benchmark harness has its own tests in `bench/tests` (`bench/requirements.txt`). The desktop app is in `desktop/` (PySide6).
+The benchmark harness has its own tests in `bench/tests` (`bench/requirements.txt`).
 
 ## Code style
 

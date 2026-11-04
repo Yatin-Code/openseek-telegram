@@ -9,7 +9,7 @@ as WebVTT cues and tile sheets. The HTTP API is specified in `api/CONTRACT-v1.md
 | Listener | Default | Who | Notes |
 |---|---|---|---|
 | Owner API | HTTPS `0.0.0.0:8787` | paired owner devices | self-signed ECDSA P-256 certificate; client IPs must be private unless `OPENSEEK_ALLOW_PUBLIC_CLIENTS=1` |
-| Admin | HTTP `127.0.0.1:8788` | the owner (CLI, dashboard, desktop app) | loopback only; rejects foreign Host/Origin; every call except the static dashboard page needs the per-install admin secret in `X-OpenSeek-Admin` |
+| Admin | HTTP `127.0.0.1:8788` | the owner (CLI, browser dashboard) | loopback only; rejects foreign Host/Origin; every call except the static dashboard page needs the per-install admin secret in `X-OpenSeek-Admin` |
 | Guest (public) | HTTPS, off unless `OPENSEEK_PUBLIC_PORT` is set | invited guest devices only | same certificate and pin, deny-by-default routes, per-address limits |
 
 ## Modules (`backend/openseek/`)
@@ -77,7 +77,6 @@ Scheduling is work-conserving: when the server is idle the contribution uses the
 drops to one worker plus an extra `OPENSEEK_CONTRIB_MBPS` allowance; it is held entirely while the owner's playback guard is holding or the contributor's own player reports a rebuffer.
 The owner always wins a source slot, and a preempted contribution resumes from its cached tiles. Limit: 6 contributions per minute per device.
 
-## Desktop app and tools
+## Tools
 
-`desktop/` is a PySide6 Windows app that attaches to a running server, reads the database read-only and uses the loopback admin API. `bench/` holds a benchmark harness with a throttled-link
-test server; `backend/tools/` holds probes and helper scripts (public endpoint probe, dynamic DNS updater, contributor benchmark, multi-range probes).
+`bench/` holds a benchmark harness with a throttled-link test server; `backend/tools/` holds probes and helper scripts (public endpoint probe, dynamic DNS updater, contributor benchmark, multi-range probes).

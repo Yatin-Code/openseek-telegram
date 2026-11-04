@@ -1,4 +1,4 @@
-; OpenSeek for Windows: one installer that sets up the server (as a Windows service) and the desktop app.
+; OpenSeek for Windows: one installer that sets up the server (as a Windows service).
 ; Build with installer\build_installer.py (it stages everything under installer\.build\stage first).
 #ifndef AppVersion
   #define AppVersion "0.2.0"
@@ -19,8 +19,8 @@ DisableProgramGroupPage=yes
 DisableDirPage=auto
 OutputDir=.build\out
 OutputBaseFilename=OpenSeekSetup-v{#AppVersion}-Windows-x64
-SetupIconFile=..\desktop\icon.ico
-UninstallDisplayIcon={app}\desktop\OpenSeek.exe
+SetupIconFile=icon.ico
+UninstallDisplayIcon={app}\server\OpenSeekServer.exe
 LicenseFile=.build\stage\installer-license.txt
 Compression=lzma2/max
 SolidCompression=yes
@@ -35,12 +35,8 @@ MinVersion=10.0
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
-[Tasks]
-Name: "desktopicon"; Description: "Create a &desktop shortcut"; Flags: unchecked
-
 [Files]
 Source: ".build\stage\server\*"; DestDir: "{app}\server"; Flags: recursesubdirs createallsubdirs ignoreversion
-Source: ".build\stage\desktop\*"; DestDir: "{app}\desktop"; Flags: recursesubdirs createallsubdirs ignoreversion
 Source: ".build\stage\service\*"; DestDir: "{app}\service"; Flags: ignoreversion
 Source: "support\openseek-service.ps1"; DestDir: "{app}\support"; Flags: ignoreversion
 Source: ".build\stage\licenses\*"; DestDir: "{app}\licenses"; Flags: recursesubdirs createallsubdirs ignoreversion
@@ -50,16 +46,7 @@ Source: ".build\stage\SOURCE-OFFER.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: ".build\stage\THIRD-PARTY-NOTICES.txt"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{autoprograms}\OpenSeek"; Filename: "{app}\desktop\OpenSeek.exe"; WorkingDir: "{app}\desktop"
 Name: "{autoprograms}\Uninstall OpenSeek"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\OpenSeek"; Filename: "{app}\desktop\OpenSeek.exe"; WorkingDir: "{app}\desktop"; Tasks: desktopicon
-
-[Registry]
-; the desktop app's optional "Start with Windows" entry (written by the app, for the user who ticked it)
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueName: "OpenSeekDesktop"; Flags: uninsdeletevalue dontcreatekey
-
-[Run]
-Filename: "{app}\desktop\OpenSeek.exe"; Description: "Open OpenSeek now"; Flags: nowait postinstall skipifsilent runasoriginaluser
 
 [UninstallDelete]
 ; the service definition (OpenSeekService.xml) is generated at install time, so the uninstaller does not know it
@@ -92,7 +79,7 @@ begin
     Log('openseek-service.ps1 Install exit code ' + IntToStr(rc));
     if rc <> 0 then
       MsgBox('OpenSeek was installed, but its background service did not start (code ' + IntToStr(rc) + ').' + #13#10 +
-             'You can start it from the OpenSeek dashboard, or look at the log in ' + ExpandConstant('{commonappdata}') + '\OpenSeek\data\logs.', mbError, MB_OK);
+             'You can start it from Windows Services (services.msc), or look at the log in ' + ExpandConstant('{commonappdata}') + '\OpenSeek\data\logs.', mbError, MB_OK);
   end;
 end;
 

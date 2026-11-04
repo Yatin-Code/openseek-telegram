@@ -1,6 +1,6 @@
 # Guest contributions (Reader / Contributor)
 
-**Default:** off. Guests stay read-only unless the owner (1) turns on *Allow guest contributions* (admin API `PUT /admin/contributions`, Desktop > Sharing)
+**Default:** off. Guests stay read-only unless the owner (1) turns on *Allow guest contributions* (admin API `PUT /admin/contributions`)
 **and** (2) grants that device the Contributor permission (`PUT /admin/devices/{id}/permissions {"contribute":true}`). Existing guests are Readers.
 
 **API (guest, public or LAN listener):** `POST /v1/contribute`, `GET /v1/contribute/{id}`, `DELETE /v1/contribute/{id}`. The privileged

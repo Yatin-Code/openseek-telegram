@@ -1,8 +1,8 @@
-"""Copy the licence files of the packages bundled into the Windows build into <out>/<package>/ and write THIRD-PARTY-NOTICES.txt.
+"""Copy the licence files of the Python packages bundled into the Windows server build into <out>/<package>/ and write a notices file.
 
     python collect_licenses.py <out-dir> <notices-file>
 
-Reads the installed distributions' metadata (the licence/notice files that ship in each dist-info). Run with the build venv's Python.
+Reads the installed distributions' metadata (the licence/notice files that ship in each dist-info). Run with the server build venv's Python.
 """
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import sys
 from importlib import metadata
 from pathlib import Path
 
-BUNDLED = ["PySide6-Essentials", "shiboken6", "httpx", "httpcore", "h11", "anyio", "idna", "certifi", "psutil", "Pillow"]
+BUNDLED = ["fastapi", "uvicorn", "cryptography", "av", "Pillow", "numpy", "telethon", "httpx"]
 if os.environ.get("OPENSEEK_LICENSE_PACKAGES"):          # e.g. the server bundle: a comma-separated package list
     BUNDLED = [p.strip() for p in os.environ["OPENSEEK_LICENSE_PACKAGES"].split(",") if p.strip()]
 LICENSE_FILE = re.compile(r"(^|/)(licen[cs]es?|copying|notice|authors)([^/]*)$", re.IGNORECASE)
@@ -41,22 +41,20 @@ def main() -> int:
                 copied += 1
         rows.append((md["Name"], md["Version"], lic or "see licence files", copied))
     lines = [
-        "OpenSeek Desktop: third-party components bundled in this build",
+        "OpenSeek Server: third-party Python packages bundled in this build",
         "",
         "OpenSeek itself is licensed under the GNU Affero General Public License v3.0 or later (see LICENSE).",
         "Python itself (PSF License) and the packages below are included by PyInstaller. Each package's own licence files are in the",
         "licenses folder next to this file.",
         "",
-        "Qt / PySide6: licensed under the GNU Lesser General Public License v3.0 (and other options offered by The Qt Company). The Qt libraries",
-        "are dynamically linked DLLs inside the _internal folder; you may replace them with your own build of the same version. Qt source code is",
-        "available from https://download.qt.io/ and PySide6 source from https://code.qt.io/cgit/pyside/pyside-setup.git/.",
-        "certifi: Mozilla Public License 2.0 (its CA bundle is used for HTTPS lookups); source at https://github.com/certifi/python-certifi.",
+        "FFmpeg, x264, x265 and the other native libraries bundled with the server: see SOURCE-OFFER.txt and",
+        "licenses\\third-party\\SOURCES-MANIFEST.md.",
         "",
         f"{'package':24} {'version':14} licence (as declared in the package metadata)",
     ]
     for n, v, l, c in rows:
         lines.append(f"{n:24} {v:14} {l}   [{c} licence file(s) in licenses/]")
-    lines += ["", "Not bundled: the OpenSeek server (backend), PyAV/FFmpeg, and anything under desktop/demo data."]
+    lines += ["", "Not bundled: the OpenSeek server source tree or test dependencies."]
     notices.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"collected {sum(r[3] for r in rows)} licence files for {len(rows)} packages")
     return 0

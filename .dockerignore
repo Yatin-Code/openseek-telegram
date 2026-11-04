@@ -9,7 +9,6 @@ data
 *.log
 .env
 .pool-secrets
-desktop
 bench
 docs
 backend/tests

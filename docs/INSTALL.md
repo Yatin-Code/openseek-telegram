@@ -6,20 +6,20 @@ database, the TLS identity (`tls/`), the capability key (`secret.key`) and the t
 
 ## Windows installer (recommended)
 
-`OpenSeekSetup-v0.2.0-Windows-x64.exe` (GitHub releases) installs the server and the desktop dashboard together. It needs administrator approval once.
+`OpenSeekSetup-v0.2.0-Windows-x64.exe` (GitHub releases) installs the server as a Windows service. It needs administrator approval once.
 
 What it sets up:
 * **The server as a Windows service** named `OpenSeek` (automatic, delayed start; restarts itself after a crash), running as the restricted virtual account `NT SERVICE\OpenSeek` with only the privileges it needs. The program is in `C:\Program Files\OpenSeek`.
-* **Data** in `C:\ProgramData\OpenSeek` (database, cache, TLS certificate, admin secret, logs, `config.json`). Only SYSTEM, Administrators, the service and the Windows user who installed can read it. That user can also start/stop the service, which is how the dashboard's Start/Stop/Restart work without admin rights. Another Windows user who wants the dashboard can run the installer from their own account.
+* **Data** in `C:\ProgramData\OpenSeek` (database, cache, TLS certificate, admin secret, logs, `config.json`). Only SYSTEM, Administrators, the service and the Windows user who installed can read it. That user can also start/stop the service from Windows without an administrator prompt. Another Windows user who wants the dashboard can run the installer from their own account.
 * **One firewall rule**, "OpenSeek (home network)": TCP, this program only, the server's port only, **local subnet only**, on any network profile (many home networks are classed "Public"). The admin interface listens on 127.0.0.1 only and has no rule. The installer does not change router settings and does not enable internet sharing.
 * **Ports:** 8787 (API) and 8788 (admin, this PC only), or the next free ones (18787, 28787, ...) if something else uses them; the dashboard shows the right address.
-* **Start Menu** entries, an optional desktop shortcut, and a normal uninstaller (Settings > Apps).
+* **Uninstall** entry in the Start Menu and in Windows Settings > Apps.
 
 Unattended: `OpenSeekSetup-v0.2.0-Windows-x64.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART` (add `/PORT=n /ADMINPORT=n` to choose ports). Uninstall: `"C:\Program Files\OpenSeek\unins000.exe" /VERYSILENT` keeps your data; add `/DELETEDATA=1` to remove it as well.
 
-Connecting a TV: open **OpenSeek** from the Start menu and press **Connect a TV**. It shows this PC's home-network address and a one-time pairing code (valid 10 minutes, single use) and tells you when the TV has paired. Nothing changes if you never use remote sharing or Contributor Mode; both are optional and live under "Show advanced options".
+Connecting a TV: open the admin dashboard (see "Admin secret" below) and start a pairing window. It shows this PC's home-network address and a one-time pairing code (valid 10 minutes, single use) and tells you when the TV has paired. Nothing changes if you never use remote sharing or Contributor Mode; both are optional.
 
-Upgrading from the v0.1.0 portable desktop app: install this version; the old app is not needed. Servers set up manually keep working with the new dashboard if you point it at the data folder in Settings, but the installed service and a manually started server must not use the same ports.
+Upgrading from v0.1.0: install this version. Servers set up manually keep working with the browser dashboard, which uses the same data directory and admin secret, but the installed service and a manually started server must not use the same ports.
 
 ## Windows, manual setup from source
 
@@ -76,8 +76,9 @@ appear here after the next channel scan. Without an intake URL, uploads return `
 ### Admin secret
 
 The loopback admin API (port 8788) requires a per-install secret in the `X-OpenSeek-Admin` header. By default the server creates a random one in
-`<data>\admin.token` (readable only by you where the OS supports it); `python -m openseek pair|devices|revoke|dashboard` and the desktop app read it from
-there. To choose your own, set `OPENSEEK_ADMIN_TOKEN` (at least 16 characters; prefer the file for anything other than automation). The secret protects
+`<data>\admin.token` (readable only by you where the OS supports it); `python -m openseek pair|devices|revoke|dashboard` reads it from there.
+`python -m openseek dashboard` opens the browser dashboard with the secret in the URL fragment; for the installed service, open
+`http://127.0.0.1:8788/#<secret>` with the value from `C:\ProgramData\OpenSeek\admin.token`. To choose your own, set `OPENSEEK_ADMIN_TOKEN` (at least 16 characters; prefer the file for anything other than automation). The secret protects
 against other local users, other local programs and containers that can reach the host's loopback; it is not a substitute for keeping the data directory private.
 
 ### Optional: `backend/tools/run_production.ps1`
@@ -92,7 +93,7 @@ backend\tools\run_production.ps1 -MultiRange 0 -Guard 0
 backend\tools\run_production.ps1 -PublicHost name.example.org:443   # also start the guest listener
 ```
 
-The desktop app and `duckdns.ps1` run these scripts from the checkout, so keep the checkout somewhere only you can write to.
+`duckdns.ps1` runs these scripts from the checkout, so keep the checkout somewhere only you can write to.
 It only stops a process that listens on the API port and whose command line is `openseek serve`. Logs go to `<data>\logs\`.
 It expects the virtual environment at `backend\.venv`. `-CodeTag` checks out a git tag in the repository; do not use it unless you
 know you want that.
@@ -181,7 +182,7 @@ How this stays safe:
 * **Proxied requests are refused.** An owner or admin request carrying `X-Forwarded-For`, `Forwarded`, `X-Real-IP` and similar headers was relayed by
   a proxy or tunnel and is answered `403 proxy_refused`, even with a valid token. Do not put the owner API behind a reverse proxy; use the guest listener for remote access.
 * The image runs as UID 10001 with a read-only root filesystem and no capabilities; state lives in the `/data` volume (`openseek-data`).
-  The admin listener is reached with `docker compose exec`. The Windows desktop app needs host-loopback access to the admin port and is not meant for a containerised server.
+  The admin listener is reached with `docker compose exec`; the browser dashboard cannot reach a container's loopback from the host.
 * The compose image is tagged `openseek-selfhosted:local` so it never overwrites another deployment's `openseek:local`.
 * Tested on Docker 29 on Windows (Docker Desktop) with simulated LAN clients; not tested on Linux Docker, other architectures, or for long runs.
 
@@ -192,7 +193,7 @@ The guest listener serves invited guest devices only; the owner API never needs 
 1. Choose a DNS name that points to your public address (a dynamic DNS service works; `backend/tools/duckdns.ps1` is a helper for one such service on Windows).
 2. Set `OPENSEEK_PUBLIC_PORT=8789` and `OPENSEEK_PUBLIC_HOST=name.example.org:443` and restart. The host is used to build the URLs placed in invitations and capability links; it is never taken from a client header.
 3. On your router, forward TCP 443 to port 8789 of the server only. Never forward 8787 or 8788. Give the server a fixed LAN address.
-4. Turn sharing on and create an invitation (admin API `POST /admin/invites {"public": true}` or the desktop app). Send the join string or short code to the guest.
+4. Turn sharing on and create an invitation (admin API `POST /admin/invites {"public": true}` or the browser dashboard). Send the join string or short code to the guest.
 5. From another network, check with `python backend/tools/public_probe.py name.example.org:443 --pin "sha256//..."` (exit code 0 = all checks passed).
 
 Guests are read-only by default; Contributor Mode additionally needs the owner to switch contributions on and grant the device the permission
@@ -209,8 +210,7 @@ what it opens; the router rule described above is the supported way.
 
 **Upgrading from a release without the admin secret** (any build before `0.1.0` plus the security fixes): nothing to migrate in the data directory. The new server creates
 `<data>/admin.token` on first start, keeps the TLS identity (so existing pairings stay valid), the paired devices, sharing settings and invitations (verified by an upgrade test).
-What changes: the **desktop app and any script that sends `X-OpenSeek-Admin: 1` must be updated** at the same time. An old desktop build gets `403 admin_auth` and cannot manage the server until you
-install the matching version (the new one reads `admin.token` from the server's data folder); the CLI (`pair`, `devices`, `revoke`, `dashboard`) already does. Docker users: re-run `tools/docker-lan.*` once if you used a hand-edited compose file,
+What changes: **any script that sends `X-OpenSeek-Admin: 1` must be updated** at the same time so it sends the per-install secret instead. The CLI (`pair`, `devices`, `revoke`, `dashboard`) and the browser dashboard already do. Docker users: re-run `tools/docker-lan.*` once if you used a hand-edited compose file,
 because the container now has to declare its publish address. Anything that reached the owner API through a reverse proxy must switch to direct access.
 
 
