@@ -25,7 +25,6 @@ services:
       # - "8789:8789"
     environment:
       OPENSEEK_DATA_DIR: /data
-      OPENSEEK_PLAYBACK_GUARD: "1"
       OPENSEEK_PUBLISHED_ON: "${OPENSEEK_LAN_IP:-127.0.0.1}"
       # OPENSEEK_PUBLIC_PORT: "8789"
       # OPENSEEK_PUBLIC_HOST: "name.example.org:443"

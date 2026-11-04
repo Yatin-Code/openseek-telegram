@@ -25,11 +25,6 @@ from openseek.config import Settings  # noqa: E402
 from openseek.netpolicy import DestinationPolicy, TestOnlyAllowance  # noqa: E402
 from openseek.pairing import client_proof, derive_key, server_proof  # noqa: E402
 
-# Synthetic media for the tests that need real files; generate with fixtures/gen_altsrc.py (see fixtures/README.md).
-FIXTURES = Path(os.environ.get("OPENSEEK_TEST_FIXTURES") or Path(__file__).resolve().parent / "fixtures" / "generated")
-FIXTURES_HINT = ("synthetic fixtures not generated in %s; run `python backend/tests/fixtures/gen_altsrc.py` "
-                 "(needs ffmpeg) or set OPENSEEK_TEST_FIXTURES" % FIXTURES)
-
 FPS = 24
 BITS = 18
 GEQ_LUM = ("if(eq(Y\\,0)\\,1\\,0)*255*mod(floor(N/pow(2\\,X))\\,2)"
@@ -264,30 +259,6 @@ def wait_for(pred, timeout: float = 30.0, interval: float = 0.05):
             return v
         time.sleep(interval)
     raise AssertionError("condition not met within %.1f s" % timeout)
-
-
-def parse_vtt(text: str) -> list[tuple[int, int, str]]:
-    """[(start_ms, end_ms, url)] with strict WebVTT timestamp parsing."""
-    lines = text.split("\n")
-    assert lines[0] == "WEBVTT"
-
-    def ms(t: str) -> int:
-        h, m, rest = t.split(":")
-        s, f = rest.split(".")
-        assert len(h) >= 2 and len(m) == 2 and len(s) == 2 and len(f) == 3
-        assert int(m) < 60 and int(s) < 60
-        return ((int(h) * 60 + int(m)) * 60 + int(s)) * 1000 + int(f)
-
-    out = []
-    i = 1
-    while i < len(lines):
-        if "-->" in lines[i]:
-            a, b = (x.strip() for x in lines[i].split("-->"))
-            out.append((ms(a), ms(b), lines[i + 1]))
-            i += 2
-        else:
-            i += 1
-    return out
 
 
 def b64u(b: bytes) -> str:

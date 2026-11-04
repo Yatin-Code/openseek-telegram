@@ -80,7 +80,6 @@ def test_real_process_restart_bind_addresses_and_no_secrets_in_logs_or_command_l
         assert "openseek" in cl and "serve" in cl and "token" not in cl.lower() and "duckdns" not in cl.lower()
         with httpx.Client(base_url=f"http://127.0.0.1:{admin}", headers=ADMIN, timeout=30) as adm:
             adm.put("/admin/sharing", json={"enabled": True})
-            adm.put("/admin/library", json={"metadata_index": True})
             inv = adm.post("/admin/invites", json={"public": True, "label": "her TV"}).json()
             assert inv["address"] == f"127.0.0.1:{public}"
             secrets += [inv["secret"], inv["code"], inv["code"].replace("-", ""), inv["join"]]
@@ -95,7 +94,6 @@ def test_real_process_restart_bind_addresses_and_no_secrets_in_logs_or_command_l
             secrets.append(token)
         with httpx.Client(base_url=base, verify=False, timeout=30, headers={"Authorization": "Bearer " + token}) as g:
             assert g.get("/v1/pair/status").status_code == 200
-            assert g.post("/v1/lookup", json={"imdb_id": "tt0000009", "duration_ms": 600000}).status_code == 404
         # ---- restart: same data directory, same guest, nothing re-paired
         stop(p)
         p, out2, err2 = start(data, api, admin, public, "run2")

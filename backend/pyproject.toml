@@ -1,7 +1,7 @@
 [project]
 name = "openseek"
 version = "0.2.0"
-description = "Self-hosted, privacy-first seek-preview thumbnails (OpenSeek API v1)"
+description = "Self-hosted Telegram-backed NVMT package pool"
 license = { text = "AGPL-3.0-or-later" }
 classifiers = ["License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)"]
 requires-python = ">=3.12"

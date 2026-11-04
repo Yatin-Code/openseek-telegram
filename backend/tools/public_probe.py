@@ -104,10 +104,10 @@ def main() -> int:
         return summary()
 
     # 3. private routes (each refused request counts as a strike; the whole probe stays under the limit of 20)
-    private = [("POST", "/v1/previews", {"source": {"url": "https://example.com/x.mkv"}}), ("GET", "/admin/status", None),
-               ("GET", "/openapi.json", None), ("PUT", "/admin/sharing", {"enabled": True}),
-               ("POST", "/v1/previews/" + "0" * 32 + "/priority", {}), ("POST", "/v1/previews/" + "0" * 32 + "/alt-source", {}),
-               ("OPTIONS", "/v1/lookup", None), ("GET", "/v1/health/../admin/status", None)]
+    private = [("GET", "/admin/status", None), ("GET", "/openapi.json", None),
+               ("PUT", "/admin/sharing", {"enabled": True}),
+               ("GET", "/v1/pool/" + "0" * 64 + "/manifest", None),
+               ("GET", "/v1/health/../admin/status", None)]
     leaked = []
     for m, p, b in private:
         try:
@@ -121,17 +121,11 @@ def main() -> int:
     # 4. the owner's pairing window / anonymous API
     s, t = request(host, port, "POST", "/v1/pair/start", {})
     rec(s in (409, 429), "owner pairing window is not reachable", str(s))
-    s, t = request(host, port, "POST", "/v1/lookup", {"imdb_id": "tt0111161", "duration_ms": 600000})
-    rec(s in (401, 429), "lookup needs a guest token", str(s))
 
     # 5. optional: authenticated guest
     if a.token:
         s, t = request(host, port, "GET", "/v1/pair/status", token=a.token)
         rec(s == 200, "guest token works", str(s))
-        s, t = request(host, port, "POST", "/v1/lookup", {"imdb_id": "tt0111161", "duration_ms": 600000}, token=a.token)
-        rec(s in (200, 404), "guest lookup answers (200 match / 404 none)", str(s))
-        s, t = request(host, port, "POST", "/v1/previews", {"source": {"url": "https://example.com/x.mkv"}, "layout": "tiles"}, token=a.token)
-        rec(s in (403, 404), "guest cannot start extraction", str(s))
         s, t = request(host, port, "GET", "/admin/status", token=a.token)
         rec(s in (403, 404), "guest cannot reach admin", str(s))
 

@@ -16,7 +16,9 @@ All notable changes are documented here. The format follows [Keep a Changelog](h
 * `docs/TELEGRAM-POOL.md`, `UPSTREAMS.md`, and `LICENSES.md` documenting deployment, provenance, and licenses.
 
 ### Removed
-* The native Windows admin application and its build, release, installer and licensing paths. The server's browser dashboard at `http://127.0.0.1:8788` is the admin interface.
+* The legacy `/v1/previews`, `/v1/lookup`, VTT, capability-image and sprite-sheet player surfaces; the browser dashboard is the only owner interface.
+* The Windows desktop-service installer and frozen Windows server build. Windows servers can still run from source.
+* On-demand sheet composition and the old title-library lookup and remapping code. Dashboard NVMT generation keeps the shared extraction worker.
 
 ## [0.2.0] - 2026-10-19
 

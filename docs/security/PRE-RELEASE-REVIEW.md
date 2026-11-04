@@ -1,4 +1,6 @@
-# Pre-release security review
+# Archived pre-release security review
+
+This report describes the 0.2.0 product before F4 removed the player preview API, guest stream contributions, and Windows frozen build. It is historical evidence for that release, not a review of the current NVMT pool product. Use `SECURITY-MODEL.md` and the current automated suite for present behavior.
 
 This is a record of one adversarial review done before the first public release. It is **not an independent professional audit.** Three
 reviewers, each an AI agent that had not seen the code before, attacked isolated copies of the release candidate: (1) the API, authentication,

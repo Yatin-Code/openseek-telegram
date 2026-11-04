@@ -1,7 +1,7 @@
-"""Logging with redaction (SR-20).
+"""Logging with redaction.
 
-Rules: log output never contains query strings, userinfo, bearer tokens, capability
-segments, pairing codes or forwarded headers; hosts are reduced to a short salted hash.
+Rules: log output never contains query strings, userinfo, bearer tokens, pairing codes or
+forwarded headers; hosts are reduced to a short salted hash.
 Our own code never passes URLs to the logger in the first place (it logs `host_tag()`
 values); the formatter-level scrubber below is defence in depth for exception text and
 third-party log lines (uvicorn access log).
@@ -19,7 +19,6 @@ _SALT = os.urandom(16)  # per-process: host tags are not linkable across restart
 
 _URL_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.-]{1,15})://([^\s'\"<>/?#]*)([^\s'\"<>]*)")
 _BEARER_RE = re.compile(r"(?i)\b(bearer)\s+[A-Za-z0-9._~+/=-]+")
-_CAP_RE = re.compile(r"/v1/c/[^/\s?\"']+")
 _PROXY_RE = re.compile(r"/j/[0-9a-fA-F]{8,}")
 _QUERY_RE = re.compile(r"\?[^\s\"']*")
 _TOKENISH_RE = re.compile(r"\b[A-Za-z0-9_-]{43}\b")          # 32-byte base64url tokens
@@ -51,7 +50,6 @@ def redact(text: str) -> str:
         return text
     text = _URL_RE.sub(_url_sub, text)
     text = _BEARER_RE.sub(r"\1 [redacted]", text)
-    text = _CAP_RE.sub("/v1/c/[cap]", text)
     text = _PROXY_RE.sub("/j/[cap]", text)
     text = _QUERY_RE.sub("?[redacted]", text)
     text = _HDR_RE.sub(lambda m: m.group(1) + ": [redacted]", text)
@@ -77,13 +75,12 @@ class RedactingFormatter(logging.Formatter):
 
 class AccessLogFilter(logging.Filter):
     """uvicorn.access passes (client, method, path, http_version, status) as args.
-    Strip the query string and capability segment before formatting."""
+    Strip the query string before formatting."""
 
     def filter(self, record: logging.LogRecord) -> bool:
         args = record.args
         if isinstance(args, tuple) and len(args) >= 3 and isinstance(args[2], str):
             path = args[2].split("?", 1)[0]
-            path = _CAP_RE.sub("/v1/c/[cap]", path)
             record.args = (args[0], args[1], path) + tuple(args[3:])
         return True
 

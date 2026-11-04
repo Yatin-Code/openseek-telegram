@@ -28,7 +28,7 @@ The benchmark harness has its own tests in `bench/tests` (`bench/requirements.tx
 * Python 3.12, type hints where they help, `from __future__ import annotations`. Match the surrounding style; keep functions small and comments factual.
 * No `shell=True`, no `os.system`; subprocesses take argument lists.
 * Never log URLs, tokens, headers or ids from clients; log salted host tags (`logutil.host_tag`). Never persist stream URLs.
-* Any change to the outbound policy, authentication, listeners or Contributor Mode needs tests, including negative tests.
+* Any change to the outbound policy, authentication, listeners or shared-pool write permissions needs tests, including negative tests.
 * Do not add an environment switch that weakens the destination policy.
 * Keep dependencies minimal and pinned; new dependencies need a licence check.
 

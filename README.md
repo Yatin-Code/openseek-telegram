@@ -1,235 +1,44 @@
-# OpenSeek Telegram Pool
-<img width="2172" height="724" alt="OpenSeek: self-hosted thumbnail sharing" src="docs/images/banner.png" />
+# OpenSeek
 
-OpenSeek Telegram Pool is OpenSeek with an optional shared tile layer. Each participating OpenSeek instance
-does its own video probing, frame decoding and JPEG generation. The shared pool accepts those completed JPEG
-tiles, indexes them in SQLite, stores the blobs as documents in a private Telegram channel, and returns exact-file
-tiles to other OpenSeek instances over HTTPS. The pool never receives a video URL and never decodes video.
+OpenSeek is the shared NVMT package pool. Telegram is the permanent storage pool. Local SQLite or the Vercel Supabase index helps find packages and can be rebuilt from Telegram. Vercel may use temporary staging while it uploads a package.
 
-Status: OpenSeek v0.2.0 base with an experimental Telegram pool extension. See [Status and limitations](#status-and-limitations).
-License: [AGPL-3.0-or-later](LICENSE).
+Nuvio generates NVMT on the device when playback has no usable pool match. OpenSeek does not generate thumbnails during playback. An owner can start NVMT generation from the browser dashboard. Vercel limits that function to 300 seconds; longer generation work can fail on Vercel. Local and VPS installs run outside that function limit.
 
-## Features
+The browser dashboard is the only admin interface. There is no desktop app.
 
-* On-demand extraction: tiles near the scrub position first (latest request wins), then the playhead window,
-  then a progressive overview (60 s, 30 s, 10 s grid), at a bounded background rate.
-* Bounded reads: preflight requires `206 Partial Content`; per-job byte budget; optional multi-range
-  (multipart/byteranges) prefetch; optional global request pacing.
-* Playback guard (optional): pauses background extraction when the client reports a rebuffer, telemetry goes
-  stale, or the source stalls, so extraction does not compete with the owner's own streaming.
-* Thumbnail cache and library: tiles are stored individually (320x180 JPEG), sheets (3200x1800) are composed on demand;
-  LRU-by-bytes eviction and retention. An opt-in title index (IMDb/TMDB ids, season, episode) lets another release of the
-  same title reuse cached thumbnails, flagged as approximate, with per-device offsets and rejections.
-* Device pairing (OSP1): an 8-symbol code, PBKDF2 key derivation bound to the server's certificate pin, mutual proofs.
-  Self-signed ECDSA P-256 certificate; clients pin the SPKI.
-* Optional public guest listener (off by default): invite-only, deny-by-default, per-address rate limits and blocks.
-* Contributor Mode (off by default): trusted guests may contribute thumbnails from their own link, under an
-  allowlisted-host, https-only, SSRF-safe policy and a work-conserving scheduler that yields to the owner.
-* Optional Telegram-backed shared tile pool: use a host API or let instances index one private Telegram group/channel
-  directly. Channel mode reads exact-fingerprint tiles and publishes opted-in JPEGs without a pool API host.
-* Browser dashboard at `http://127.0.0.1:8788`: server status, pairing, devices, sharing, title index, cache and pool controls.
+## Run OpenSeek
 
-## Architecture
+Install Python 3.12 or newer. From the repository:
 
-```mermaid
-flowchart LR
-  C["Media client<br/>(paired device)"] -- "HTTPS, pinned: POST /v1/previews<br/>URL + headers in the body" --> API
-  subgraph S["OpenSeek server"]
-    API["API listener :8787<br/>auth, capability URLs"]
-    ADM["Admin :8788<br/>loopback only"]
-    PUB["Public guest listener :8789<br/>(optional)"]
-    JOBS["Jobs + scheduler"]
-    W["Worker subprocess<br/>PyAV over loopback range proxy"]
-    CACHE[("Cache + SQLite")]
-    API --> JOBS --> W --> CACHE
-    PUB --> JOBS
-    API --> CACHE
-  end
-  W -- "vetted HTTP range reads" --> SRC["Media host / CDN"]
-  C -- "capability URL: thumbs.vtt, tiles, sheets" --> API
-  OWN["Owner: CLI / browser dashboard"] --> ADM
-  API -. "exact tile lookup / opted-in upload" .-> POOL["Shared pool API on a participating host"]
-  POOL --> TG["Private Telegram channel<br/>JPEG documents"]
-```
+    cd backend
+    python -m venv .venv
+    .venv/bin/pip install -r requirements.txt -c requirements-lock.txt
+    .venv/bin/python -m openseek serve
 
-The shared pool carries finished tiles between instances. Each instance retains its own source fetching and
-frame-decoding workload. A participant can host the pool API on an existing OpenSeek server; a separate pool
-machine is not required.
+On Windows, use .venv\Scripts\pip and .venv\Scripts\python instead. Docker setup is in docs/INSTALL.md. For the Vercel deployment profile, see docs/VERCEL.md.
 
-More detail: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+Open the browser dashboard at http://127.0.0.1:8788. It provides Telegram setup, pairing, pool controls and explicit NVMT generation. On Vercel, use the deployed URL and admin secret.
 
-## Quick start
+## Pool model
 
-### Windows: one installer (recommended)
+- Telegram is the canonical, durable package store.
+- SQLite on local/VPS installs and Supabase on Vercel are indexes that can be rebuilt from Telegram.
+- Vercel staging is temporary. It queues uploads; it does not replace Telegram as package storage.
+- A pool node reads and gives NVMT packages. Nuvio and the dashboard can upload packages.
+- OpenSeek does not receive video URLs from Nuvio playback requests.
+- Pool reads and writes use the API documented in docs/api/CONTRACT-v1.md.
 
-1. Download **`OpenSeekSetup-v0.2.0-Windows-x64.exe`** from the [latest release](https://github.com/obadevyh/openseek/releases/latest) and run it. Windows will ask for administrator approval, and SmartScreen may warn because the installer is not code-signed (check the SHA-256 on the release page, then "More info" > "Run anyway").
-2. That is all. OpenSeek is installed as a background Windows service that starts with Windows. Open **http://127.0.0.1:8788** in a browser for the admin dashboard; the admin secret is in `C:\ProgramData\OpenSeek\admin.token` (append it after `#` in the address). No Python, Docker, FFmpeg, PowerShell or configuration files are needed.
-3. To connect a TV, start a pairing window on the dashboard, then enter the address and one-time code it shows into the TV app (same home network).
+## Security
 
-The installer opens one Windows Firewall rule (this program only, local network only), keeps your data in `C:\ProgramData\OpenSeek` (private to you and the service), never touches your router and never enables internet sharing. Configuration and unattended-install switches: [docs/INSTALL.md](docs/INSTALL.md).
-
-### Manual setup (other platforms, developers)
-
-Requirements: Python 3.12 or newer. FFmpeg libraries come with the `av` (PyAV) wheel; no separate ffmpeg install is needed to run the server (ffmpeg is only used to generate test fixtures).
-
-Windows (PowerShell):
-
-```powershell
-cd backend
-python -m venv .venv
-.venv\Scripts\pip install -r requirements.txt -c requirements-lock.txt
-$env:OPENSEEK_DATA_DIR = "$env:LOCALAPPDATA\OpenSeek\data"
-.venv\Scripts\python -m openseek serve
-```
-
-Linux:
-
-```sh
-cd backend
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt -c requirements-lock.txt
-OPENSEEK_DATA_DIR=$HOME/.local/share/openseek .venv/bin/python -m openseek serve
-```
-
-Docker (see [docs/INSTALL.md](docs/INSTALL.md); the image has not been built by the maintainers' tooling yet):
-
-```sh
-docker compose up -d
-docker compose exec openseek python -m openseek pair
-```
-
-In another terminal on the same machine run `python -m openseek pair`. It opens a 10-minute pairing window and prints a
-one-time code and the server's certificate pin. Enter the code, the server address and (if your client asks) the pin in your client.
-`python -m openseek devices` lists paired devices and `python -m openseek revoke <device_id>` removes one.
-
-For the Vercel channel-pool profile, see [docs/VERCEL.md](docs/VERCEL.md).
-
-## Configuration
-
-All settings are environment variables read at start-up. Invalid values stop the server with a configuration error. The browser setup wizard saves Telegram settings in the owner-only `<data>/.env` file; process environment variables override values from that file.
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `OPENSEEK_DATA_DIR` | `data` | Database, secret key, TLS identity, cache |
-| `OPENSEEK_HOST` / `OPENSEEK_PORT` | `0.0.0.0` / `8787` | HTTPS API listener |
-| `OPENSEEK_ADMIN_PORT` | `8788` | Admin listener, always bound to 127.0.0.1; every call except the dashboard page needs the admin secret |
-| `OPENSEEK_ADMIN_TOKEN` | random, in `<data>/admin.token` | Local/VPS optional override; required owner secret on Vercel (at least 16 characters) |
-| `OPENSEEK_PUBLIC_TLS_PIN` | unset | Vercel only: deployed HTTPS certificate SPKI pin used by paired Nuvio clients |
-| `OPENSEEK_CRON_SECRET` or `CRON_SECRET` | empty | Bearer secret for the Vercel tick (`GET` for scheduled calls; `POST` for manual calls). `CRON_SECRET` is the Vercel Cron name. When empty, the generated admin token is the only accepted credential |
-| `OPENSEEK_PUBLIC_PORT` | `0` (off) | Internet-facing guest listener; must differ from the other ports |
-| `OPENSEEK_PUBLIC_BIND` | `0.0.0.0` | Bind address of the guest listener |
-| `OPENSEEK_PUBLIC_HOST` | empty | `name.example.org:443`, advertised in invitations and capability URLs |
-| `OPENSEEK_TLS_CERT_FILE` | generated cert | Optional PEM certificate for a publicly trusted HTTPS endpoint |
-| `OPENSEEK_TLS_KEY_FILE` | generated key | Matching PEM private key; configure with the certificate as a pair |
-| `OPENSEEK_CACHE_MAX_BYTES` | 2 GiB | Cache cap (LRU eviction, minimum 16 MiB) |
-| `OPENSEEK_RETENTION_DAYS` | `30` | Drop titles unused for this long |
-| `OPENSEEK_BG_MBPS` | `8` | Background (overview) byte-rate cap, Mbit/s |
-| `OPENSEEK_JOB_BYTES` | 4 GiB | Per-job upstream byte budget (minimum 1 MiB) |
-| `OPENSEEK_TOLERANCE_S` | `5` | Preview tolerance, 0 < t <= 5 |
-| `OPENSEEK_PREGEN` | `full` | `off`, `overview` or `full` background generation |
-| `OPENSEEK_MAX_ACTIVE_SOURCES` | `2` | Sources with a live worker; beyond this `429 busy` |
-| `OPENSEEK_WORKERS_PER_SOURCE` | `1` | Parallel extraction workers per source (1 to 4) |
-| `OPENSEEK_MAX_JOBS_PER_DEVICE` | `1` | A device's older active job is stopped when it starts another |
-| `OPENSEEK_IDLE_TIMEOUT_S` | `600` | Worker stopped after this long without client activity |
-| `OPENSEEK_FRAME_TIMEOUT_S` | `30` | Hard per-frame timeout |
-| `OPENSEEK_CREATE_WAIT_S` | `4` | How long `POST /v1/previews` waits for the preflight |
-| `OPENSEEK_ALLOWED_PORTS` | `80,443,8080,8443` | Allowed upstream ports |
-| `OPENSEEK_ALLOW_HTTP_SOURCES` | `1` | Allow plain `http://` sources (public addresses only) |
-| `OPENSEEK_ALLOW_PUBLIC_CLIENTS` | `0` | Accept non-private client IPs on the owner API. Needs `OPENSEEK_ALLOW_PUBLIC_CLIENTS_ACK=owner-api-is-public` as well; prefer the guest listener |
-| `OPENSEEK_PUBLISHED_ON` | none | Containers only (set by the compose file): the host address the port is published on. The server refuses to start unless it is loopback or a private LAN address |
-| `OPENSEEK_ALLOW_SHARED_DATA_DIR` | `0` | Windows: start even if other local users can write to the data directory (not recommended) |
-| `OPENSEEK_UPSTREAM_RPS` | `0` (off) | Global upstream request pacing (0 to 100) |
-| `OPENSEEK_MULTIRANGE_PREFETCH` / `OPENSEEK_MULTIRANGE_BATCH` | `0` / `8` | Experimental multi-range prefetch; windows per request (2 to 16) |
-| `OPENSEEK_PLAYBACK_GUARD` | `0` | Pause background extraction on rebuffer, stale telemetry or CDN stall |
-| `OPENSEEK_GUARD_STALL_S` | `6` | Stall threshold for the guard (1 to 60) |
-| `OPENSEEK_CONTRIB_MBPS` | `16` | Extra byte cap for contributions while the owner is busy |
-| `OPENSEEK_CONTRIB_MAX_SOURCES` | `1` | Concurrent contributed sources (1 to 4) |
-| `OPENSEEK_CONTRIB_HOSTS` | common debrid/CDN hosts | Default contributor host allowlist (editable by the owner) |
-| `OPENSEEK_P2_PAUSE_S`, `OPENSEEK_P1_INTERLEAVE`, `OPENSEEK_HIERARCHICAL`, `OPENSEEK_NEAREST_KEYFRAME` | see `config.py` | Scheduler experiments |
-| `OPENSEEK_ALT_*` | off | Experimental alternative low-resolution source negotiation (`OPENSEEK_ALT_SOURCE` and related); see `backend/openseek/config.py` |
-| `OPENSEEK_CAPTURE_SOURCE_FILE` | empty | Diagnostics: writes the resolved source link to a file. Leave unset |
-| `OPENSEEK_LOG_LEVEL` | `INFO` | Log level |
-| `OPENSEEK_POOL_MODE` | unset | `host` or `channel`; unset means local-only, except legacy `POOL_ENABLED=1` selects host mode |
-| `OPENSEEK_POOL_ENABLED` | `0` | Serve the existing shared-pool API (host mode); requires Telegram credentials and both keys |
-| `OPENSEEK_POOL_URL` | empty | Host-mode shared pool URL; HTTPS except loopback tests |
-| `OPENSEEK_POOL_CONTRIB_URL` | empty | Read-only channel upload proxy target; HTTPS origin plus `POOL_WRITE_KEY` |
-| `OPENSEEK_POOL_READ_KEY` | empty | Pool read secret, at least 24 characters |
-| `OPENSEEK_POOL_WRITE_KEY` | empty | Pool upload or contribution proxy secret, at least 24 characters |
-| `OPENSEEK_POOL_SHARE` | `0` | Publish this instance's already-generated tiles to `POOL_URL` in host mode |
-| `OPENSEEK_POOL_TIMEOUT_S` | `2` | Per-request timeout for shared tile access |
-| `OPENSEEK_TELEGRAM_BOT_TOKEN` | empty | Telegram bot identity; secret |
-| `OPENSEEK_TELEGRAM_CHANNEL_ID` | empty | Private group/channel used by the selected pool mode |
-| `OPENSEEK_TELEGRAM_API_ID` / `OPENSEEK_TELEGRAM_API_HASH` | empty | Telethon MTProto app credentials for channel mode |
-| `OPENSEEK_TELEGRAM_SESSION` | empty | User StringSession or session filename for channel mode |
-| `OPENSEEK_TELEGRAM_SESSION_FILE` | `<data>/telegram/openseek.session` | Explicit mode-0600 user session file |
-| `OPENSEEK_POOL_CHANNEL_SCAN_LIMIT` | `2000` | Maximum Telegram messages scanned per pass |
-| `OPENSEEK_POOL_INDEX_REFRESH_S` | `300` | Channel index refresh interval in seconds |
-| `OPENSEEK_POOL_CHANNEL_WRITABLE` | `auto` | Detect channel post rights or override with `1` / `0` |
-| `OPENSEEK_CONTRIBUTION` | `0` | Opt in to channel-mode uploads |
-| `OPENSEEK_LIBRARIAN` | empty | `@bot` or HTTPS upload relay for channel contributions |
-| `OPENSEEK_LIBRARIAN_KEY` | empty | Optional bearer key for an HTTPS upload relay |
-| `OPENSEEK_LIBRARIAN_ENABLED` | `0` | Run this channel-mode instance as a Telegram DM upload relay |
-
-There is deliberately no variable that relaxes the outbound destination policy. The authoritative list is
-`backend/openseek/config.py`.
-
-## Security summary
-
-* The API is HTTPS only; by default certificates are self-signed and clients pin the public key. A host may configure
-  a matching trusted TLS certificate/key pair for its public listener. No plain-HTTP API.
-* Every route except health and pairing needs a device token; data URLs use expiring HMAC capabilities.
-* Outbound fetching is SSRF-hardened: destinations are resolved once, every address must be public, redirects are followed
-  by OpenSeek (max 5, re-vetted), and the decoder only reads from a loopback range proxy.
-* Stream URLs and headers are kept in memory and, by default, not written to disk or logs (tests check this); logs redact URLs, tokens and codes.
-  The opt-in diagnostic `OPENSEEK_CAPTURE_SOURCE_FILE` is the one exception, so leave it unset.
-* The admin interface is loopback only with Host/Origin checks and a CSRF header.
-* The owner API refuses non-private client addresses unless you opt in. The public guest listener is off by default.
-
-Details: [docs/SECURITY-MODEL.md](docs/SECURITY-MODEL.md). To report a vulnerability see [SECURITY.md](SECURITY.md).
-
-## Responsible use
-
-OpenSeek is free and self-hosted. The project does not provide movie downloads. The optional pool is operated by whoever
-configures it; every contributing OpenSeek owner opts in through `OPENSEEK_POOL_SHARE` (host mode) or
-`OPENSEEK_CONTRIBUTION` (channel mode). You must hold the rights, permissions
-or applicable legal exceptions needed to generate and share thumbnails from the media you point OpenSeek at. This notice does
-not remove anyone's legal responsibility and is not legal advice.
-See [docs/RESPONSIBLE-USE.md](docs/RESPONSIBLE-USE.md).
+OpenSeek validates outbound media URLs for dashboard generation. It keeps the source URL in memory and does not write it to the generation status store. Telegram credentials stay on the server. Nuvio receives pool package data, not Telegram credentials.
 
 ## Documentation
 
-* [docs/INSTALL.md](docs/INSTALL.md): Windows, Linux, Docker, exposing the guest listener
-* [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
-* [docs/TELEGRAM-POOL.md](docs/TELEGRAM-POOL.md): pool deployment, participant setup, and Telegram storage behavior
-* [docs/SECURITY-MODEL.md](docs/SECURITY-MODEL.md)
-* [docs/api/CONTRACT-v1.md](docs/api/CONTRACT-v1.md) and `backend/openapi.json`: the HTTP API, for client authors
-* [docs/RESPONSIBLE-USE.md](docs/RESPONSIBLE-USE.md), [docs/LICENSE-OPTIONS.md](docs/LICENSE-OPTIONS.md)
-* [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), [CHANGELOG.md](CHANGELOG.md), [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
+- docs/INSTALL.md — local and VPS installation
+- docs/VERCEL.md — Vercel setup and limits
+- docs/TELEGRAM-POOL.md — Telegram storage and pool operation
+- docs/ARCHITECTURE.md — service design
+- docs/api/CONTRACT-v1.md — pairing and shared pool API
+- docs/api/HINTS-v2.md — package hint format and ranking
 
-A client for a Nuvio Legacy fork exists as a separate project maintained elsewhere. Any client can use the documented HTTP API.
-
-## License
-
-OpenSeek is free software, licensed under the **GNU Affero General Public License, version 3 or (at your option) any later version** (AGPL-3.0-or-later);
-see [LICENSE](LICENSE). Copyright (C) 2026 the OpenSeek authors. You may use, study, change and share it. If you run a modified version for other people
-over a network, the AGPL (section 13) requires you to offer those users the corresponding source.
-
-OpenSeek's Python dependencies are permissively licensed, except that the `av` (PyAV) wheels bundle FFmpeg libraries built with GPL components; they are
-downloaded onto your machine when you install the requirements and are not part of this repository. For that reason **this project publishes source code and a
-Dockerfile only, not prebuilt Docker images**; build the image yourself with `docker compose up -d --build`. Details: [docs/LICENSE-OPTIONS.md](docs/LICENSE-OPTIONS.md).
-
-## Status and limitations
-
-* Initial experimental release. It has an automated test suite and was put through an adversarial pre-release review (see
-  [docs/security/PRE-RELEASE-REVIEW.md](docs/security/PRE-RELEASE-REVIEW.md), including what could not be tested), but it has **not** been independently
-  audited or security-certified. It is built for a trusted home network: keep the owner API off the internet and use the guest listener for remote devices.
-  Behaviour against every real-world CDN, release type or client has not been verified.
-* MP4 files without a usable index (fragmented, no `mfra`) are not detected up front; the byte budget bounds the cost.
-* Worker memory is bounded only by container or OS limits; extraction runs in a separate process but is not OS-sandboxed.
-* Pairing is password-authenticated key confirmation, not a PAKE.
-* Dependencies are pinned by version (`backend/requirements-lock.txt`), not by hash; `pip-audit` is not wired up.
-* No prebuilt Docker images are published (see License); build from the Dockerfile.
-* The server is developed on Windows and tested in Linux containers.
-* Access logs record client IPs and request times and are not rotated by OpenSeek.
-* The Telegram pool is experimental. Host mode uses shared read/write bearer keys; channel mode keeps a rebuildable
-  SQLite index on each instance and uses Telethon MTProto. Conflicting renders are resolved by first-writer-wins.
-  See [docs/TELEGRAM-POOL.md](docs/TELEGRAM-POOL.md) for mode selection and setup.
+License: AGPL-3.0-or-later.

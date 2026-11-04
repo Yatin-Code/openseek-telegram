@@ -29,7 +29,6 @@ from openseek.jobs import Source
 from openseek.pool import (MAX_NVMT_BYTES, PoolClient, PoolError, PoolService,
                            PoolSync, TelegramBotStore, decode_nvmt, encode_nvmt)
 from openseek.scheduler import tile_count
-from openseek.vtt import render
 
 READ_KEY = "r" * 40
 WRITE_KEY = "w" * 40
@@ -245,10 +244,6 @@ def test_two_instances_share_generated_tile_via_telegram_and_http_contract(tmp_p
         receiver_cache.set_media(fp, duration_ms, n_tiles)
         receiver_cache.put_tile(fp, 1, shared[1], shared[0])
 
-        # Its normal OpenSeek VTT references the local HTTP tile endpoint.
-        vtt = render("https://receiver.example", "cap-value", "preview-value", 123,
-                     "tiles", {1: 10_000}, duration_ms, n_tiles, 5_000)
-        assert "/v1/c/cap-value/preview-value/tiles/1.jpg" in vtt
         assert receiver_cache.tile_bytes(fp, 1) == tile_bytes
 
         # The manifest keeps partial coverage and has no title or source URL.
@@ -303,7 +298,7 @@ def test_two_instances_through_real_asgi_pool_routes(tmp_path, monkeypatch):
             is_open=lambda: True,
             close=lambda: None,
             grab=lambda t_ms, accurate: SimpleNamespace(pts_ms=t_ms, jpeg=original,
-                                                         requests=1, bytes=len(original), via="a"),
+                                                         requests=1, bytes=len(original)),
         )
         budget = SimpleNamespace(requests=0, used=0)
         proxy_source = SimpleNamespace(last_error=None, throttle_seconds=0.0)
@@ -314,7 +309,6 @@ def test_two_instances_through_real_asgi_pool_routes(tmp_path, monkeypatch):
         source.mgr = job_mgr
         source.fp = fp
         source.scheduler = None
-        source.alt = None
         source.stop_flag = False
         source.engines = [decoder]
         source.n_workers = 1

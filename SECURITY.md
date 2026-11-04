@@ -10,8 +10,8 @@ media links, tokens or invitation codes; use synthetic ones.
 
 ## Scope
 
-In scope: the server in `backend/openseek/` (authentication and pairing, capability URLs, the guest and admin listeners, the outbound fetch policy and
-SSRF protections, Contributor Mode policy, logging and redaction, the cache), the Docker files, and the Windows installer.
+In scope: the server in `backend/openseek/` (authentication and pairing, the pool API, Telegram and Supabase integrations,
+dashboard generation, the outbound fetch policy and SSRF protections, logging and redaction, the cache), and deployment files.
 
 Out of scope: vulnerabilities in third-party dependencies that are not reachable through OpenSeek (report them upstream), attacks that need
 control of the host or of the data directory, denial of service by a device the owner has already authorised within its quotas, a deployment that
@@ -19,7 +19,7 @@ deliberately forwards the owner API to the internet, and the legal status of med
 
 ## Supported versions
 
-Only the latest released version (currently 0.1.x) receives security fixes.
+Only the latest released version receives security fixes.
 
 ## What to expect
 

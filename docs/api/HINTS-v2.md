@@ -1,8 +1,7 @@
 # Hints API v2 — NVMT shared pool
 
 Status: frozen for implementation (ticket A1).
-Applies to **NVMT packages only**. The preview/VTT API is a separate product surface and is never used by the
-pool path. See `docs/api/CONTRACT-v1.md` for transport, auth, and the existing pool endpoints.
+Applies to **NVMT packages only**. See `docs/api/CONTRACT-v1.md` for transport, auth, and pool endpoints.
 
 ## Identity model
 

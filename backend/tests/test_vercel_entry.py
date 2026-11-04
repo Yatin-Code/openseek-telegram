@@ -8,7 +8,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from openseek.app import Core
+from openseek.app import Core, create_api_app
 from openseek.auth import DeviceAuth
 from openseek.config import Settings
 from openseek.pairing import InviteManager, PairingManager, client_proof, derive_key
@@ -168,7 +168,6 @@ def test_vercel_owner_pairing_uses_durable_state_and_separate_owner_auth(tmp_pat
     store = RemoteAdminStore(client)
     core.state_store = store
     core.auth = DeviceAuth(core.db, store=store)
-    core.library.settings_store = store
     core.uploads.store = RemoteUploadQueueStore(client)
     core.invites = InviteManager(store, core.spki_pin, core.auth.register, iterations=200_000)
     core.pairing = PairingManager(core.spki_pin, core.auth.register, invites=core.invites)
@@ -181,9 +180,8 @@ def test_vercel_owner_pairing_uses_durable_state_and_separate_owner_auth(tmp_pat
         assert "const PROFILE='vercel'" in dashboard.text
         assert "OPENSEEK_ADMIN_TOKEN" in dashboard.text
         assert "const PAIR_KEY='oskPairing'" in dashboard.text
-        core.library.set_enabled(True)
-        assert store.get_setting("metadata_index") == "1"
-        core.library.set_enabled(False)
+        route_paths = {route.path for route in create_api_app(core).app.routes}
+        assert not any(path.startswith(("/v1/previews", "/v1/lookup", "/v1/c/")) for path in route_paths)
         assert request(app, "GET", "/admin/status").status_code == 403
         assert request(app, "GET", "/admin/status", token="x" * 43).status_code == 403
         assert request(app, "GET", "/admin/status", owner=ADMIN_TOKEN,

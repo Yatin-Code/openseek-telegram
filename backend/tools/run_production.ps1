@@ -3,19 +3,17 @@
 
     tools\run_production.ps1                       # multi-range ON (the default of this script)
     tools\run_production.ps1 -MultiRange 0         # same code, multi-range OFF  (the quick switch back)
-    tools\run_production.ps1 -Guard 0              # playback guard OFF (it pauses background extraction on rebuffer / CDN stall)
     tools\run_production.ps1 -MultiRange 0 -CodeTag production-pre-multirange   # full code rollback
     tools\run_production.ps1 -PublicHost name.example.org:443                   # ALSO start the guest-only public listener (8789)
     tools\run_production.ps1                                                    # without -PublicHost the public listener is OFF
 
   It only ever stops the process that LISTENS on 8787 after checking that its command line is "openseek serve" (and its
   launcher parent, if that is one too). The data directory (thumbnail cache, pairing, TLS identity) is never touched.
-  Settings: 3 RPS, 64 Mbit/s background cap, full pre-generation, 5 s
-  tolerance, 2 workers per source (override with -Workers). Logs: <data dir>\logs\serve-<time>.log (no URLs or tokens).
+  Settings: 3 RPS, 64 Mbit/s background cap, 5 s tolerance, 2 workers per source
+  (override with -Workers). Logs: <data dir>\logs\serve-<time>.log (no URLs or tokens).
 #>
 param(
   [int]$MultiRange = 1,
-  [int]$Guard = 1,
   [int]$Workers = 2,
   [string]$CodeTag = "",
   [string]$Data = (Join-Path $env:LOCALAPPDATA "OpenSeek\data"),
@@ -51,13 +49,11 @@ if ($CodeTag) {
 
 $env:OPENSEEK_DATA_DIR = $Data
 $env:OPENSEEK_BG_MBPS = "64"
-$env:OPENSEEK_PREGEN = "full"
 $env:OPENSEEK_TOLERANCE_S = "5"
 $env:OPENSEEK_UPSTREAM_RPS = "3"
 $env:OPENSEEK_WORKERS_PER_SOURCE = "$Workers"
 $env:OPENSEEK_MULTIRANGE_PREFETCH = "$MultiRange"
 $env:OPENSEEK_MULTIRANGE_BATCH = "8"
-$env:OPENSEEK_PLAYBACK_GUARD = "$Guard"
 if ($PublicHost) {
   $env:OPENSEEK_PUBLIC_PORT = "$PublicPort"
   $env:OPENSEEK_PUBLIC_HOST = $PublicHost
@@ -70,7 +66,7 @@ New-Item -ItemType Directory -Force $logs | Out-Null
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $proc = Start-Process -FilePath $py -ArgumentList "-m", "openseek", "serve" -WorkingDirectory $backend -WindowStyle Hidden -PassThru `
   -RedirectStandardOutput (Join-Path $logs "serve-$stamp.log") -RedirectStandardError (Join-Path $logs "serve-$stamp.err.log")
-Write-Host "started openseek serve pid $($proc.Id): multi-range=$MultiRange guard=$Guard workers=$Workers rps=3 bg=64Mbit/s data=$Data"
+Write-Host "started openseek serve pid $($proc.Id): multi-range=$MultiRange workers=$Workers rps=3 bg=64Mbit/s data=$Data"
 Start-Sleep -Seconds 6
 $up = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
 if ($up) { Write-Host "listening on $Port" } else { Write-Host "NOT listening yet - check $logs\serve-$stamp.err.log" }

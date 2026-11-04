@@ -1,7 +1,6 @@
-"""Device tokens (SR-5) and capability URLs (SR-7)."""
+"""Paired-device bearer token authentication."""
 from __future__ import annotations
 
-import base64
 import hashlib
 import hmac
 import os
@@ -13,7 +12,6 @@ from pathlib import Path
 from .db import DB
 from .ids import new_device_id
 
-CAP_MAX_TTL_S = 6 * 3600
 _TOKEN = re.compile(r"[A-Za-z0-9_-]{43}")
 
 
@@ -86,32 +84,6 @@ class DeviceAuth:
 
     def set_contribute(self, device_id: str, enabled: bool) -> bool:
         return self.store.set_contribute(device_id, enabled)
-
-
-class CapSigner:
-    """cap = base64url(HMAC-SHA256(server_secret, device_id || preview_id || exp))[0:32]."""
-
-    def __init__(self, secret: bytes, clock=time.time):
-        if len(secret) < 32:
-            raise ValueError("secret too short")
-        self.secret = secret
-        self.clock = clock
-
-    def cap(self, device_id: str, preview_id: str, exp: int) -> str:
-        mac = hmac.new(self.secret, f"{device_id}{preview_id}{int(exp)}".encode(), hashlib.sha256).digest()
-        return base64.urlsafe_b64encode(mac).rstrip(b"=").decode()[:32]
-
-    def current_exp(self) -> int:
-        """Hour-bucketed expiry: URLs stay byte-identical for an hour (clients keep textures keyed
-        by URL) while always satisfying exp <= now + 6 h."""
-        now = int(self.clock())
-        return (now // 3600) * 3600 + CAP_MAX_TTL_S
-
-    def verify(self, cap: str, device_id: str, preview_id: str, exp: int) -> bool:
-        now = self.clock()
-        if not (now < exp <= now + CAP_MAX_TTL_S):
-            return False
-        return hmac.compare_digest(self.cap(device_id, preview_id, exp), cap)
 
 
 def admin_token(data_dir: Path, configured: str = "") -> str:

@@ -12,13 +12,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 import multirange_compare as mc  # noqa: E402
 from helpers import make_policy  # noqa: E402
 
-from helpers import FIXTURES as ALT, FIXTURES_HINT
-FILE = ALT / "ok_10min.mkv"
-pytestmark = pytest.mark.skipif(not FILE.exists(), reason=FIXTURES_HINT)
 
-
-def _server(multi: bool = True):
-    data = FILE.read_bytes()
+def _server(path: Path, multi: bool = True):
+    data = path.read_bytes()
     log = {"requests": 0}
 
     class H(BaseHTTPRequestHandler):
@@ -60,11 +56,20 @@ def _server(multi: bool = True):
     return httpd, O, len(data), log
 
 
-def test_windows_come_from_the_index_of_this_exact_file_and_both_arms_return_identical_bytes():
-    httpd, o, size, log = _server()
+def _run(link, policy, size):
+    try:
+        return mc.run(link, policy, size, rps=1000, first_slot=5, n=8)
+    except mc.Unexpected as exc:
+        if str(exc).startswith("no index entry"):
+            pytest.skip("this PyAV build does not expose usable container keyframe indexes")
+        raise
+
+
+def test_windows_come_from_the_index_of_this_exact_file_and_both_arms_return_identical_bytes(media):
+    httpd, o, size, log = _server(media / "main.mkv")
     try:
         link = f"http://127.0.0.1:{o.port}/f.mkv"
-        rep = mc.run(link, make_policy([o]), size, rps=1000, first_slot=5, n=8)
+        rep = _run(link, make_policy([o]), size)
         assert "stopped" not in rep, rep
         assert rep["bytes_identical_per_window"] == [True] * 8
         assert rep["multi"]["parts"] == 8 and rep["multi"]["parts_ok"] and rep["multi"]["requests"] == 1
@@ -76,21 +81,21 @@ def test_windows_come_from_the_index_of_this_exact_file_and_both_arms_return_ide
         httpd.shutdown()
 
 
-def test_a_different_file_size_is_refused_before_any_window_is_requested():
-    httpd, o, size, log = _server()
+def test_a_different_file_size_is_refused_before_any_window_is_requested(media):
+    httpd, o, size, log = _server(media / "main.mkv")
     try:
         link = f"http://127.0.0.1:{o.port}/f.mkv"
         with pytest.raises(mc.Unexpected):
-            mc.run(link, make_policy([o]), size + 1, rps=1000, first_slot=5, n=8)
+            _run(link, make_policy([o]), size + 1)
     finally:
         httpd.shutdown()
 
 
-def test_single_range_only_server_stops_the_multi_arm():
-    httpd, o, size, log = _server(multi=False)
+def test_single_range_only_server_stops_the_multi_arm(media):
+    httpd, o, size, log = _server(media / "main.mkv", multi=False)
     try:
         link = f"http://127.0.0.1:{o.port}/f.mkv"
-        rep = mc.run(link, make_policy([o]), size, rps=1000, first_slot=5, n=8)
+        rep = _run(link, make_policy([o]), size)
         assert "stopped" in rep and "multi" not in rep
     finally:
         httpd.shutdown()

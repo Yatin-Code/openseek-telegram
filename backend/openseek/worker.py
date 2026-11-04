@@ -135,14 +135,10 @@ class GrabResult:
     jpeg: bytes
     requests: int = 0
     bytes: int = 0
-    via: str = "a"          # "b" when produced from an alternative thumbnail source
 
 
 def worker_argv() -> list[str]:
-    """The worker's argument vector. Frozen (PyInstaller): the same executable with a marker
-    argument (see run_server.py); otherwise an isolated interpreter running the bootstrap."""
-    if getattr(sys, "frozen", False):
-        return [sys.executable, "--openseek-worker"]
+    """Run the extraction worker in an isolated interpreter with the package directory supplied explicitly."""
     return [sys.executable, "-I", "-c", _BOOT, PACKAGE_PARENT]
 
 

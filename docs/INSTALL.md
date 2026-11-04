@@ -2,26 +2,9 @@
 
 OpenSeek needs Python 3.12 or newer (pins in `backend/requirements.txt`). The ffmpeg libraries are bundled in the `av` wheel.
 Pick a data directory outside the source tree and back it up if you want to keep your pairings and cache: it holds the
-database, the TLS identity (`tls/`), the capability key (`secret.key`) and the thumbnail cache.
+database, the TLS identity (`tls/`), the admin token and the local extraction cache.
 
-## Windows installer (recommended)
-
-`OpenSeekSetup-v0.2.0-Windows-x64.exe` (GitHub releases) installs the server as a Windows service. It needs administrator approval once.
-
-What it sets up:
-* **The server as a Windows service** named `OpenSeek` (automatic, delayed start; restarts itself after a crash), running as the restricted virtual account `NT SERVICE\OpenSeek` with only the privileges it needs. The program is in `C:\Program Files\OpenSeek`.
-* **Data** in `C:\ProgramData\OpenSeek` (database, cache, TLS certificate, admin secret, logs, `config.json`). Only SYSTEM, Administrators, the service and the Windows user who installed can read it. That user can also start/stop the service from Windows without an administrator prompt. Another Windows user who wants the dashboard can run the installer from their own account.
-* **One firewall rule**, "OpenSeek (home network)": TCP, this program only, the server's port only, **local subnet only**, on any network profile (many home networks are classed "Public"). The admin interface listens on 127.0.0.1 only and has no rule. The installer does not change router settings and does not enable internet sharing.
-* **Ports:** 8787 (API) and 8788 (admin, this PC only), or the next free ones (18787, 28787, ...) if something else uses them; the dashboard shows the right address.
-* **Uninstall** entry in the Start Menu and in Windows Settings > Apps.
-
-Unattended: `OpenSeekSetup-v0.2.0-Windows-x64.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART` (add `/PORT=n /ADMINPORT=n` to choose ports). Uninstall: `"C:\Program Files\OpenSeek\unins000.exe" /VERYSILENT` keeps your data; add `/DELETEDATA=1` to remove it as well.
-
-Connecting a TV: open the admin dashboard (see "Admin secret" below) and start a pairing window. It shows this PC's home-network address and a one-time pairing code (valid 10 minutes, single use) and tells you when the TV has paired. Nothing changes if you never use remote sharing or Contributor Mode; both are optional.
-
-Upgrading from v0.1.0: install this version. Servers set up manually keep working with the browser dashboard, which uses the same data directory and admin secret, but the installed service and a manually started server must not use the same ports.
-
-## Windows, manual setup from source
+## Windows, run the server from source
 
 ```powershell
 cd backend
@@ -36,7 +19,7 @@ The server prints its LAN address(es), the certificate pin and the admin URL. Pa
 
 **Keep the source checkout and the data directory inside your own user profile** (for example `%LOCALAPPDATA%\OpenSeek\data`, the default
 used above). A folder at the root of another drive such as `D:\` usually inherits permissions that let every local user read it, and
-the data directory holds the TLS private key, the capability key (`secret.key`), the admin secret (`admin.token`) and the invitation database.
+the data directory holds the TLS private key, admin secret (`admin.token`) and invitation database.
 If the server finds such a data directory it logs a warning at start-up.
 
 Windows Firewall: when Windows asks, untick **Public networks**. Better, create the rule yourself so that it covers only this Python,
@@ -47,7 +30,7 @@ New-NetFirewallRule -DisplayName "OpenSeek API (LAN only)" -Direction Inbound -A
   -Program "C:\path\to\openseek\backend\.venv\Scripts\python.exe" -Profile Private -RemoteAddress LocalSubnet
 ```
 
-The router must not forward 8787 or 8788.
+The router must not forward 8787 or 8788. OpenSeek has no Windows installer; the browser dashboard is served by the running server.
 
 ### Optional: Telegram channel pool node
 
@@ -84,12 +67,12 @@ against other local users, other local programs and containers that can reach th
 ### Optional: `backend/tools/run_production.ps1`
 
 A convenience script that (re)starts the server in the background with a fixed set of everyday settings (background cap 64 Mbit/s,
-full pre-generation, 2 workers per source, request pacing 3/s, multi-range prefetch and playback guard on). Read it before use and adapt
+2 workers per source, request pacing 3/s and multi-range prefetch on). Read it before use and adapt
 the values to your link.
 
 ```powershell
 backend\tools\run_production.ps1                                  # start or restart on 8787 (data in %LOCALAPPDATA%\OpenSeek\data)
-backend\tools\run_production.ps1 -MultiRange 0 -Guard 0
+backend\tools\run_production.ps1 -MultiRange 0
 backend\tools\run_production.ps1 -PublicHost name.example.org:443   # also start the guest listener
 ```
 
@@ -111,7 +94,7 @@ sudo python3 -m venv .venv && sudo .venv/bin/pip install -r requirements.txt -c 
 
 ```ini
 [Unit]
-Description=OpenSeek seek-preview server
+Description=OpenSeek pool server
 After=network-online.target
 Wants=network-online.target
 
@@ -119,7 +102,6 @@ Wants=network-online.target
 User=openseek
 WorkingDirectory=/opt/openseek/backend
 Environment=OPENSEEK_DATA_DIR=/var/lib/openseek
-Environment=OPENSEEK_PLAYBACK_GUARD=1
 ExecStart=/opt/openseek/backend/.venv/bin/python -m openseek serve
 Restart=on-failure
 NoNewPrivileges=true
@@ -191,12 +173,12 @@ How this stays safe:
 The guest listener serves invited guest devices only; the owner API never needs internet exposure. It is off unless `OPENSEEK_PUBLIC_PORT` is set.
 
 1. Choose a DNS name that points to your public address (a dynamic DNS service works; `backend/tools/duckdns.ps1` is a helper for one such service on Windows).
-2. Set `OPENSEEK_PUBLIC_PORT=8789` and `OPENSEEK_PUBLIC_HOST=name.example.org:443` and restart. The host is used to build the URLs placed in invitations and capability links; it is never taken from a client header.
+2. Set `OPENSEEK_PUBLIC_PORT=8789` and `OPENSEEK_PUBLIC_HOST=name.example.org:443` and restart. The host is used in invitations; it is never taken from a client header.
 3. On your router, forward TCP 443 to port 8789 of the server only. Never forward 8787 or 8788. Give the server a fixed LAN address.
 4. Turn sharing on and create an invitation (admin API `POST /admin/invites {"public": true}` or the browser dashboard). Send the join string or short code to the guest.
 5. From another network, check with `python backend/tools/public_probe.py name.example.org:443 --pin "sha256//..."` (exit code 0 = all checks passed).
 
-Guests are read-only by default; Contributor Mode additionally needs the owner to switch contributions on and grant the device the permission
+Guests are read-only by default; publishing NVMT packages also needs the owner to turn on guest NVMT contributions in the dashboard and grant the device write permission
 (see `docs/SECURITY-MODEL.md`). Kill switches: sharing off (`PUT /admin/sharing {"enabled": false}`) stops every guest call at once;
 `DELETE /admin/devices/<id>` revokes one device; removing the router rule closes the entrance. Per-address limits are applied on the public listener
 and blocks can be lifted with `DELETE /admin/public/blocks` (loopback, with the admin secret in `X-OpenSeek-Admin`).

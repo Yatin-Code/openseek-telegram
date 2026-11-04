@@ -128,7 +128,7 @@ class GenerationService:
             hints = {"imdb": imdb, "season": season, "episode": episode, "filename": filename}
             try:
                 job = self.core.jobs.create(
-                    f"dashboard:{generation_id}", source_url, {}, None, 0, "tiles")
+                    generation_id, source_url, {})
             except Exception as exc:
                 code = "source_forbidden" if type(exc).__name__ == "SourceForbidden" else (
                     "busy" if type(exc).__name__ == "Busy" else "source_unavailable")
@@ -148,8 +148,10 @@ class GenerationService:
                 status = self.store.get(generation_id)
                 if status is None or status["state"] == "cancelled":
                     return
+                source = self.core.jobs.sources.get(job.fp) if job.fp else None
+                if source is not None:
+                    source.touch()
                 snap = self.core.jobs.snapshot(job)
-                self._force_full_schedule(job)
                 state, error = self.core.jobs.state(job)
                 self.store.update(generation_id, state="generating", fp=job.fp,
                                   duration_ms=snap["source_duration_ms"],
@@ -181,16 +183,6 @@ class GenerationService:
             self.core.jobs.delete(job)
             with self.lock:
                 self.active.pop(generation_id, None)
-
-    def _force_full_schedule(self, job) -> None:
-        if not job.fp:
-            return
-        source = self.core.jobs.sources.get(job.fp)
-        if source is not None:
-            with source.cond:
-                if source.scheduler is not None:
-                    source.scheduler.pregen = "full"
-                    source.cond.notify_all()
 
     def _package(self, job) -> tuple[bytes, str, int, int, str]:
         if not job.fp:

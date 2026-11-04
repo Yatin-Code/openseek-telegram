@@ -38,7 +38,8 @@ def generation_env(tmp_path):
         jobs=SimpleNamespace(
             snapshot=lambda _job: {"source_duration_ms": 20_000, "tiles_done": 2, "tiles_total": 2},
             state=lambda _job: ("complete", None), delete=lambda _job: None,
-            sources={fp: SimpleNamespace(size=12345, cond=threading.Condition(), scheduler=None)}),
+            sources={fp: SimpleNamespace(size=12345, cond=threading.Condition(), scheduler=None,
+                                         touch=lambda: None)}),
     )
     service = GenerationService(core, store)
     yield service, store, pool, core, fp
@@ -60,7 +61,7 @@ def test_generation_state_never_persists_source_url(generation_env):
 def test_generation_packages_valid_nvmt_and_publishes_to_telegram(generation_env):
     service, store, pool, _core, fp = generation_env
     store.create("b" * 32, 1.0)
-    job = SimpleNamespace(fp=fp, generation_profile="nvmt-v1-g10",
+    job = SimpleNamespace(job_id="generation-test", fp=fp, generation_profile="nvmt-v1-g10",
                           generation_hints={"imdb": "tt1234567", "season": 1,
                                             "episode": 2, "filename": "show.mkv"})
     service.run("b" * 32, job)

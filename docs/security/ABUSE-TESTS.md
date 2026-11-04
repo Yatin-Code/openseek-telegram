@@ -51,7 +51,6 @@ Plus:
 ## 5. Storage & privacy
 | test_no_url_on_disk | unique marker in URL path+query | absent from data dir and logs | 15,20 |
 | test_path_traversal_ids | `../`, `%2e%2e`, uppercase, overlong IDs in every path param | 404/422, no file outside data dir | 16 |
-| test_corrupt_sheet_regenerated | truncate a cached JPEG | detected, regenerated or 404 not 500 | 16 |
 | test_lru_eviction | cap below cache size | least-recently-used evicted | 16 |
 | test_logs_redacted | capture logs during job | no marker, no token, no cap | 20 |
 | test_security_headers | any response | nosniff, no-store/private | 19 |
