@@ -27,8 +27,7 @@ License: [AGPL-3.0-or-later](LICENSE).
   allowlisted-host, https-only, SSRF-safe policy and a work-conserving scheduler that yields to the owner.
 * Optional Telegram-backed shared tile pool: use a host API or let instances index one private Telegram group/channel
   directly. Channel mode reads exact-fingerprint tiles and publishes opted-in JPEGs without a pool API host.
-* Desktop app (`desktop/`, PySide6, Windows): dashboard, poster library, live activity, logs, sharing, settings.
-  See [docs/DESKTOP.md](docs/DESKTOP.md).
+* Browser dashboard at `http://127.0.0.1:8788`: server status, pairing, devices, sharing, title index, cache and pool controls.
 
 ## Architecture
 
@@ -48,7 +47,7 @@ flowchart LR
   end
   W -- "vetted HTTP range reads" --> SRC["Media host / CDN"]
   C -- "capability URL: thumbs.vtt, tiles, sheets" --> API
-  OWN["Owner: CLI / dashboard / desktop app"] --> ADM
+  OWN["Owner: CLI / browser dashboard"] --> ADM
   API -. "exact tile lookup / opted-in upload" .-> POOL["Shared pool API on a participating host"]
   POOL --> TG["Private Telegram channel<br/>JPEG documents"]
 ```
@@ -64,10 +63,10 @@ More detail: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 ### Windows: one installer (recommended)
 
 1. Download **`OpenSeekSetup-v0.2.0-Windows-x64.exe`** from the [latest release](https://github.com/obadevyh/openseek/releases/latest) and run it. Windows will ask for administrator approval, and SmartScreen may warn because the installer is not code-signed (check the SHA-256 on the release page, then "More info" > "Run anyway").
-2. That is all. OpenSeek is installed as a background Windows service that starts with Windows, and the **OpenSeek** dashboard opens. No Python, Docker, FFmpeg, PowerShell or configuration files are needed.
-3. To connect a TV, press **Connect a TV** on the dashboard, then enter the address and one-time code it shows into the TV app (same home network).
+2. That is all. OpenSeek is installed as a background Windows service that starts with Windows. Open **http://127.0.0.1:8788** in a browser for the admin dashboard; the admin secret is in `C:\ProgramData\OpenSeek\admin.token` (append it after `#` in the address). No Python, Docker, FFmpeg, PowerShell or configuration files are needed.
+3. To connect a TV, start a pairing window on the dashboard, then enter the address and one-time code it shows into the TV app (same home network).
 
-The installer opens one Windows Firewall rule (this program only, local network only), keeps your data in `C:\ProgramData\OpenSeek` (private to you and the service), never touches your router and never enables internet sharing. Advanced options (ports, bandwidth, cache size, logs, remote sharing, contributor mode) are behind the "Show advanced options" switch in Settings. Details and unattended-install switches: [docs/INSTALL.md](docs/INSTALL.md).
+The installer opens one Windows Firewall rule (this program only, local network only), keeps your data in `C:\ProgramData\OpenSeek` (private to you and the service), never touches your router and never enables internet sharing. Configuration and unattended-install switches: [docs/INSTALL.md](docs/INSTALL.md).
 
 ### Manual setup (other platforms, developers)
 
@@ -169,18 +168,6 @@ All settings are environment variables read at start-up. Invalid values stop the
 There is deliberately no variable that relaxes the outbound destination policy. The authoritative list is
 `backend/openseek/config.py`.
 
-## Desktop app
-
-![OpenSeek Desktop dashboard](docs/images/desktop-dashboard.png)
-
-OpenSeek Desktop (PySide6) manages a running server: dashboard, poster library, live activity, logs, sharing and settings.
-See [docs/DESKTOP.md](docs/DESKTOP.md) for usage, building the .exe and the offline demo mode (`python desktop/run_openseek.py --demo`).
-Screenshots show synthetic sample data only (Blender open movies, CC BY).
-
-| Library | Sharing |
-|---|---|
-| ![Library](docs/images/desktop-library.png) | ![Sharing](docs/images/desktop-sharing.png) |
-
 ## Security summary
 
 * The API is HTTPS only; by default certificates are self-signed and clients pin the public key. A host may configure
@@ -211,7 +198,6 @@ See [docs/RESPONSIBLE-USE.md](docs/RESPONSIBLE-USE.md).
 * [docs/TELEGRAM-POOL.md](docs/TELEGRAM-POOL.md): pool deployment, participant setup, and Telegram storage behavior
 * [docs/SECURITY-MODEL.md](docs/SECURITY-MODEL.md)
 * [docs/api/CONTRACT-v1.md](docs/api/CONTRACT-v1.md) and `backend/openapi.json`: the HTTP API, for client authors
-* [docs/DESKTOP.md](docs/DESKTOP.md): the Windows desktop app
 * [docs/RESPONSIBLE-USE.md](docs/RESPONSIBLE-USE.md), [docs/LICENSE-OPTIONS.md](docs/LICENSE-OPTIONS.md)
 * [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), [CHANGELOG.md](CHANGELOG.md), [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
 
@@ -238,7 +224,7 @@ Dockerfile only, not prebuilt Docker images**; build the image yourself with `do
 * Pairing is password-authenticated key confirmation, not a PAKE.
 * Dependencies are pinned by version (`backend/requirements-lock.txt`), not by hash; `pip-audit` is not wired up.
 * No prebuilt Docker images are published (see License); build from the Dockerfile.
-* The desktop app is Windows only. The server is developed on Windows and tested in Linux containers.
+* The server is developed on Windows and tested in Linux containers.
 * Access logs record client IPs and request times and are not rotated by OpenSeek.
 * The Telegram pool is experimental. Host mode uses shared read/write bearer keys; channel mode keeps a rebuildable
   SQLite index on each instance and uses Telethon MTProto. Conflicting renders are resolved by first-writer-wins.

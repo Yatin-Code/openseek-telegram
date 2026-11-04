@@ -25,7 +25,6 @@ libraries inside the PyAV wheels are a GPL build (see "PyAV and FFmpeg" below): 
 * MIT or Apache-2.0 maximise adoption and allow commercial forks. Apache-2.0 adds an explicit patent licence and is the better of the two permissive options for a project with cryptographic and protocol code.
 * The maintainer wrote the backend entirely, so relicensing is not blocked by third-party contributions today. This changes as soon as outside contributions are accepted without a
   contributor agreement or a clear inbound licence; decide the licence before merging them.
-* The desktop app (`desktop/`) links PySide6 (LGPL-3.0, plus commercial). Using it under the LGPL from any of the options above is possible if the LGPL conditions (notice, ability to replace the library when distributing a bundle such as a PyInstaller build) are met. Verify this for the bundled build.
 
 ## Recommendation
 
@@ -44,8 +43,6 @@ does not ship the FFmpeg, x264 or x265 licence texts). OpenSeek only decodes med
   for FFmpeg, x264 and x265 at the exact versions), and expect the combined image to be distributed on GPL terms. AGPL-3.0 and GPL-3.0 are compatible with that, Apache-2.0 is compatible with GPL-3.0 (not GPL-2.0-only),
   and MIT is compatible. The simplest way to avoid taking this on is to publish only the `Dockerfile` and let users build locally, or to build PyAV against an LGPL-only FFmpeg (`pip install av --no-binary av`
   against system FFmpeg libraries whose build you have checked).
-* **Desktop app:** `desktop/` does not import PyAV. A PyInstaller bundle redistributes PySide6 (LGPL-3.0): ship the LGPL text, state that Qt is used, and keep the libraries replaceable (the one-folder build in
-  `docs/DESKTOP.md` does that; a one-file build is harder to defend).
 * Patent licensing for codecs such as H.264 and HEVC is separate from copyright licensing and is not addressed by any open-source licence. This is not legal advice.
 
 ## Third-party licences to check before release
@@ -59,11 +56,11 @@ does not ship the FFmpeg, x264 or x265 licence texts). OpenSeek only decodes med
 | FFmpeg libraries bundled in the PyAV wheels | **Checked for `av==18.1.0`, both the Windows wheel and the Linux `manylinux_2_28_x86_64` wheel (the one the Docker image installs): FFmpeg 8.1.2 built with `--enable-libx264 --enable-libx265 --enable-version3`, i.e. a GPL build (FFmpeg allows libx264 only in GPL builds). Bundled libraries include x264, x265, LAME, Opus, VP8/9, dav1d, SVT-AV1, and on Linux GnuTLS, nettle and gmp (LGPL).** See "PyAV and FFmpeg" below |
 | Pillow | HPND (MIT-CMU style) |
 | numpy | BSD-3-Clause (the wheels bundle other libraries with their own notices) |
-| PySide6 (desktop) | LGPL-3.0 / GPL / commercial |
-| PyInstaller (desktop build tool) | GPL-2.0 with a bootloader exception |
+| PyInstaller (Windows server build tool) | GPL-2.0 with a bootloader exception |
 
 Runtime dependency closure of `backend/requirements.txt` (read from the installed package metadata of the pinned versions): annotated-doc MIT, annotated-types MIT, anyio MIT, av BSD-3-Clause (bundled FFmpeg: see above),
 cffi MIT-0, click BSD-3-Clause, cryptography Apache-2.0 OR BSD-3-Clause, fastapi MIT, h11 MIT, idna BSD-3-Clause, numpy BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0, opentelemetry-api Apache-2.0, pillow MIT-CMU,
 pycparser BSD-3-Clause, pydantic MIT, pydantic-core MIT, starlette BSD-3-Clause, typing-extensions PSF-2.0, typing-inspection MIT, uvicorn BSD-3-Clause. Apart from the FFmpeg binaries inside the `av` wheel,
-all of them are permissive and compatible with MIT, Apache-2.0 and AGPL-3.0 for the project's own licence. The desktop app adds PySide6 (LGPL-3.0), httpx (BSD), psutil (BSD) and Pillow; PyInstaller (GPL-2.0 with bootloader exception) is a build tool only.
-Distributing the Docker image or a PyInstaller bundle is redistribution of these components and brings their notice requirements with it.
+all of them are permissive and compatible with MIT, Apache-2.0 and AGPL-3.0 for the project's own licence. The frozen Windows server build adds PyInstaller
+(GPL-2.0 with a bootloader exception) as a build tool only. Distributing the Docker image or a PyInstaller bundle is redistribution of these components and brings
+their notice requirements with it.

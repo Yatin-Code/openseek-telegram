@@ -12,6 +12,9 @@ All notable changes are documented here. The format follows [Keep a Changelog](h
   Telegram `sendDocument` storage, a durable upload outbox, exact-content lookup, and local-cache fallback on misses.
 * `docs/TELEGRAM-POOL.md`, `UPSTREAMS.md`, and `LICENSES.md` documenting deployment, provenance, and licenses.
 
+### Removed
+* The native Windows admin application and its build, release, installer and licensing paths. The server's browser dashboard at `http://127.0.0.1:8788` is the admin interface.
+
 ## [0.2.0] - 2026-10-19
 
 ### Added

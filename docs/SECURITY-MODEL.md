@@ -72,11 +72,10 @@ There is no telemetry or update check. With `OPENSEEK_POOL_MODE` unset and the l
 backend makes no pool connection (a test checks that an idle server makes none). Host mode may contact the configured
 HTTPS pool URL and Telegram Bot API. Channel mode uses MTProto for the configured Telegram group/channel and, when
 selected, its librarian bot. No source URL is sent to either pool mode.
-OpenSeek Desktop contacts a public metadata service (Cinemeta) for titles and posters.
 
 ## Windows installer
 
-The installer runs the server as a service under `NT SERVICE\OpenSeek` (a virtual account with no password and minimal privileges), keeps its files in a folder private to SYSTEM, Administrators, the service and the installing user, and opens one firewall rule limited to the server program, its port and the local subnet. The settings file the dashboard edits (`config.json`) is writable by the installing user, so the server honours only an allowlist of keys from it (ports, limits, bandwidth, log level, optional sharing) and ignores anything else, including the data folder.
+The installer runs the server as a service under `NT SERVICE\OpenSeek` (a virtual account with no password and minimal privileges), keeps its files in a folder private to SYSTEM, Administrators, the service and the installing user, and opens one firewall rule limited to the server program, its port and the local subnet. The settings file (`config.json`) is writable by the installing user, so the server honours only an allowlist of keys from it (ports, limits, bandwidth, log level, optional sharing) and ignores anything else, including the data folder.
 Automatic discovery on the network is not implemented: the TV needs the address and a one-time code, shown by the dashboard. Binaries are not code-signed. Rebooting Windows with the service installed has been configured (automatic, delayed start) but not exercised in testing.
 
 ## Known limitations
