@@ -122,6 +122,32 @@ class SupabaseClient:
         return response.json()
 
     # ---------------------------------------------------------------- Storage REST (F1b staging only)
+    def create_bucket(self, name: str, *, public: bool = False,
+                      size_limit: int | None = None) -> bool:
+        """Create a Storage bucket and return whether it was created now.
+
+        Idempotent: Storage answers 409 (and on some versions 400) with a
+        duplicate-name message when the bucket already exists; both count as
+        success. Other failures raise `RemoteStoreError`.
+
+        Used to prepare the temporary upload-staging bucket. Storage is never a
+        second durable package store: Telegram is canonical (docs/adr/0001).
+        """
+        body: dict = {"name": name, "public": bool(public)}
+        if size_limit is not None:
+            body["file_size_limit"] = int(size_limit)
+        try:
+            response = self._client.post("/storage/v1/bucket", json=body)
+        except httpx.HTTPError as exc:
+            raise RemoteStoreError(0, type(exc).__name__, str(exc)) from None
+        if response.status_code < 400:
+            return True
+        duplicate = response.text[:300].lower()
+        if response.status_code in (400, 409) and ("duplicate" in duplicate or "exists" in duplicate):
+            return False
+        raise RemoteStoreError(response.status_code, "bucket_create_failed",
+                               response.text[:300] or "bucket creation failed")
+
     def put_object(self, path: str, data: bytes, content_type: str) -> None:
         try:
             response = self._client.post(
