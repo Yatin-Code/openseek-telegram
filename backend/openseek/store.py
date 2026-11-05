@@ -64,6 +64,11 @@ class UploadQueueStore:
                          (upload_id,))
         return _upload_dict(rows[0]) if rows else None
 
+    def pending_count(self) -> int:
+        rows = self.db.q(
+            "SELECT COUNT(*) FROM pool_uploads WHERE state IN ('pending','queued','publishing')")
+        return int(rows[0][0]) if rows else 0
+
     def pending_expired(self, now: float) -> list[dict]:
         """Pending rows past their staging TTL, oldest first."""
         rows = self.db.q(f"SELECT {_UPLOAD_COLUMNS} FROM pool_uploads "

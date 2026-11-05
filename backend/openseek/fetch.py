@@ -233,13 +233,12 @@ def fingerprint(size: int, head64: bytes, tail64: bytes) -> str:
 
 
 class Budget:
-    def __init__(self, limit: int, request_bucket=None, urgent: Callable[[], bool] | None = None):
+    def __init__(self, limit: int, request_bucket=None):
         self.limit = int(limit)
         self.used = 0
         self.requests = 0
         self.exceeded = False
         self.request_bucket = request_bucket
-        self.urgent = urgent
         self._lock = threading.Lock()
 
     def reserve(self, n: int) -> None:
@@ -267,28 +266,18 @@ class TokenBucket:
         self._clock = clock
         self._sleep = sleep
         self._next_free = 0.0
-        self._last_urgent = 0.0
         self._lock = threading.Lock()
 
-    def throttle(self, n: int, active: Callable[[], bool],
-                 urgent: Callable[[], bool] | None = None) -> None:
-        """Account n bytes; sleep while `active()` stays true (re-checked every 50 ms, so a
-        frame upgraded to foreground stops waiting)."""
+    def throttle(self, n: int, active: Callable[[], bool]) -> None:
+        """Account n bytes; sleep while `active()` stays true, re-checked every 50 ms."""
         if not active():
             return
-        is_urgent = bool(urgent and urgent())
         with self._lock:
             now = self._clock()
             start = max(self._next_free, now - self.burst / self.rate)
             self._next_free = start + n / self.rate
-            if is_urgent:
-                due = min(self._next_free, max(now, self._last_urgent + 0.12))
-                self._last_urgent = due
-            else:
-                due = self._next_free
+            due = self._next_free
         while active():
-            if not is_urgent and urgent is not None and urgent():
-                return
             delay = due - self._clock()
             if delay <= 0:
                 return
@@ -415,7 +404,7 @@ class Upstream:
         """GET one bounded range; reconnects once if a kept-alive connection went stale."""
         for attempt in range(2):
             if self.budget.request_bucket is not None:
-                self.budget.request_bucket.throttle(1, lambda: True, urgent=self.budget.urgent)
+                self.budget.request_bucket.throttle(1, lambda: True)
             conn = self._conn_for(target)
             t_req = time.perf_counter()
             tok = self.stats.begin()

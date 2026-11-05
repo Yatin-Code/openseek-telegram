@@ -76,11 +76,27 @@ On Windows, use `.venv\Scripts\pip` and `.venv\Scripts\python` in place of the P
 5. Deploying the Telegram-enabled node and checking it again.
 6. Creating a one-time Nuvio pairing bundle. Enter it in **Nuvio → Settings → OpenSeek → Pair**, then enable contribution if you want to share.
 
-The wizard can resume after an interruption. Its local progress file is `~/.config/openseek/participant-setup.json` with owner-only permissions. Telegram session and API hash values are sent to the participant's Vercel project and are not saved in that progress file. The Telegram account remains under the participant's control; revoke its session or disable contribution at any time.
+The wizard can resume after an interruption. Its local progress file is `~/.config/openseek/participant-setup.json` with owner-only permissions. Telegram session and API hash values are sent to the participant's Vercel project and are not saved in that progress file. The generated dashboard secret is stored separately in `~/.config/openseek/participant-setup.admin-token` with owner-only permissions; setup prints a dashboard link that carries the secret only in the URL fragment. The Telegram account remains under the participant's control; revoke its session or disable contribution at any time.
 
 The pool owner still performs the one-time group setup and shares the direct-join invite. For the group to work, new members must see its history and be allowed to send messages and media. An invite that requires owner approval is not suitable for the hands-off participant flow.
 
 For the full wizard details and recovery steps, see [Participant-owned Vercel nodes](docs/VERCEL.md).
+
+## Manage your node
+
+The browser dashboard manages the OpenSeek node you own. On Vercel, open its deployment
+URL with the owner secret in the URL fragment, for example
+`https://your-node.vercel.app/#<OPENSEEK_ADMIN_TOKEN>`. The dashboard saves that secret
+in the browser session and removes it from the address bar. On a local or VPS install,
+open the dashboard URL shown by `python -m openseek dashboard`.
+
+From the dashboard, you can check the Telegram connection and pool index, pair and revoke
+Nuvio devices, enable or disable pool sharing and guest uploads, and create or revoke
+invites. The owner secret protects these controls; Nuvio uses its separate device token
+or pool keys. To publish a package from the dashboard, submit a media URL and start
+**Generate and publish**. This is an explicit owner action with progress and status.
+Playback and lookup requests never trigger media extraction; during playback Nuvio
+generates its own thumbnails locally when it has no usable shared match.
 
 ## What the Vercel node stores
 
@@ -144,7 +160,7 @@ To create a node that joins a Telegram community directly, run `.venv/bin/python
 - [Participant-owned Vercel setup](docs/VERCEL.md)
 - [Telegram pool modes](docs/TELEGRAM-POOL.md)
 - [Installation](docs/INSTALL.md)
-- [HTTP API contract](docs/api/CONTRACT-v1.md) and [OpenAPI document](backend/openapi.json)
+- [HTTP API contract](docs/api/CONTRACT-v1.md)
 - [Security model](docs/SECURITY-MODEL.md) and [vulnerability reporting](SECURITY.md)
 - [Responsible use](docs/RESPONSIBLE-USE.md)
 - [Contributing](CONTRIBUTING.md), [license](LICENSE), and [changelog](CHANGELOG.md)

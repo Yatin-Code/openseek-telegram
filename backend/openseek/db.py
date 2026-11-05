@@ -1,8 +1,7 @@
 """Small SQLite store for service metadata (SR-15).
 
-Persisted: hashed device tokens + device names, preview_id <-> (device, fingerprint),
-per-fingerprint media metadata (duration, tile pts), timestamps, optional hashed episode keys,
-and normalized catalog hints attached to shared-pool packages. NEVER persisted: source URLs,
+Persisted: hashed device tokens + device names, per-fingerprint media metadata (duration, tile pts),
+timestamps, optional hashed episode keys, and normalized catalog hints attached to shared-pool packages. NEVER persisted: source URLs,
 forwarded headers, raw titles, pairing codes, or raw tokens.
 """
 from __future__ import annotations
@@ -16,10 +15,6 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS devices (
   device_id TEXT PRIMARY KEY, name TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE,
   created REAL NOT NULL, last_seen REAL NOT NULL);
-CREATE TABLE IF NOT EXISTS previews (
-  preview_id TEXT PRIMARY KEY, device_id TEXT NOT NULL, fp TEXT NOT NULL,
-  created REAL NOT NULL, last_used REAL NOT NULL);
-CREATE INDEX IF NOT EXISTS previews_dev_fp ON previews(device_id, fp);
 CREATE TABLE IF NOT EXISTS entries (
   fp TEXT PRIMARY KEY, duration_ms INTEGER, n_tiles INTEGER, version INTEGER NOT NULL DEFAULT 0,
   bytes INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL, last_used REAL NOT NULL);
@@ -115,25 +110,13 @@ CREATE TABLE IF NOT EXISTS invites (
   max_uses INTEGER NOT NULL DEFAULT 1, uses INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0,
   revoked REAL, device_days REAL, tag TEXT);
 CREATE TABLE IF NOT EXISTS settings (k TEXT PRIMARY KEY, v TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS release_meta (
-  fp TEXT PRIMARY KEY, imdb_id TEXT, tmdb_id INTEGER, season INTEGER NOT NULL DEFAULT 0,
-  episode INTEGER NOT NULL DEFAULT 0, size_bytes INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL);
-CREATE INDEX IF NOT EXISTS release_meta_imdb ON release_meta(imdb_id, season, episode);
-CREATE INDEX IF NOT EXISTS release_meta_tmdb ON release_meta(tmdb_id, season, episode);
-CREATE TABLE IF NOT EXISTS borrowed (
-  device_id TEXT NOT NULL, release_key TEXT NOT NULL, src_fp TEXT NOT NULL, preview_id TEXT NOT NULL UNIQUE,
-  a REAL NOT NULL, b REAL NOT NULL, kind TEXT NOT NULL, guest_duration_ms INTEGER NOT NULL, created REAL NOT NULL,
-  PRIMARY KEY (device_id, release_key, src_fp));
-CREATE TABLE IF NOT EXISTS offsets (
-  device_id TEXT NOT NULL, release_key TEXT NOT NULL, src_fp TEXT NOT NULL, a REAL NOT NULL, b REAL NOT NULL,
-  updated REAL NOT NULL, PRIMARY KEY (device_id, release_key, src_fp));
-CREATE TABLE IF NOT EXISTS rejections (
-  device_id TEXT NOT NULL, release_key TEXT NOT NULL, src_fp TEXT NOT NULL, created REAL NOT NULL,
-  PRIMARY KEY (device_id, release_key, src_fp));
-CREATE TABLE IF NOT EXISTS thumb_sources (
-  play_fp TEXT NOT NULL, thumb_fp TEXT NOT NULL, a REAL NOT NULL, b REAL NOT NULL,
-  residual_ms REAL NOT NULL, kind TEXT NOT NULL, verified REAL NOT NULL,
-  PRIMARY KEY (play_fp, thumb_fp));
+-- Owner-triggered generation status; source URLs are deliberately never persisted.
+CREATE TABLE IF NOT EXISTS generation_jobs (
+  generation_id TEXT PRIMARY KEY, state TEXT NOT NULL, fp TEXT, profile TEXT,
+  duration_ms INTEGER, tiles_done INTEGER NOT NULL DEFAULT 0, tiles_total INTEGER,
+  upload_id TEXT, error TEXT, package_sha256 TEXT, created REAL NOT NULL, updated REAL NOT NULL);
+CREATE INDEX IF NOT EXISTS generation_jobs_created ON generation_jobs(created);
+
 """
 
 
@@ -167,18 +150,6 @@ class DB:
         if hint_cols and "verified" not in hint_cols:
             self.conn.execute("ALTER TABLE pool_hints ADD COLUMN verified INTEGER NOT NULL DEFAULT 0")
 
-    def put_thumb_source(self, play_fp: str, thumb_fp: str, a: float, b: float, residual_ms: float,
-                         kind: str) -> None:
-        """Provenance of tiles made from a different file: playback fp, source fp, verified mapping.
-        Fingerprints and numbers only (nothing identifying the title or the URL)."""
-        self.x("INSERT OR REPLACE INTO thumb_sources VALUES (?,?,?,?,?,?,?)",
-               (play_fp, thumb_fp, float(a), float(b), float(residual_ms), kind, time.time()))
-
-    def get_thumb_source(self, play_fp: str) -> tuple | None:
-        r = self.q("SELECT thumb_fp,a,b,residual_ms,kind FROM thumb_sources WHERE play_fp=? "
-                   "ORDER BY verified DESC LIMIT 1", (play_fp,))
-        return r[0] if r else None
-
     def close(self) -> None:
         with self._lock:
             self.conn.close()
@@ -190,16 +161,6 @@ class DB:
 
     def set_setting(self, k: str, v: str) -> None:
         self.x("INSERT OR REPLACE INTO settings(k,v) VALUES(?,?)", (k, v))
-
-    # ---------------------------------------------------------------- library (cross-release reuse)
-    def upsert_release_meta(self, fp: str, imdb: str | None, tmdb: int | None, season: int, episode: int,
-                            size_bytes: int, replace: bool = True) -> None:
-        # replace=False: first writer wins (a guest's contribution must never relabel an existing entry)
-        self.x(("INSERT OR REPLACE" if replace else "INSERT OR IGNORE") + " INTO release_meta(fp,imdb_id,tmdb_id,season,episode,size_bytes,created) "
-               "VALUES(?,?,?,?,?,?,?)", (fp, imdb, tmdb, season, episode, size_bytes, time.time()))
-
-    def purge_release_meta(self) -> int:
-        return self.x("DELETE FROM release_meta")
 
     def purge_pool(self, invalid_tiles: list[tuple], invalid_packages: list[tuple],
                    outbox_before: float, max_attempts: int, *, dry_run: bool = True,
@@ -270,76 +231,6 @@ class DB:
                 self.conn.execute("VACUUM")
                 self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             return counts
-
-    def release_rows(self) -> list[dict]:
-        """Exactly what is stored, joined with the cache entry (for the owner's dashboard / API)."""
-        out = []
-        for fp, imdb, tmdb, season, episode, size, created, dur, n, tiles, used in self.q(
-                "SELECT m.fp, m.imdb_id, m.tmdb_id, m.season, m.episode, m.size_bytes, m.created, e.duration_ms, e.n_tiles, "
-                "(SELECT COUNT(*) FROM tiles t WHERE t.fp=m.fp), e.last_used FROM release_meta m "
-                "LEFT JOIN entries e ON e.fp=m.fp ORDER BY m.created"):
-            out.append({"fp": fp[:12], "imdb_id": imdb, "tmdb_id": tmdb, "season": season, "episode": episode,
-                        "size_bytes": size, "duration_ms": dur, "tiles": tiles, "n_tiles": n, "last_used": used})
-        return out
-
-    def release_candidates(self, imdb: str | None, tmdb: int | None, season: int, episode: int) -> list[tuple]:
-        """(fp, size, duration_ms, n_tiles, tiles_done) of cache entries with the same id and season/episode."""
-        return self.q(
-            "SELECT m.fp, m.size_bytes, e.duration_ms, e.n_tiles, (SELECT COUNT(*) FROM tiles t WHERE t.fp=m.fp) "
-            "FROM release_meta m JOIN entries e ON e.fp=m.fp WHERE m.season=? AND m.episode=? AND e.duration_ms > 0 "
-            "AND ((? IS NOT NULL AND m.imdb_id=?) OR (? IS NOT NULL AND m.tmdb_id=?))",
-            (season, episode, imdb, imdb, tmdb, tmdb))
-
-    def rejected_sources(self, device_id: str, release_key: str) -> set[str]:
-        return {r[0] for r in self.q("SELECT src_fp FROM rejections WHERE device_id=? AND release_key=?",
-                                     (device_id, release_key))}
-
-    def borrowed_for(self, device_id: str, release_key: str, src_fp: str) -> str | None:
-        r = self.q("SELECT preview_id FROM borrowed WHERE device_id=? AND release_key=? AND src_fp=?",
-                   (device_id, release_key, src_fp))
-        return r[0][0] if r else None
-
-    def add_borrowed(self, device_id: str, release_key: str, src_fp: str, preview_id: str, a: float, b: float,
-                     kind: str, guest_duration_ms: int, max_per_device: int) -> None:
-        """A per-device row pointing at someone else's cache entry; bounded so a device cannot grow the table."""
-        now = time.time()
-        with self._lock:
-            self.x("INSERT OR IGNORE INTO borrowed VALUES(?,?,?,?,?,?,?,?,?)",
-                   (device_id, release_key, src_fp, preview_id, a, b, kind, guest_duration_ms, now))
-            self.x("INSERT OR IGNORE INTO previews(preview_id,device_id,fp,created,last_used) VALUES(?,?,?,?,?)",
-                   (preview_id, device_id, src_fp, now, now))
-            extra = self.q("SELECT preview_id FROM borrowed WHERE device_id=? ORDER BY created DESC LIMIT -1 OFFSET ?",
-                           (device_id, max_per_device))
-            for (pid,) in extra:
-                self.x("DELETE FROM borrowed WHERE preview_id=?", (pid,))
-                self.x("DELETE FROM previews WHERE preview_id=?", (pid,))
-
-    def update_borrowed_mapping(self, preview_id: str, a: float, b: float, kind: str) -> None:
-        self.x("UPDATE borrowed SET a=?, b=?, kind=? WHERE preview_id=?", (a, b, kind, preview_id))
-
-    def borrowed(self, preview_id: str) -> tuple | None:
-        """(device_id, release_key, src_fp, a, b, kind, guest_duration_ms) of a borrowed preview."""
-        r = self.q("SELECT device_id, release_key, src_fp, a, b, kind, guest_duration_ms FROM borrowed WHERE preview_id=?",
-                   (preview_id,))
-        return r[0] if r else None
-
-    def get_offset(self, device_id: str, release_key: str, src_fp: str) -> tuple[float, float] | None:
-        r = self.q("SELECT a, b FROM offsets WHERE device_id=? AND release_key=? AND src_fp=?",
-                   (device_id, release_key, src_fp))
-        return (r[0][0], r[0][1]) if r else None
-
-    def put_offset(self, device_id: str, release_key: str, src_fp: str, a: float, b: float) -> None:
-        self.x("INSERT OR REPLACE INTO offsets VALUES(?,?,?,?,?,?)", (device_id, release_key, src_fp, a, b, time.time()))
-
-    def delete_offset(self, device_id: str, release_key: str, src_fp: str) -> None:
-        self.x("DELETE FROM offsets WHERE device_id=? AND release_key=? AND src_fp=?", (device_id, release_key, src_fp))
-
-    def reject_borrowed(self, device_id: str, release_key: str, src_fp: str, preview_id: str) -> None:
-        with self._lock:
-            self.x("INSERT OR REPLACE INTO rejections VALUES(?,?,?,?)", (device_id, release_key, src_fp, time.time()))
-            self.x("DELETE FROM borrowed WHERE preview_id=?", (preview_id,))
-            self.x("DELETE FROM previews WHERE preview_id=?", (preview_id,))
-            self.x("DELETE FROM offsets WHERE device_id=? AND release_key=? AND src_fp=?", (device_id, release_key, src_fp))
 
     def q(self, sql: str, args: tuple = ()) -> list[tuple]:
         with self._lock:
@@ -433,30 +324,10 @@ class DB:
         return self.x("DELETE FROM invites WHERE expires<?", (older_than,))
 
     def remove_device(self, device_id: str) -> bool:
-        with self._lock:
-            n = self.x("DELETE FROM devices WHERE device_id=?", (device_id,))
-            self.x("DELETE FROM previews WHERE device_id=?", (device_id,))
-            for t in ("borrowed", "offsets", "rejections"):
-                self.x(f"DELETE FROM {t} WHERE device_id=?", (device_id,))
-            return n > 0
+        return self.x("DELETE FROM devices WHERE device_id=?", (device_id,)) > 0
 
     def touch_device(self, device_id: str) -> None:
         self.x("UPDATE devices SET last_seen=? WHERE device_id=?", (time.time(), device_id))
-
-    # ---------------------------------------------------------------- previews
-    def preview_for(self, device_id: str, fp: str) -> str | None:
-        r = self.q("SELECT preview_id FROM previews WHERE device_id=? AND fp=? ORDER BY created LIMIT 1",
-                   (device_id, fp))
-        return r[0][0] if r else None
-
-    def add_preview(self, preview_id: str, device_id: str, fp: str) -> None:
-        now = time.time()
-        self.x("INSERT OR IGNORE INTO previews(preview_id,device_id,fp,created,last_used) VALUES(?,?,?,?,?)",
-               (preview_id, device_id, fp, now, now))
-
-    def preview(self, preview_id: str) -> tuple[str, str] | None:
-        r = self.q("SELECT device_id, fp FROM previews WHERE preview_id=?", (preview_id,))
-        return (r[0][0], r[0][1]) if r else None
 
     # ---------------------------------------------------------------- pool quotas & corrections (Epic C)
     def sender_quota_count(self, sender_id: int, work_key: str, day: str) -> int:

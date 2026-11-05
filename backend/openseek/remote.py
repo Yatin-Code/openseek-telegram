@@ -107,9 +107,9 @@ class SupabaseClient:
         body = response.json()
         return body if isinstance(body, list) else []
 
-    def count(self, table: str, column: str = "fp") -> int:
+    def count(self, table: str, column: str = "fp", filters=()) -> int:
         response = self.request("GET", f"/rest/v1/{table}",
-                                params=[("select", column), ("limit", "1")],
+                                params=[("select", column), *filters, ("limit", "1")],
                                 prefer="count=exact")
         content_range = response.headers.get("content-range", "")
         total = content_range.rsplit("/", 1)[-1]
@@ -200,9 +200,9 @@ class SupabaseClient:
 class RemoteTelegramSessionLease:
     """A short distributed lease preventing concurrent primary MTProto sessions."""
 
-    def __init__(self, client: SupabaseClient, *, lease_seconds: int = 120):
+    def __init__(self, client: SupabaseClient, *, lease_seconds: int = 600):
         self.client = client
-        self.lease_seconds = min(120, max(1, int(lease_seconds)))
+        self.lease_seconds = min(600, max(1, int(lease_seconds)))
 
     def acquire(self, owner: str) -> bool:
         result = self.client.rpc("try_acquire_pool_telegram_session", {
@@ -366,6 +366,10 @@ class RemoteUploadQueueStore:
             "pool_uploads", [("select", _UPLOAD_COLUMNS), ("upload_id", f"eq.{upload_id}"),
                              ("limit", "1")])
         return self._upload(rows[0]) if rows else None
+
+    def pending_count(self) -> int:
+        return self.client.count(
+            "pool_uploads", "upload_id", [("state", "in.(pending,queued,publishing)")])
 
     def pending_expired(self, now: float) -> list[dict]:
         rows = self.client.select(

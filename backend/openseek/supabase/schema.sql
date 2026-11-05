@@ -155,7 +155,7 @@ declare
   now_s double precision := extract(epoch from clock_timestamp());
   changed integer;
 begin
-  if p_owner is null or length(p_owner) < 16 or p_lease_seconds < 1 or p_lease_seconds > 120 then
+  if p_owner is null or length(p_owner) < 16 or p_lease_seconds < 1 or p_lease_seconds > 600 then
     return false;
   end if;
   insert into public.pool_telegram_session_lock(lock_id, owner, lease_until)
@@ -266,3 +266,45 @@ revoke all on function public.revoke_pool_invite(text, double precision) from pu
 grant execute on function public.bump_pool_invite_attempts(text) to service_role;
 grant execute on function public.use_pool_invite(text, double precision, integer) to service_role;
 grant execute on function public.revoke_pool_invite(text, double precision) to service_role;
+
+-- Owner settings and generation progress from the browser dashboard.
+create table if not exists public.pool_owner_settings (
+  k text primary key,
+  v text not null
+);
+
+-- Generation status only. Source URLs and media bytes remain in process memory.
+create table if not exists public.pool_generation_jobs (
+  generation_id text primary key,
+  state text not null,
+  fp text,
+  profile text,
+  duration_ms bigint,
+  tiles_done integer not null default 0,
+  tiles_total integer,
+  upload_id text,
+  error text,
+  package_sha256 text,
+  created double precision not null,
+  updated double precision not null
+);
+create index if not exists pool_generation_jobs_created
+  on public.pool_generation_jobs (created desc);
+
+-- Retained for the dashboard adapter and compatible with the participant RPCs above.
+create or replace function public.record_pool_invite_failure(p_pair_id text)
+returns boolean language plpgsql security definer set search_path = pg_catalog as $$
+declare
+  changed integer;
+begin
+  update public.pool_invites set attempts = attempts + 1
+   where pair_id = p_pair_id and attempts < 5;
+  get diagnostics changed = row_count;
+  return changed = 1;
+end;
+$$;
+revoke all on function public.record_pool_invite_failure(text) from public;
+grant execute on function public.record_pool_invite_failure(text) to service_role;
+
+alter table public.pool_owner_settings enable row level security;
+alter table public.pool_generation_jobs enable row level security;

@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import datetime as dt
 import hashlib
+import re
 from pathlib import Path
 
 from cryptography import x509
@@ -12,6 +13,19 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
 from .cache import atomic_write, secure_mkdir
+
+_SPKI_PIN = re.compile(r"sha256//[A-Za-z0-9+/]{43}=")
+
+
+def valid_spki_pin(value: str) -> bool:
+    """Return whether value is a canonical SHA-256 SPKI pin."""
+    if not isinstance(value, str) or not _SPKI_PIN.fullmatch(value):
+        return False
+    try:
+        digest = base64.b64decode(value[8:], validate=True)
+    except (ValueError, base64.binascii.Error):
+        return False
+    return len(digest) == hashlib.sha256().digest_size and base64.b64encode(digest).decode() == value[8:]
 
 
 def spki_pin_from_cert_pem(pem: bytes) -> str:

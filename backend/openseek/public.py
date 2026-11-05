@@ -13,22 +13,15 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Callable
 
-_ID32 = r"[0-9a-f]{32}"
-_CAP = r"[A-Za-z0-9_-]{16,64}"
-_NAME = r"[0-9A-Za-z_.-]{1,40}"
 _FP = r"[0-9a-f]{64}"
 _EPISODE_KEY = r"[0-9a-f]{64}"
 _INDEX = r"[0-9]{1,6}"
 
-# what needs no token: the entrance (health, invitation pairing) and the borrowed-content URLs, whose HMAC capability
-# binds device + preview + expiry (and which the data plane re-checks for guest role, revocation and the kill switch)
+# Routes that need no token: health, invitation pairing, and the configured public pool reads/writes.
 OPEN_ROUTES = (
     ("health", "GET", re.compile(r"/v1/health")),
     ("pair", "POST", re.compile(r"/v1/pair/start")),
     ("pair", "POST", re.compile(r"/v1/pair/claim")),
-    ("cap", "GET", re.compile(rf"/v1/c/{_CAP}/{_ID32}/thumbs\.vtt")),
-    ("cap", "GET", re.compile(rf"/v1/c/{_CAP}/{_ID32}/tiles/{_NAME}")),
-    ("cap", "GET", re.compile(rf"/v1/c/{_CAP}/{_ID32}/sheets/{_NAME}")),
     ("pool_read", "GET", re.compile(rf"/v1/pool/{_FP}/manifest")),
     ("pool_read", "GET", re.compile(rf"/v1/pool/{_FP}/tiles/{_INDEX}\.jpg")),
     ("pool_write", "PUT", re.compile(rf"/v1/pool/{_FP}/tiles/{_INDEX}\.jpg")),
@@ -40,7 +33,7 @@ OPEN_ROUTES = (
 
 
 def classify(method: str, path: str, guest_allowed: Callable[[str, str], bool]) -> str | None:
-    """'health' | 'pair' | 'cap' | 'api' (authenticated guest routes) | None (deny)."""
+    """'health' | 'pair' | pool limit class | authenticated guest route | None (deny)."""
     for kind, m, rx in OPEN_ROUTES:
         if m == method and rx.fullmatch(path):
             return kind
@@ -57,7 +50,7 @@ class PublicLimits:
 
 
 def default_limits() -> PublicLimits:
-        return PublicLimits(per_minute={"health": 30, "pair": 12, "api": 300, "cap": 900,
+        return PublicLimits(per_minute={"health": 30, "pair": 12, "api": 300,
                                        "pool_read": 900, "pool_write": 120, "unknown": 30})
 
 

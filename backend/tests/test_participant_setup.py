@@ -115,6 +115,8 @@ def test_participant_wizard_provisions_and_health_checks_own_node(tmp_path):
     assert provider.schema_calls[0][0] == "sb-ref-1"
     assert provider.bucket_calls == [("https://pool.supabase.co", "sb_secret_DO_NOT_PRINT")]
     assert provider.env["OPENSEEK_SETUP_PENDING"] == ("1", False)
+    admin_token, admin_secret = provider.env["OPENSEEK_ADMIN_TOKEN"]
+    assert admin_secret is True and len(admin_token) >= 32
     assert provider.env["OPENSEEK_SUPABASE_SERVICE_KEY"] == ("sb_secret_DO_NOT_PRINT", True)
     assert provider.deploy_calls == 1
     assert provider.health_calls == ["https://my-openseek-node.vercel.app"]
@@ -122,8 +124,12 @@ def test_participant_wizard_provisions_and_health_checks_own_node(tmp_path):
     state = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
     assert state["step"] == "healthy"
     assert "sb_secret_DO_NOT_PRINT" not in json.dumps(state)
+    assert "OPENSEEK_ADMIN_TOKEN" not in json.dumps(state)
+    token_path = tmp_path / "participant-setup.admin-token"
+    assert token_path.read_text().strip() == admin_token
     if __import__("os").name == "posix":
         assert (tmp_path / "state.json").stat().st_mode & 0o777 == 0o600
+        assert token_path.stat().st_mode & 0o777 == 0o600
 
 
 def test_participant_wizard_resumes_after_deployment_failure_without_recreating_resources(tmp_path):
@@ -173,6 +179,7 @@ def test_telegram_session_goes_only_to_the_participant_vercel_project(tmp_path):
 
     assert provider.env["OPENSEEK_TELEGRAM_SESSION"] == ("telegram_session_secret", True)
     assert provider.env["OPENSEEK_TELEGRAM_API_HASH"] == ("api_hash_secret", True)
+    assert provider.env["OPENSEEK_ADMIN_TOKEN"][0] == (tmp_path / "participant-setup.admin-token").read_text().strip()
     assert provider.env["OPENSEEK_TELEGRAM_CHANNEL_ID"] == ("-100123456", False)
     assert provider.env["OPENSEEK_SETUP_PENDING"] == ("0", False)
     assert provider.health_pending == [False, False, False]
@@ -186,3 +193,4 @@ def test_telegram_session_goes_only_to_the_participant_vercel_project(tmp_path):
     assert "telegram_session_secret" not in "\n".join(output)
     assert "api_hash_secret" not in "\n".join(output)
     assert "https://my-openseek-node.vercel.app|ABCD-EFGH-IJKL-MNOP" in "\n".join(output)
+    assert f"https://my-openseek-node.vercel.app/#{provider.env['OPENSEEK_ADMIN_TOKEN'][0]}" in "\n".join(output)

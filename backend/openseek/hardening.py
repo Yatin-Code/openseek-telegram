@@ -1,6 +1,6 @@
 """Start-up checks for deployments the server cannot protect by itself. They only ever warn (never fail, never change anything):
 
-* Windows: a data directory whose permissions let other local users read it (it holds the TLS private key, the capability key,
+* Windows: a data directory whose permissions let other local users read it (it holds the TLS private key,
   the admin secret and the invitation database). The default `%LOCALAPPDATA%\\OpenSeek\\data` is private; a folder at the root of another
   drive usually is not.
 * Containers: behind Docker Desktop's NAT or any proxy every client appears with a private address, so the "private clients only"
@@ -65,7 +65,7 @@ def check_data_dir(path: Path, warn: Callable[[str], None]) -> list[str]:
         return []
     bad = broad_acl_principals(out)
     if bad:
-        warn("the data directory %s is accessible to: %s. It holds the TLS private key, secret.key, admin.token and the invitation database; "
+        warn("the data directory %s is accessible to: %s. It holds the TLS private key, admin.token and the invitation database; "
              "move it into your own profile (the default %%LOCALAPPDATA%%\\OpenSeek\\data) or remove those entries (icacls <dir> /inheritance:r "
              "/grant:r \"%%USERNAME%%:(OI)(CI)F\")" % (path, ", ".join(bad)))
     return bad

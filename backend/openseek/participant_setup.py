@@ -101,6 +101,29 @@ def _atomic_state(path: Path, state: dict) -> None:
         raise
 
 
+def _atomic_secret(path: Path, value: str) -> None:
+    """Keep the generated dashboard credential separate from provider resume state."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, temp_name = tempfile.mkstemp(prefix=".pool-secret-", dir=path.parent)
+    try:
+        if os.name == "posix":
+            os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(value + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_name, path)
+        if os.name == "posix":
+            os.chmod(path.parent, 0o700)
+            os.chmod(path, 0o600)
+    except BaseException:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
+
+
 def _load_state(path: Path) -> dict:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -153,6 +176,16 @@ class ParticipantSetup:
             if self.new_pairing:
                 return self._create_pairing_invite()
             self.print("This OpenSeek node is already paired. Run `openseek setup --new-pairing` to create a replacement invite.")
+            token_path = self._owner_token_path()
+            try:
+                owner_token = token_path.read_text(encoding="utf-8").strip()
+            except OSError:
+                owner_token = ""
+            if owner_token:
+                deployment = str(self.state.get("deployment_url") or "")
+                self.print(f"Dashboard access (owner secret): {deployment}/#{owner_token}")
+            else:
+                self.print(f"Dashboard owner secret file is missing: {token_path}. Run `openseek setup --new-pairing` to reset it.")
             return 0
         self.print("Join the shared OpenSeek pool")
         self.print("This creates resources in your own provider accounts and uses their current free-plan limits.")
@@ -183,10 +216,12 @@ class ParticipantSetup:
             self.state["step"] = "vercel_selected"
             self._save()
             self.provider.link_vercel_project(self.source_dir, vercel)
+            admin_token = self._owner_token()
             for key, value, secret in (
                 ("OPENSEEK_PROFILE", "vercel", False),
                 ("OPENSEEK_POOL_MODE", "channel", False),
                 ("OPENSEEK_SETUP_PENDING", "1", False),
+                ("OPENSEEK_ADMIN_TOKEN", admin_token, True),
                 ("OPENSEEK_SUPABASE_URL", supabase_url, False),
                 ("OPENSEEK_SUPABASE_SERVICE_KEY", supabase_secret, True),
                 ("OPENSEEK_SUPABASE_BUCKET", "openseek-staging", False),
@@ -265,6 +300,7 @@ class ParticipantSetup:
             project = {"name": str(self.state.get("vercel_project") or "")}
             self.provider.link_vercel_project(self.source_dir, project)
             for key, value, secret in (
+                ("OPENSEEK_ADMIN_TOKEN", self._owner_token(), True),
                 ("OPENSEEK_TELEGRAM_API_ID", str(api_id), False),
                 ("OPENSEEK_TELEGRAM_API_HASH", api_hash, True),
                 ("OPENSEEK_TELEGRAM_CHANNEL_ID", joined.channel_id, False),
@@ -277,6 +313,9 @@ class ParticipantSetup:
             self.provider.set_vercel_secret(self.source_dir, "OPENSEEK_SETUP_PENDING", "0", secret=False)
         except SetupFailure as exc:
             self.print(f"Could not save Telegram setup in your Vercel project ({exc.reason}). Retry this step.")
+            return 1
+        except (OSError, ValueError):
+            self.print("Could not save the local dashboard secret. Check that your setup folder is writable, then retry.")
             return 1
         self.state["telegram_channel_id"] = joined.channel_id
         self.state["step"] = "telegram_deployed"
@@ -311,6 +350,8 @@ class ParticipantSetup:
         try:
             self.provider.authenticate()
             self.provider.link_vercel_project(self.source_dir, {"name": project})
+            self.provider.set_vercel_secret(self.source_dir, "OPENSEEK_ADMIN_TOKEN",
+                                            self._owner_token(), secret=True)
             setup_key = str(self.state.get("pairing_setup_key") or secrets.token_urlsafe(32))
             self.state["pairing_setup_key"] = setup_key
             self.state["step"] = "pairing_configured"
@@ -347,8 +388,26 @@ class ParticipantSetup:
         self.print(f"Your OpenSeek node is ready at {deployment}.")
         self.print("On Nuvio, open Settings → OpenSeek → Pair and enter this one-time pairing bundle:")
         self.print(bundle)
-        self.print("Nuvio verifies the public HTTPS certificate and stores its own revocable device credential. Contributions start off; enable them in Nuvio when you choose to share.")
+        self.print(f"Dashboard access (owner secret): {deployment}/#{self._owner_token()}")
+        self.print("Nuvio connects over HTTPS and stores its own revocable device credential. Contributions start off; enable them in Nuvio when you choose to share.")
         return 0
+
+    def _owner_token_path(self) -> Path:
+        return self.state_path.with_name("participant-setup.admin-token")
+
+    def _owner_token(self) -> str:
+        path = self._owner_token_path()
+        try:
+            value = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            value = ""
+        if len(value) >= 32:
+            if os.name == "posix":
+                os.chmod(path, 0o600)
+            return value
+        value = secrets.token_urlsafe(32)
+        _atomic_secret(path, value)
+        return value
 
     def _supabase_project(self) -> dict:
         ref = str(self.state.get("supabase_ref") or "")

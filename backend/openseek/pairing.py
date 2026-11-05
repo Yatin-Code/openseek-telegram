@@ -175,6 +175,21 @@ class InviteManager:
     def knows(self, pair_id: str) -> bool:
         return isinstance(pair_id, str) and bool(_HEX32.fullmatch(pair_id)) and self.db.invite(pair_id) is not None
 
+    def role_of(self, pair_id: str) -> str | None:
+        invite = self.db.invite(pair_id) if isinstance(pair_id, str) and _HEX32.fullmatch(pair_id) else None
+        return invite.get("role") if invite else None
+
+    def is_owner_invite(self, pair_id_or_tag: str) -> bool:
+        if not isinstance(pair_id_or_tag, str):
+            return False
+        pair_id = pair_id_or_tag
+        if not _HEX32.fullmatch(pair_id):
+            tag = normalize_code(pair_id)
+            if len(tag) != INVITE_TAG_LEN:
+                return False
+            pair_id = self.db.invite_by_tag(tag, self.clock()) or ""
+        return self.role_of(pair_id) == "owner"
+
     def claim(self, pair_id: str, device_name: str, proof: str) -> dict:
         inv = self._live(pair_id)
         if inv is None:
@@ -267,7 +282,7 @@ class PairingManager:
             with self._lock:
                 if not self._starts.hit():
                     raise RateLimited()
-            if self.invites is None or not self.sharing_enabled():
+            if self.invites is None or (not self.sharing_enabled() and not self.invites.is_owner_invite(invite)):
                 raise PairingClosed()
             return self.invites.start(invite)
         with self._lock:
@@ -290,7 +305,7 @@ class PairingManager:
             with self._lock:
                 if not self._claims.hit():
                     raise RateLimited()
-            if not self.sharing_enabled():
+            if not self.sharing_enabled() and not self.invites.is_owner_invite(pair_id):
                 raise PairingFailed()
             return self.invites.claim(pair_id, device_name, proof)
         with self._lock:

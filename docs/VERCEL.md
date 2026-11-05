@@ -60,6 +60,29 @@ OpenSeek configuration. The Supabase secret key is held in process memory only l
 enough for the wizard to configure the private bucket and pipe it to `vercel env add`;
 the command captures provider output and never prints the key.
 
+The wizard creates a random `OPENSEEK_ADMIN_TOKEN` for the dashboard. It stores that
+first-party owner secret separately at
+`~/.config/openseek/participant-setup.admin-token` with owner-only permissions and
+prints a dashboard link with the secret in the URL fragment. `OPENSEEK_PUBLIC_TLS_PIN`
+is optional for participant nodes; when configured, it adds an exact certificate-key
+pin to Nuvio's normal HTTPS verification.
+
+## Browser dashboard
+
+The same dashboard serves local/VPS and Vercel nodes. It can inspect pairing and pool
+status, revoke devices and invites, enable or disable guest uploads, and start explicit
+NVMT generation. On Vercel, open the root deployment URL with the owner secret in the
+fragment once, such as `https://your-node.vercel.app/#<OPENSEEK_ADMIN_TOKEN>`. The
+dashboard keeps it in that browser session and removes it from the address bar. The
+owner secret is separate from Nuvio's pool keys and paired-device token.
+
+Generation is started only from the dashboard. Its source URL stays in the running
+function's memory; only generation progress and publication status are stored in
+Supabase. A Vercel generation is bounded to 270 seconds so it can finish within the
+function's configured duration. If the invocation times out or is interrupted, the
+dashboard reports that state and the owner can retry it. Local/VPS generation runs
+outside the Vercel function deadline.
+
 ## Runtime data
 
 - Telegram holds accepted package tiles and manifests as the canonical shared pool.
@@ -74,3 +97,8 @@ Vercel's `/tmp` directory is scratch space only. Function instances do not share
 The node must not depend on background workers or a frequent Cron schedule: reads and
 contribution requests advance bounded work. If a provider quota or inactivity pause
 stops the node, local thumbnail generation remains available.
+
+The wizard authorizes one Telegram user session for this node. OpenSeek stores the
+StringSession as a Vercel secret and uses a short Supabase lease to serialize requests
+that access the shared group. Each invocation disconnects before releasing the lease;
+a warm function instance reconnects on its next request.

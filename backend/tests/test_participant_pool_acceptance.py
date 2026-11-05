@@ -20,6 +20,7 @@ from openseek.pool import decode_nvmt, encode_nvmt
 from openseek.remote import (RemoteChannelStore, RemotePairingStore,
                              RemoteTelegramSessionLease, RemoteUploadQueueStore,
                              SupabaseClient)
+from openseek.remote_admin import RemoteAdminStore
 from openseek.uploads import UploadService
 from test_participant_setup import FakeProvider, FakeTelegramJoiner, _source
 from test_pool_channel import MemoryChannel, jpeg
@@ -223,6 +224,7 @@ def _node(tmp_path: Path, tag: str, telegram: MemoryChannel, fake: StatefulSupab
     from openseek.vercel import build_app
 
     cfg = Settings(data_dir=tmp_path / tag, profile="vercel", pool_mode="channel",
+                   admin_token=f"participant-owner-{tag}-secret",
                    contribution=contribution, telegram_channel_id=telegram.channel_id,
                    telegram_session=f"session-{tag}", telegram_api_id=123,
                    telegram_api_hash=f"api-hash-{tag}",
@@ -235,6 +237,7 @@ def _node(tmp_path: Path, tag: str, telegram: MemoryChannel, fake: StatefulSupab
     if old_client:
         old_client.close()
     core.supabase = client
+    core.state_store = RemoteAdminStore(client)
     core.channel_index.store = RemoteChannelStore(client)
     core.pairing_store = RemotePairingStore(client)
     core.auth = DeviceAuth(core.pairing_store)

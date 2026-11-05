@@ -21,11 +21,11 @@ def load(tmp_path, content, env=None, raw=False):
 
 def test_allowlisted_keys_applied(tmp_path):
     s = load(tmp_path, {"port": 9001, "admin_port": 9002, "cache_max_bytes": 512 * MiB, "retention_days": 7,
-                        "bg_mbps": 4.5, "workers_per_source": 3, "playback_guard": True, "log_level": "DEBUG",
-                        "contrib_hosts": "a.example", "public_port": 9003, "public_host": "x.example.org:443"})
+                        "bg_mbps": 4.5, "workers_per_source": 3, "log_level": "DEBUG",
+                        "public_port": 9003, "public_host": "x.example.org:443"})
     assert (s.port, s.admin_port, s.cache_max_bytes, s.retention_days, s.bg_mbps) == (9001, 9002, 512 * MiB, 7.0, 4.5)
-    assert s.workers_per_source == 3 and s.playback_guard is True and s.log_level == "DEBUG"
-    assert s.contrib_hosts == "a.example" and s.public_port == 9003 and s.public_host == "x.example.org:443"
+    assert s.workers_per_source == 3 and s.log_level == "DEBUG"
+    assert s.public_port == 9003 and s.public_host == "x.example.org:443"
 
 
 def test_env_overrides_file(tmp_path):
@@ -38,11 +38,11 @@ def test_forbidden_and_unknown_keys_ignored(tmp_path, caplog):
     d = tmp_path / "evil"
     s = load(tmp_path, {"data_dir": str(d), "capture_source_file": str(d / "x"), "allow_public_clients": True,
                         "allow_http_sources": False, "allowed_ports": "22", "admin_token": "x", "nonsense": 1,
-                        "pregen": "off", "port": 9005})
+                        "port": 9005})
     base = Settings()
     assert s.data_dir == base.data_dir and s.capture_source_file == "" and s.allow_public_clients is False
     assert s.allow_http_sources is True and s.allowed_ports == base.allowed_ports and s.admin_token == ""
-    assert s.pregen == base.pregen and s.port == 9005
+    assert s.port == 9005
     assert "'data_dir'" in caplog.text and "'nonsense'" in caplog.text
 
 
@@ -86,17 +86,17 @@ def test_bom_prefixed_file(tmp_path):
 
 def test_bad_values_skip_only_that_key(tmp_path):
     s = load(tmp_path, {"port": "abc", "admin_port": 70000, "cache_max_bytes": 1, "bg_mbps": [1], "workers_per_source": 99,
-                        "playback_guard": "maybe", "retention_days": None, "upstream_rps": True, "max_active_sources": 4})
+                        "retention_days": None, "upstream_rps": True, "max_active_sources": 4})
     b = Settings()
     assert (s.port, s.admin_port, s.cache_max_bytes, s.bg_mbps, s.workers_per_source) == \
         (b.port, b.admin_port, b.cache_max_bytes, b.bg_mbps, b.workers_per_source)
-    assert s.playback_guard is False and s.retention_days == b.retention_days and s.upstream_rps == b.upstream_rps
+    assert s.retention_days == b.retention_days and s.upstream_rps == b.upstream_rps
     assert s.max_active_sources == 4
 
 
 def test_string_values_use_env_converters(tmp_path):
-    s = load(tmp_path, {"port": "9020", "playback_guard": "yes", "bg_mbps": "2.5"})
-    assert s.port == 9020 and s.playback_guard is True and s.bg_mbps == 2.5
+    s = load(tmp_path, {"port": "9020", "bg_mbps": "2.5"})
+    assert s.port == 9020 and s.bg_mbps == 2.5
 
 
 def test_cross_field_conflict_drops_key_not_server(tmp_path):
@@ -125,6 +125,8 @@ def vercel_env(**overrides):
         "OPENSEEK_TELEGRAM_SESSION": "1abc",
         "OPENSEEK_SUPABASE_URL": "https://project.supabase.co",
         "OPENSEEK_SUPABASE_SERVICE_KEY": "service-role-key",
+        "OPENSEEK_ADMIN_TOKEN": "owner-secret-is-long-enough",
+        "OPENSEEK_PUBLIC_TLS_PIN": "sha256//" + "A" * 43 + "=",
     }
     env.update(overrides)
     return env
@@ -160,12 +162,19 @@ def test_vercel_profile_requires_channel_pool_mode():
 @pytest.mark.parametrize("overrides", [
     {"OPENSEEK_SUPABASE_URL": ""},
     {"OPENSEEK_SUPABASE_SERVICE_KEY": ""},
+    {"OPENSEEK_PUBLIC_TLS_PIN": "sha256//not-a-pin"},
     {"OPENSEEK_SUPABASE_URL": "http://project.supabase.co"},
     {"OPENSEEK_SUPABASE_BUCKET": "../bad"},
 ])
 def test_vercel_profile_validates_supabase_settings(overrides):
     with pytest.raises(ConfigError):
         Settings.from_env({**vercel_env(**overrides), "OPENSEEK_PROFILE": "vercel"})
+
+
+def test_vercel_public_tls_pin_is_optional_but_validated_when_set():
+    settings = Settings.from_env({**vercel_env(OPENSEEK_PUBLIC_TLS_PIN=""),
+                                  "OPENSEEK_PROFILE": "vercel"})
+    assert settings.public_tls_pin == ""
 
 
 def test_vercel_profile_accepts_complete_settings():

@@ -1,7 +1,6 @@
-"""Device tokens (SR-5) and capability URLs (SR-7)."""
+"""Paired-device bearer token authentication."""
 from __future__ import annotations
 
-import base64
 import hashlib
 import hmac
 import os
@@ -13,7 +12,6 @@ from pathlib import Path
 from .db import DB
 from .ids import new_device_id
 
-CAP_MAX_TTL_S = 6 * 3600
 _TOKEN = re.compile(r"[A-Za-z0-9_-]{43}")
 
 
@@ -21,24 +19,26 @@ class DeviceAuth:
     """Bearer token -> device_id. Only SHA-256(token) is stored; comparisons are constant-time
     over every registered hash."""
 
-    def __init__(self, db: DB):
+    def __init__(self, db: DB, store=None):
         self.db = db
+        self.store = store or db
+        self._live_store = store is not None
         self._lock = threading.Lock()
         self._hashes: list[tuple[str, str]] = []
         self._roles: dict[str, tuple[str, float | None]] = {}
-        if not getattr(self.db, "is_remote", False):
+        if not self._live_store:
             self.reload()
 
     def reload(self) -> None:
         with self._lock:
-            rows = self.db.auth_rows()
+            rows = self.store.auth_rows()
             self._hashes = [(h, d) for h, d, _r, _e in rows]
             self._roles = {d: (r, e) for _h, d, r, e in rows}
 
     def register(self, device_name: str, token_hash: str, role: str = "owner", expires: float | None = None,
                  invite_id: str | None = None) -> str:
         device_id = new_device_id()
-        self.db.add_device(device_id, device_name, token_hash, role, expires, invite_id)
+        self.store.add_device(device_id, device_name, token_hash, role, expires, invite_id)
         self.reload()
         return device_id
 
@@ -53,7 +53,7 @@ class DeviceAuth:
         return r[0]
 
     def revoke(self, device_id: str) -> bool:
-        ok = self.db.remove_device(device_id)
+        ok = self.store.remove_device(device_id)
         self.reload()
         return ok
 
@@ -63,12 +63,9 @@ class DeviceAuth:
         token = authorization[7:].strip()
         if not _TOKEN.fullmatch(token):
             return None
-        # Vercel instances are disposable and can be long-lived after another
-        # function instance creates or revokes a device. Refresh before checking
-        # a syntactically valid device token so all instances see shared state.
-        if getattr(self.db, "is_remote", False):
-            self.reload()
         h = hashlib.sha256(token.encode()).hexdigest()
+        if self._live_store:
+            self.reload()                 # another serverless instance may have added/revoked a device
         found = None
         with self._lock:
             for stored, device_id in self._hashes:
@@ -76,31 +73,17 @@ class DeviceAuth:
                     found = device_id
         return found if self.role_of(found) is not None else None          # an expired guest is no device at all
 
+    def devices(self) -> list[dict]:
+        return self.store.devices()
 
-class CapSigner:
-    """cap = base64url(HMAC-SHA256(server_secret, device_id || preview_id || exp))[0:32]."""
+    def touch_device(self, device_id: str) -> None:
+        self.store.touch_device(device_id)
 
-    def __init__(self, secret: bytes, clock=time.time):
-        if len(secret) < 32:
-            raise ValueError("secret too short")
-        self.secret = secret
-        self.clock = clock
+    def can_contribute(self, device_id: str) -> bool:
+        return self.store.can_contribute(device_id)
 
-    def cap(self, device_id: str, preview_id: str, exp: int) -> str:
-        mac = hmac.new(self.secret, f"{device_id}{preview_id}{int(exp)}".encode(), hashlib.sha256).digest()
-        return base64.urlsafe_b64encode(mac).rstrip(b"=").decode()[:32]
-
-    def current_exp(self) -> int:
-        """Hour-bucketed expiry: URLs stay byte-identical for an hour (clients keep textures keyed
-        by URL) while always satisfying exp <= now + 6 h."""
-        now = int(self.clock())
-        return (now // 3600) * 3600 + CAP_MAX_TTL_S
-
-    def verify(self, cap: str, device_id: str, preview_id: str, exp: int) -> bool:
-        now = self.clock()
-        if not (now < exp <= now + CAP_MAX_TTL_S):
-            return False
-        return hmac.compare_digest(self.cap(device_id, preview_id, exp), cap)
+    def set_contribute(self, device_id: str, enabled: bool) -> bool:
+        return self.store.set_contribute(device_id, enabled)
 
 
 def admin_token(data_dir: Path, configured: str = "") -> str:

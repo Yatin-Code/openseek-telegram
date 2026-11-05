@@ -5,6 +5,8 @@ All notable changes are documented here. The format follows [Keep a Changelog](h
 ## [Unreleased]
 
 ### Added
+* One browser dashboard across local/VPS and Vercel, with a first-run Telegram setup wizard, private per-install `.env` storage, and durable Supabase-backed device/invitation/sharing state on Vercel.
+* Explicit dashboard NVMT generation with progress, bounded job execution, validated package assembly, and Telegram publication; player and pool lookup requests never start generation.
 * Participant-owned Vercel setup wizard for creating or linking each participant's own Vercel and Supabase projects,
   authorizing a Telegram user session, joining the shared supergroup, and pairing Nuvio without per-participant bots.
 * Vercel channel-pool deployment profile with Supabase-backed rebuildable index and temporary upload staging; Telegram remains the only durable package store.
@@ -19,6 +21,9 @@ All notable changes are documented here. The format follows [Keep a Changelog](h
 * `docs/TELEGRAM-POOL.md`, `UPSTREAMS.md`, and `LICENSES.md` documenting deployment, provenance, and licenses.
 
 ### Removed
+* The legacy `/v1/previews`, `/v1/lookup`, VTT, capability-image and sprite-sheet player surfaces; the browser dashboard is the only owner interface.
+* The Windows desktop-service installer and frozen Windows server build. Windows servers can still run from source.
+* On-demand sheet composition and the old title-library lookup and remapping code. Dashboard NVMT generation keeps the shared extraction worker.
 * The native Windows admin application and its build, release, installer and licensing paths. The server's browser dashboard at `http://127.0.0.1:8788` is the admin interface.
 
 ## [0.2.0] - 2026-10-19

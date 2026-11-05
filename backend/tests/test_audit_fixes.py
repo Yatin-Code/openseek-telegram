@@ -5,42 +5,6 @@ import pytest
 
 from openseek.db import DB
 from openseek.fetch import MAX_SOURCE_SIZE, _parse_cr
-from openseek.library import Library
-
-
-def _library(tmp_path):
-    db = DB(tmp_path / "x.db")
-    db.set_setting("metadata_index", "1")
-    return db, Library(db, cache=None)
-
-
-def _meta(db, fp):
-    return db.q("SELECT imdb_id, tmdb_id, season, episode FROM release_meta WHERE fp=?", (fp,))
-
-
-def test_a_contribution_cannot_relabel_an_existing_entry(tmp_path):
-    """The owner's entry for a file is labelled; a guest who streams the same bytes must not rewrite the ids."""
-    db, lib = _library(tmp_path)
-    fp = "ab" * 32
-    assert lib.record(fp, {"imdb_id": "tt0000001", "season": 0, "episode": 0}, 123)
-    # contributed job: first writer wins
-    lib.record(fp, {"imdb_id": "tt9999999", "season": 0, "episode": 0}, 123, replace=False)
-    assert _meta(db, fp) == [("tt0000001", None, 0, 0)]
-
-
-def test_a_contribution_still_labels_a_new_entry(tmp_path):
-    db, lib = _library(tmp_path)
-    fp = "cd" * 32
-    lib.record(fp, {"imdb_id": "tt0000002", "season": 1, "episode": 2}, 5, replace=False)
-    assert _meta(db, fp) == [("tt0000002", None, 1, 2)]
-
-
-def test_the_owner_can_still_correct_a_label(tmp_path):
-    db, lib = _library(tmp_path)
-    fp = "ef" * 32
-    lib.record(fp, {"imdb_id": "tt0000003", "season": 0, "episode": 0}, 5, replace=False)       # a guest's (maybe wrong) label
-    lib.record(fp, {"imdb_id": "tt0000004", "season": 0, "episode": 0}, 5)                        # the owner's own job
-    assert _meta(db, fp) == [("tt0000004", None, 0, 0)]
 
 
 @pytest.mark.parametrize("total", [2 ** 64, 2 ** 64 + 5, MAX_SOURCE_SIZE + 1, 10 ** 30])
@@ -253,13 +217,10 @@ def test_read_only_exposure_warns_but_write_exposure_refuses():
 
 
 def _pair_owner(srv):
-    """Full OSP1 pairing against a live test server; returns (token, device_id)."""
-    return _register_owner(srv)
-
-
-def _register_owner(srv):
-    from test_scenarios import _register
-    return _register(srv, "owner-tv")
+    """Register a local test device and return its token and device id."""
+    from openseek.pairing import new_token, token_hash
+    token = new_token()
+    return token, srv.core.auth.register("owner-tv", token_hash(token), role="owner")
 
 
 @pytest.mark.parametrize("value", ["127.0.0.1", "192.168.1.20", "10.0.0.5", "172.16.4.9", "::1", "fd00::5", "192.168.1.20,127.0.0.1", "host-network"])

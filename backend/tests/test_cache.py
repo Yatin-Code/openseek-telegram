@@ -1,8 +1,8 @@
 """SR-15/SR-16: atomic tiles, corruption detection, LRU eviction + retention, path hygiene."""
 from __future__ import annotations
 
-import io
 import os
+import io
 import time
 
 import pytest
@@ -75,22 +75,6 @@ def test_same_size_garbage_detected(cache, tmp_path):
     p = tmp_path / "cache" / FP1[:2] / FP1 / PROFILE / "tiles" / "4.jpg"
     p.write_bytes(b"\x00" * len(good))
     assert cache.tile_bytes(FP1, 4) is None
-
-
-def test_sheet_composed_from_tiles(cache):
-    for k in (0, 1, 99):
-        cache.put_tile(FP1, k, k * 10_000, jpeg((k, 255 - k, 0)))
-    data, v = cache.sheet_bytes(FP1, 0)
-    assert v == 3
-    im = Image.open(io.BytesIO(data))
-    assert im.size == (3200, 1800)
-    r, g, _ = im.getpixel((160, 90))
-    assert g > 200 and r < 40                           # tile 0 in slot 0
-    assert im.getpixel((1600, 900)) == (0, 0, 0)        # unfilled slot is black
-    assert cache.sheet_bytes(FP1, 0)[0] == data         # cached
-    cache.put_tile(FP1, 50, 500_000, jpeg())
-    assert cache.sheet_bytes(FP1, 0)[1] == 4            # new fill version
-    assert cache.sheet_bytes(FP1, 1) is None
 
 
 def test_persistence_across_instances(tmp_path):

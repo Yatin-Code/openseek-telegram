@@ -14,48 +14,47 @@ import os
 import re
 import socket
 import time
-from collections import deque
-from dataclasses import asdict
+from dataclasses import replace
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 import httpx
 
-from fastapi import FastAPI, Request
+from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, Response
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import API_VERSION, __version__
-from .library import Library, clean_ids
 from .pairing import InviteManager
-from .altpipeline import AltMeta
-from .altsource import Candidate
-from .auth import CapSigner, DeviceAuth, admin_token, load_or_create_secret
+from .auth import DeviceAuth, admin_token
 from .cache import Cache, PROFILE, secure_mkdir
 from .config import Settings
 from .db import DB
+from .envfile import write_env_file
 from .fetch import RangeProxy
-from .ids import is_cap, is_device_id, is_fingerprint, is_preview_id, parse_index
-from .jobs import Busy, Job, JobManager, SourceForbidden
+from .ids import is_device_id, is_fingerprint, is_invite_id, parse_index
+from .jobs import JobManager
 from .logutil import plain, setup_logging
 from .netpolicy import DestinationPolicy, filter_forwarded_headers
 from .pairing import PairingClosed, PairingFailed, PairingManager, RateLimited
 from .public import PublicLimiter, classify
-from .pool import (MAX_NVMT_BYTES, ChannelPoolClient, ChannelPoolSync, PoolClient,
-                   PoolError, PoolService, PoolSync, TelegramBotStore, decode_nvmt)
+from .pool import (MAX_NVMT_BYTES, ChannelPoolClient,
+                   ChannelPoolSync, PoolClient, PoolError, PoolService, PoolSync,
+                   TelegramBotStore, decode_nvmt)
+from .generation import GenerationError, GenerationService, GenerationStateStore
 from .channel_index import ChannelIndex
 from .channel_pool import ChannelPoolService, PoolWritePolicy
 from .remote import (RemoteChannelStore, RemotePairingStore, RemoteTelegramSessionLease,
                      RemoteStoreError, RemoteUploadQueueStore, SupabaseClient)
+from .remote_admin import RemoteAdminStore
 from .store import ChannelStore, UploadQueueStore
 from .uploads import UploadError, UploadService
 from .telegram_mt import TelegramMTProtoStore
 from .contribution import TelegramLibrarian
-from .contrib import ContributionPolicy, Spacing, clean_hosts
 from .tls import ensure_certificate
-from .vtt import LAYOUTS, render
 
 log = logging.getLogger("openseek.app")
 
@@ -93,6 +92,7 @@ class Core:
         self.channel_index = None
         self.librarian = None
         self.supabase = None
+        self.state_store = self.db
         self.uploads = None
         self.telegram_session_lease = None
         self.pairing_store = self.db
@@ -103,91 +103,88 @@ class Core:
                                                        settings.upstream_timeout_s)
             self.pool = PoolService(self.db, storage, settings.pool_read_key, settings.pool_write_key)
         if mode == "channel":
-            self.channel_store = pool_storage or TelegramMTProtoStore(settings)
-            self.pool_write_policy = PoolWritePolicy(
-                mode,
-                store=self.channel_store,
-                proxy_url=settings.pool_contrib_url,
-                librarian_url=_librarian_url(settings) or "")
-            if settings.profile == "vercel" or (settings.supabase_url and settings.supabase_service_key):
-                self.supabase = SupabaseClient(
-                    settings.supabase_url, settings.supabase_service_key,
-                    bucket=settings.supabase_bucket)
-            if settings.profile == "vercel":
-                self.telegram_session_lease = RemoteTelegramSessionLease(self.supabase)
-                self.pairing_store = RemotePairingStore(self.supabase)
-                index_store = RemoteChannelStore(self.supabase)
-                index_db = None
-            else:
-                index_store = ChannelStore(self.db)
-                index_db = self.db
-            self.channel_index = ChannelIndex(
-                index_store, self.channel_store, db=index_db,
-                channel_id=settings.telegram_channel_id,
-                scan_limit=settings.pool_channel_scan_limit, refresh_s=settings.pool_index_refresh_s)
-            self.pool = ChannelPoolService(self.channel_index, settings.pool_read_key, settings.pool_write_key)
-            if settings.profile == "vercel" or self.supabase is not None:
-                upload_store = (RemoteUploadQueueStore(self.supabase) if self.supabase is not None
-                                else UploadQueueStore(self.db))
-                self.uploads = UploadService(settings, self.supabase, self.pool, upload_store)
-            if settings.librarian_enabled and hasattr(self.channel_store, "set_message_handler"):
-                self.librarian = TelegramLibrarian(self.channel_store, self.channel_index)
-                self.librarian.attach()
-            self.pool_client = ChannelPoolClient(self.cache, self.channel_index, self.channel_store)
-            self.pool_sync = (ChannelPoolSync(self.db, self.cache, self.channel_store, self.channel_index)
-                              if settings.contribution else None)
+            self._configure_channel_pool(settings, pool_storage)
         else:
             self.pool_client = (PoolClient(settings.pool_url, settings.pool_read_key, settings.pool_write_key,
                                            settings.pool_timeout_s)
                                 if mode == "host" and settings.pool_url and settings.pool_read_key else None)
             self.pool_sync = (PoolSync(self.db, self.cache, self.pool_client)
                               if self.pool_client and settings.pool_share else None)
-        self.cert_path, self.key_path, self.spki_pin = ensure_certificate(
+        self.cert_path, self.key_path, generated_pin = ensure_certificate(
             self.data_dir, settings.tls_cert_file, settings.tls_key_file)
-        self.caps = CapSigner(load_or_create_secret(self.data_dir / "secret.key"))
+        self.spki_pin = settings.public_tls_pin if settings.profile == "vercel" else generated_pin
         self.admin_token = admin_token(self.data_dir, settings.admin_token)
-        pairing_pin = "" if settings.profile == "vercel" else self.spki_pin
-        self.auth = DeviceAuth(self.pairing_store)
-        self.invites = InviteManager(self.pairing_store, pairing_pin, self.auth.register)
-        self.pairing = PairingManager(pairing_pin, self.auth.register, invites=self.invites)
+        self.auth = DeviceAuth(self.db, store=self.pairing_store if settings.profile == "vercel" else None)
+        self.invites = InviteManager(self.pairing_store, self.spki_pin, self.auth.register)
+        self.pairing = PairingManager(self.spki_pin, self.auth.register, invites=self.invites)
         self.pairing.sharing_enabled = self.sharing_enabled
         self.public_limiter = PublicLimiter()
-        self.contrib_spacing = Spacing(6)
-        self.contrib_denied: deque = deque(maxlen=12)       # recent refused HOST NAMES (never paths or queries)
         self.proxy = proxy or RangeProxy()
         self.policy = policy or DestinationPolicy(settings.allowed_ports, settings.allow_http_sources)
-        self.jobs = JobManager(settings, self.policy, self.cache, self.db, self.proxy, engine_factory)
+        self.jobs = JobManager(settings, self.policy, self.cache, self.proxy, engine_factory)
         self.jobs.pool_client = self.pool_client
         self.jobs.pool_sync = self.pool_sync
-        self.library = Library(self.db, self.cache)
-        self.jobs.library = self.library
+        self.generations = GenerationService(
+            self, GenerationStateStore(self.db, self.supabase if settings.profile == "vercel" else None))
         self.started = time.time()
         self.closing = False
         self.ffmpeg = _engine_available()
 
-    def contributions_enabled(self) -> bool:
-        if self.settings.profile == "vercel":
-            return self.settings.contribution
-        return self.sharing_enabled() and self.db.get_setting("contrib_enabled") == "1"
-
-    def contrib_hosts(self) -> list[str]:
-        raw = self.db.get_setting("contrib_hosts")
-        if raw is not None:
-            try:
-                return clean_hosts(json.loads(raw))
-            except ValueError:
-                pass
-        return clean_hosts(self.settings.contrib_hosts.split(","))
+    def _configure_channel_pool(self, settings: Settings, channel_store=None) -> None:
+        """Wire the channel pool for startup or for the local browser setup wizard."""
+        self.settings = settings
+        self.channel_store = channel_store or TelegramMTProtoStore(settings)
+        self.pool_write_policy = PoolWritePolicy(
+            "channel", store=self.channel_store, proxy_url=settings.pool_contrib_url,
+            librarian_url=_librarian_url(settings) or "")
+        if settings.profile == "vercel" or (settings.supabase_url and settings.supabase_service_key):
+            self.supabase = SupabaseClient(settings.supabase_url, settings.supabase_service_key,
+                                           bucket=settings.supabase_bucket)
+        if settings.profile == "vercel":
+            index_store = RemoteChannelStore(self.supabase)
+            index_db = None
+            self.state_store = RemoteAdminStore(self.supabase)
+            self.telegram_session_lease = RemoteTelegramSessionLease(self.supabase)
+            self.pairing_store = RemotePairingStore(self.supabase)
+        else:
+            index_store = ChannelStore(self.db)
+            index_db = self.db
+            self.state_store = self.db
+        self.channel_index = ChannelIndex(
+            index_store, self.channel_store, db=index_db,
+            channel_id=settings.telegram_channel_id,
+            scan_limit=settings.pool_channel_scan_limit, refresh_s=settings.pool_index_refresh_s)
+        self.pool = ChannelPoolService(self.channel_index, settings.pool_read_key, settings.pool_write_key)
+        if settings.profile == "vercel" or self.supabase is not None:
+            upload_store = (RemoteUploadQueueStore(self.supabase) if self.supabase is not None
+                            else UploadQueueStore(self.db))
+            self.uploads = UploadService(settings, self.supabase, self.pool, upload_store)
+        else:
+            self.uploads = None
+        if settings.librarian_enabled and hasattr(self.channel_store, "set_message_handler"):
+            self.librarian = TelegramLibrarian(self.channel_store, self.channel_index)
+            self.librarian.attach()
+        self.pool_client = ChannelPoolClient(self.cache, self.channel_index, self.channel_store)
+        self.pool_sync = (ChannelPoolSync(self.db, self.cache, self.channel_store, self.channel_index)
+                          if settings.contribution else None)
+        if hasattr(self, "jobs"):
+            self.jobs.settings = settings
+            self.jobs.pool_client = self.pool_client
+            self.jobs.pool_sync = self.pool_sync
 
     def can_contribute(self, device_id: str | None) -> bool:
-        return bool(device_id and self.contributions_enabled() and self.auth.role_of(device_id) == "guest"
-                    and self.pairing_store.can_contribute(device_id))
+        return bool(device_id and self.pool_contributions_enabled()
+                    and self.auth.role_of(device_id) == "guest"
+                    and self.auth.can_contribute(device_id))
+
+    def pool_contributions_enabled(self) -> bool:
+        """Owner-controlled guest NVMT writes; the setting key also preserves existing installs."""
+        return (self.sharing_enabled() and
+                self.state_store.get_setting("contrib_enabled") == "1")
 
     def sharing_enabled(self) -> bool:
         """The owner's kill switch for everything a guest can do. Off unless the owner turned it on."""
-        if self.settings.profile == "vercel":
-            return True
-        return self.db.get_setting("sharing_enabled") == "1"
+        return self.state_store.get_setting("sharing_enabled") == "1"
 
     def start(self) -> "Core":
         self.proxy.start()
@@ -207,6 +204,7 @@ class Core:
 
     def stop(self) -> None:
         self.closing = True
+        self.generations.close()
         self.jobs.shutdown()
         if self.pool_sync:
             self.pool_sync.stop()
@@ -252,22 +250,10 @@ def client_ip_allowed(host: str | None, allow_public: bool) -> bool:
     return ip.is_loopback or ip.is_private or ip.is_link_local
 
 
-# A guest may do exactly this and nothing else (fail closed: a route that is not listed is refused). Capability URLs
-# (/v1/c/...) are checked separately and also bind to the device's own previews.
-_ID32 = r"[0-9a-f]{32}"
 GUEST_ALLOWED = (
     ("GET", re.compile(r"/v1/health")),
     ("GET", re.compile(r"/v1/pair/status")),
     ("DELETE", re.compile(r"/v1/pair")),                                  # leave: revokes only itself
-    ("POST", re.compile(r"/v1/lookup")),
-    ("PUT", re.compile(rf"/v1/previews/{_ID32}/offset")),
-    ("DELETE", re.compile(rf"/v1/previews/{_ID32}/offset")),
-    ("POST", re.compile(rf"/v1/previews/{_ID32}/reject")),
-    ("DELETE", re.compile(rf"/v1/previews/{_ID32}")),                     # no-op for a borrowed preview
-    ("POST", re.compile(r"/v1/contribute")),                              # allowed by role, then by switch + per-device permission
-    ("GET", re.compile(rf"/v1/contribute/{_ID32}")),
-    ("DELETE", re.compile(rf"/v1/contribute/{_ID32}")),
-    ("POST", re.compile(rf"/v1/contribute/{_ID32}/telemetry")),           # the contributor's own playback health
 )
 GUEST_WHEN_SHARING_OFF = (("GET", re.compile(r"/v1/health")), ("GET", re.compile(r"/v1/pair/status")),
                           ("DELETE", re.compile(r"/v1/pair")))
@@ -322,7 +308,7 @@ class Guard:
             ph = self.core.settings.public_host
             if ph:
                 scope["openseek.base"] = f"https://{ph}"
-        elif self.admin:
+        elif self.admin and self.core.settings.profile != "vercel":
             if not client_ip_allowed(client[0], False) or not ipaddress.ip_address(
                     (client[0] or "0.0.0.0").split("%")[0]).is_loopback:
                 return await _send_json(send, 403, {"error": "forbidden"})
@@ -334,7 +320,7 @@ class Guard:
         # Vercel's platform proxy always adds forwarded headers; refusing them would make the
         # profile unusable. They are never consulted for auth, rate limits, or base URLs. The
         # loopback admin listener keeps the strict local-only rules (F2 owns its surface).
-        forwarded_allowed = not self.admin and self.core.settings.profile == "vercel"
+        forwarded_allowed = self.core.settings.profile == "vercel"
         if not self.public and not forwarded_allowed and any(h in headers for h in PROXY_HEADERS):
             return await _send_json(send, 403, {"error": "proxy_refused"})
         clen = headers.get("content-length")
@@ -370,10 +356,14 @@ class Guard:
         else:
             path = scope.get("path", "")
             state = scope.setdefault("state", {})
-            device = self.core.auth.authenticate(headers.get("authorization"))
+            try:
+                device = self.core.auth.authenticate(headers.get("authorization"))
+            except Exception as exc:
+                log.warning("device authentication unavailable (%s)", type(exc).__name__)
+                return await _send_json(send, 503, {"error": "auth_unavailable"})
             state["device_id"] = device
             is_pool_route = path.startswith("/v1/pool/")
-            if path not in PUBLIC_PATHS and not path.startswith("/v1/c/") and not is_pool_route and device is None:
+            if path not in PUBLIC_PATHS and not is_pool_route and device is None:
                 return await self._deny(send, client, 401, {"error": "unauthorized"})
             role = self.core.auth.role_of(device)
             state["role"] = role
@@ -392,7 +382,7 @@ class Guard:
                             return await self._deny(send, client, 409, {"error": "pairing_closed"})
                     elif not (isinstance(j.get("pair_id"), str) and self.core.invites.knows(j["pair_id"])):
                         return await self._deny(send, client, 403, {"error": "pairing_failed"})
-            if role == "guest" and not path.startswith("/v1/c/") and not is_pool_route:
+            if role == "guest" and not is_pool_route:
                 method = scope["method"]
                 if not self.core.sharing_enabled() and not guest_route_allowed(method, path, GUEST_WHEN_SHARING_OFF):
                     return await _send_json(send, 403, {"error": "sharing_disabled"})
@@ -402,7 +392,7 @@ class Guard:
         async def send_wrapper(message):
             if message["type"] == "http.response.start":
                 if self.public and message.get("status") in (401, 403) and client[0]:
-                    self.core.public_limiter.strike(client[0])          # wrong proof, bad capability, guessed id ...
+                    self.core.public_limiter.strike(client[0])          # wrong proof, guessed id ...
                 hs = list(message.get("headers", []))
                 names = {k.lower() for k, _ in hs}
                 for k, v in SECURITY_HEADERS:
@@ -417,13 +407,28 @@ class Guard:
         await self.app(scope, replay, send_wrapper)
 
     def _admin_check(self, scope, headers) -> str | None:
-        port = self.core.settings.admin_port
         host = headers.get("host", "")
-        if host not in (f"127.0.0.1:{port}", f"localhost:{port}", f"[::1]:{port}"):
-            return "bad_host"                 # DNS-rebinding guard
+        if self.core.settings.profile == "vercel":
+            if not host or any(ch in host for ch in "\r\n/\\"):
+                return "bad_host"
+            origin = headers.get("origin")
+            if origin:
+                try:
+                    parsed = urlsplit(origin)
+                except ValueError:
+                    return "bad_origin"
+                if (parsed.scheme != "https" or parsed.netloc.casefold() != host.casefold() or
+                        parsed.path or parsed.query or parsed.fragment):
+                    return "bad_origin"
+        else:
+            port = self.core.settings.admin_port
+            if host not in (f"127.0.0.1:{port}", f"localhost:{port}", f"[::1]:{port}"):
+                return "bad_host"             # DNS-rebinding guard
         origin = headers.get("origin")
-        if origin is not None and origin not in (f"http://127.0.0.1:{port}", f"http://localhost:{port}"):
-            return "bad_origin"
+        if self.core.settings.profile != "vercel" and origin is not None:
+            if origin not in (f"http://127.0.0.1:{self.core.settings.admin_port}",
+                              f"http://localhost:{self.core.settings.admin_port}"):
+                return "bad_origin"
         if scope["method"] == "GET" and scope.get("path") == "/":
             return None                       # the static dashboard shell: no data, no secret; its script gets the token from the URL fragment
         given = headers.get("x-openseek-admin", "")
@@ -445,8 +450,7 @@ def _install_error_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(RemoteStoreError)
     async def _remote_store(request, exc: RemoteStoreError):
-        # Supabase errors contain provider-specific text and may include project
-        # details. Keep the public code stable and let clients fall back/retry.
+        # Provider response text can contain project details; expose a stable retryable code.
         log.warning("remote pool store unavailable (status=%d)", exc.status)
         return err(503, "pool_backend_unavailable", {"Retry-After": "5"})
 
@@ -466,108 +470,12 @@ def base_url(request: Request) -> str | None:
     return f"{request.url.scheme}://{host}"
 
 
+def request_host(request: Request) -> str | None:
+    host = request.headers.get("host", "")
+    return host if _HOST_RE.fullmatch(host) else None
+
+
 # ===================================================================== models
-class SourceIn(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    url: StrictStr = Field(min_length=1, max_length=4096)
-    headers: dict[StrictStr, StrictStr] | None = None
-    duration_ms: StrictInt | None = Field(default=None, ge=0, le=MAX_MS)
-
-    @field_validator("headers")
-    @classmethod
-    def _few_headers(cls, v):
-        if v is not None and len(v) > 32:
-            raise ValueError("too many headers")
-        return v
-
-
-class CandIn(BaseModel):
-    """Candidate metadata only: no URLs, no credentials. Held in memory, never persisted."""
-    model_config = ConfigDict(extra="ignore")
-    cid: StrictStr = Field(min_length=1, max_length=64)
-    title_key: StrictStr = Field(min_length=1, max_length=64)
-    height: StrictInt = Field(ge=0, le=8192)
-    duration_ms: StrictInt = Field(default=0, ge=0, le=MAX_MS)
-    size: StrictInt = Field(default=0, ge=0)
-    codec: StrictStr = Field(default="", max_length=32)
-    container: StrictStr = Field(default="", max_length=32)
-    name: StrictStr = Field(default="", max_length=240)
-    cached: StrictBool = False
-    resolved: StrictBool = False
-
-    def to_candidate(self) -> Candidate:
-        return Candidate(self.cid, self.title_key, self.height, self.duration_ms, self.size, self.codec,
-                         self.container, self.name, self.cached, self.resolved)
-
-
-class AltIn(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    play: CandIn
-    candidates: list[CandIn] = Field(default_factory=list, max_length=24)
-    telemetry: StrictBool = False          # the client will report playback health
-
-
-class AltSourceIn(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    cid: StrictStr = Field(min_length=1, max_length=64)
-    source: SourceIn
-
-
-class TelemetryIn(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    buffer_ms: StrictInt | None = Field(default=None, ge=0, le=600_000)
-    rebuffering: StrictBool = False
-    host: StrictStr | None = Field(default=None, max_length=255)
-    conns: StrictInt = Field(default=1, ge=0, le=64)
-
-
-class PreviewIn(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    source: SourceIn
-    alt: dict | None = None         # optional negotiation block; validated (AltIn) only when the feature is on
-    hints: dict | None = None       # accepted for compatibility; never used as a key, never stored
-    at_ms: StrictInt | None = Field(default=None, ge=0, le=MAX_MS)
-    playhead_ms: StrictInt | None = Field(default=0, ge=0, le=MAX_MS)
-    layout: Literal["tiles", "sheets", "hybrid"] = "hybrid"
-
-
-class LookupIn(BaseModel):
-    """What a device knows about the video it is about to play. No URL, no credentials, nothing about files."""
-    model_config = ConfigDict(extra="ignore")
-    imdb_id: StrictStr | None = Field(default=None, max_length=16)
-    tmdb_id: StrictInt | None = Field(default=None, ge=1, le=10 ** 9)
-    season: StrictInt = Field(default=0, ge=0, le=9999)
-    episode: StrictInt = Field(default=0, ge=0, le=9999)
-    duration_ms: StrictInt = Field(gt=0, le=MAX_MS)
-    size_bytes: StrictInt | None = Field(default=None, ge=0)
-    layout: Literal["tiles", "sheets", "hybrid"] = "hybrid"
-
-
-class OffsetIn(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    offset_ms: StrictInt = Field(ge=-21_600_000, le=21_600_000)   # t_cache = a * t_guest + offset_ms
-
-
-class LibraryIn(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    metadata_index: StrictBool
-    purge: StrictBool = False
-
-
-class PoolPurgeIn(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    dry_run: StrictBool = True
-    outbox_older_than_days: StrictInt = Field(default=30, ge=1, le=3650)
-    outbox_attempts: StrictInt = Field(default=5, ge=0, le=100)
-    vacuum: StrictBool = False
-
-
-class PriorityIn(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    at_ms: StrictInt | None = Field(default=None, ge=0, le=MAX_MS)
-    playhead_ms: StrictInt | None = Field(default=None, ge=0, le=MAX_MS)
-
-
 class ClaimIn(BaseModel):
     model_config = ConfigDict(extra="ignore")
     pair_id: StrictStr = Field(max_length=64)
@@ -588,6 +496,24 @@ class UploadIn(BaseModel):
     filename: StrictStr | None = Field(default=None, max_length=1024)
 
 
+class GenerationIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    source_url: StrictStr = Field(min_length=1, max_length=4096)
+    profile: Literal["nvmt-v1-g5", "nvmt-v1-g10"] = "nvmt-v1-g10"
+    imdb: StrictStr | None = Field(default=None, max_length=16)
+    season: StrictInt = Field(default=0, ge=0, le=9999)
+    episode: StrictInt = Field(default=0, ge=0, le=9999)
+    filename: StrictStr | None = Field(default=None, max_length=1024)
+
+
+class PoolPurgeIn(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    dry_run: StrictBool = True
+    outbox_older_than_days: StrictInt = Field(default=30, ge=1, le=3650)
+    outbox_attempts: StrictInt = Field(default=5, ge=0, le=100)
+    vacuum: StrictBool = False
+
+
 class StartIn(BaseModel):
     model_config = ConfigDict(extra="ignore")
     invite: StrictStr | None = Field(default=None, max_length=64)      # invitation id or its 4-letter tag (else the open window)
@@ -602,34 +528,13 @@ class InviteIn(BaseModel):
     read_only: StrictBool = False     # explicit Reader: by default an invited guest is a Contributor once the host enables contributions
 
 
-class EntryTagIn(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    imdb_id: StrictStr | None = Field(default=None, max_length=12)
-    tmdb_id: StrictInt | None = None
-    season: StrictInt = Field(default=0, ge=0, le=9999)
-    episode: StrictInt = Field(default=0, ge=0, le=9999)
-
-
-class ContribIn(BaseModel):
-    """What a Contributor hands over: the stream reference and what the title is. Nothing else is read."""
-    model_config = ConfigDict(extra="ignore")
-    source: SourceIn
-    imdb_id: StrictStr | None = Field(default=None, max_length=16)
-    tmdb_id: StrictInt | None = Field(default=None, ge=1, le=10 ** 9)
-    season: StrictInt = Field(default=0, ge=0, le=9999)
-    episode: StrictInt = Field(default=0, ge=0, le=9999)
-    duration_ms: StrictInt = Field(ge=60_000, le=MAX_MS)
-
-
-class ContribAdminIn(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    enabled: StrictBool | None = None
-    hosts: list[StrictStr] | None = Field(default=None, max_length=64)
-
-
-class PermIn(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    contribute: StrictBool
+class AdminSetupIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    telegram_channel_id: StrictStr = Field(min_length=1, max_length=128)
+    telegram_api_id: StrictInt = Field(gt=0)
+    telegram_api_hash: StrictStr = Field(min_length=8, max_length=256)
+    telegram_bot_token: StrictStr | None = Field(default=None, max_length=256)
+    telegram_session: StrictStr | None = Field(default=None, max_length=8192)
 
 
 class SharingIn(BaseModel):
@@ -642,6 +547,16 @@ class SetupPairingIn(BaseModel):
     label: StrictStr = Field(default="Nuvio TV", max_length=64)
 
 
+class PermIn(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    contribute: StrictBool
+
+
+class PoolContributionsIn(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    enabled: StrictBool
+
+
 # ===================================================================== API app
 def create_api_app(core: Core, public: bool = False) -> FastAPI:
     app = FastAPI(title="OpenSeek", version=__version__, docs_url=None, redoc_url=None, openapi_url=None,
@@ -650,30 +565,8 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
     jobs = core.jobs
     s = core.settings
 
-    def preview_body(request: Request, job: Job, as_id: str) -> dict:
-        snap = jobs.snapshot(job)
-        base = base_url(request)
-        exp = core.caps.current_exp()
-        cap = core.caps.cap(job.device_id, as_id, exp)
-        vtt_url = f"{base}/v1/c/{cap}/{as_id}/thumbs.vtt?exp={exp}&layout={job.layout}" if base else None
-        state = snap["state"]
-        body = {"preview_id": as_id, "state": state, "error": snap["error"], "vtt_url": vtt_url,
-                "vtt_version": snap["vtt_version"], "source_duration_ms": snap["source_duration_ms"],
-                "tile_interval_ms": 10_000, "tolerance_ms": s.tolerance_ms,
-                "progress": {"tiles_done": snap["tiles_done"], "tiles_total": snap["tiles_total"]},
-                "refresh_after_ms": {"preparing": 1000, "ready": 2000}.get(state, 10_000)}
-        alt_view = jobs.alt_view(job)
-        if alt_view is not None:                        # key absent for clients/servers without the feature
-            body["alt"] = alt_view
-        return body
-
     def device(request: Request) -> str:
         return request.state.device_id
-
-    def job_or_404(request: Request, preview_id: str) -> Job | None:
-        if not is_preview_id(preview_id):
-            return None
-        return jobs.get(device(request), preview_id)
 
     def pool_key(request: Request) -> str | None:
         scheme, _, credential = request.headers.get("authorization", "").partition(" ")
@@ -778,9 +671,8 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
 
     @app.post("/v1/setup/pairing")
     async def setup_pairing(request: Request, body: SetupPairingIn | None = None):
-        # The CLI wizard installs this short-lived key only while it creates the
-        # owner's first Nuvio invite, then removes it and redeploys. It is never
-        # the device bearer token and is not embedded in Nuvio.
+        # The participant wizard exposes this short-lived key only while creating
+        # the initial Nuvio invite, then removes it and redeploys.
         expected = os.environ.get("OPENSEEK_SETUP_KEY", "")
         scheme, _, supplied = request.headers.get("authorization", "").partition(" ")
         if (core.settings.profile != "vercel" or not expected or scheme.lower() != "bearer" or
@@ -797,208 +689,14 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
     @app.get("/v1/pair/status")
     async def pair_status(request: Request):
         d = device(request)
-        name = next((x["name"] for x in core.pairing_store.devices() if x["device_id"] == d), None)
-        core.pairing_store.touch_device(d)
+        name = next((x["name"] for x in core.auth.devices() if x["device_id"] == d), None)
+        core.auth.touch_device(d)
         return {"device_id": d, "device_name": name, "contribute": core.can_contribute(d)}
 
     @app.delete("/v1/pair", status_code=204)
     async def pair_revoke(request: Request):
         d = device(request)
-        await asyncio.to_thread(jobs.revoke_device, d)
         core.auth.revoke(d)
-        return Response(status_code=204)
-
-    @app.post("/v1/previews", status_code=202)
-    async def create_preview(request: Request, body: PreviewIn):
-        if request.url.query:
-            return err(400, "bad_request")          # SR-4: URLs never travel in query strings
-        if core.closing:
-            return err(503, "unavailable")
-        if base_url(request) is None:
-            return err(400, "bad_request")
-        headers = filter_forwarded_headers(body.source.headers)
-        try:
-            alt = None
-            if body.alt is not None and s.alt_source:
-                try:
-                    ai = AltIn.model_validate(body.alt)
-                except ValidationError:
-                    ai = None                           # a malformed block never breaks the preview request
-                if ai is not None and ai.telemetry:     # no telemetry => never offered
-                    skip = [x.strip().lower() for x in s.alt_skip_names.split(",") if x.strip()]
-                    cands = [c.to_candidate() for c in ai.candidates if not any(k in c.name.lower() for k in skip)]
-                    alt = AltMeta(ai.play.to_candidate(), cands, True)
-            hints = None
-            if isinstance(body.hints, dict):                 # only these four ids are ever looked at (and only with opt-in)
-                hints = {k: body.hints.get(k) for k in ("imdb_id", "tmdb_id", "season", "episode")}
-            job = await asyncio.to_thread(jobs.create, device(request), body.source.url, headers, body.at_ms,
-                                          body.playhead_ms, body.layout, alt, hints)
-        except SourceForbidden:
-            return err(400, "source_forbidden")
-        except Busy:
-            return err(429, "busy", {"Retry-After": "30"})
-        return JSONResponse(preview_body(request, job, job.preview_id), status_code=202)
-
-    @app.get("/v1/previews/{preview_id}")
-    async def get_preview(request: Request, preview_id: str, wait_version: int | None = None,
-                          wait_ms: int | None = None):
-        job = job_or_404(request, preview_id)
-        if job is None:
-            return err(404, "not_found")
-        jobs.touch(job)
-        if wait_version is not None:
-            deadline = time.monotonic() + max(0, min(int(wait_ms if wait_ms is not None else 1000), 2000)) / 1000
-            while jobs.version(job) <= wait_version and time.monotonic() < deadline:
-                if jobs.state(job)[0] in ("failed", "complete") and jobs.version(job) <= wait_version:
-                    break
-                await asyncio.sleep(0.025)
-        return preview_body(request, job, preview_id)
-
-    @app.post("/v1/previews/{preview_id}/priority")
-    async def set_priority(request: Request, preview_id: str, body: PriorityIn):
-        job = job_or_404(request, preview_id)
-        if job is None:
-            return err(404, "not_found")
-        jobs.priority(job, body.at_ms, body.playhead_ms)
-        return {"vtt_version": jobs.version(job), "state": jobs.state(job)[0]}
-
-    @app.post("/v1/previews/{preview_id}/alt-source", status_code=202)
-    async def alt_source(request: Request, preview_id: str, body: AltSourceIn):
-        if request.url.query:
-            return err(400, "bad_request")
-        job = job_or_404(request, preview_id)
-        if job is None:
-            return err(404, "not_found")
-        headers = filter_forwarded_headers(body.source.headers)
-        ok = await asyncio.to_thread(jobs.alt_attach, job, body.cid, body.source.url, headers)
-        if not ok:
-            return err(409, "not_wanted")
-        return {"state": "validating"}
-
-    @app.post("/v1/previews/{preview_id}/telemetry", status_code=204)
-    async def telemetry(request: Request, preview_id: str, body: TelemetryIn):
-        job = job_or_404(request, preview_id)
-        if job is None:
-            return err(404, "not_found")
-        jobs.telemetry(job, body.buffer_ms, body.rebuffering, body.host, body.conns)
-        return Response(status_code=204)
-
-    @app.post("/v1/lookup")
-    async def lookup(request: Request, body: LookupIn):
-        """Reuse of a cached timeline by a different release of the same title. A pure read: no job, no source, no
-        network. Every candidate is approximate; the device can adjust or reject it."""
-        if not core.library.enabled():
-            return err(403, "library_disabled")
-        ids = clean_ids(body.imdb_id, body.tmdb_id, body.season, body.episode)
-        if ids is None:
-            return err(400, "bad_request")
-        base = base_url(request)
-        if base is None:
-            return err(400, "bad_request")
-        res = await asyncio.to_thread(core.library.lookup, device(request), ids, body.duration_ms, body.size_bytes)
-        if not res["candidates"]:
-            return err(404, "not_cached")
-        exp = core.caps.current_exp()
-        for c in res["candidates"]:
-            cap = core.caps.cap(device(request), c["preview_id"], exp)
-            c["vtt_url"] = f"{base}/v1/c/{cap}/{c['preview_id']}/thumbs.vtt?exp={exp}&layout={body.layout}"
-        return res
-
-    # ---------------------------------------------------------------- guest contributions (narrow, off by default)
-    @app.post("/v1/contribute", status_code=202)
-    async def contribute(request: Request, body: ContribIn):
-        """An authorised Contributor hands over its stream so thumbnails are generated once for everybody. Reuses a cached
-        compatible release first; otherwise starts ONE background extraction under the contribution policy."""
-        d = device(request)
-        if request.url.query or core.closing:
-            return err(400, "bad_request")
-        if not core.can_contribute(d):
-            return err(403, "contribution_not_allowed")
-        if not core.contrib_spacing.hit(d):
-            return err(429, "rate_limited", {"Retry-After": "60"})
-        ids = clean_ids(body.imdb_id, body.tmdb_id, body.season, body.episode)
-        base = base_url(request)
-        if ids is None or base is None:
-            return err(400, "ids_required")
-        if core.library.enabled():                       # 1. a compatible release may already be cached: reuse, no extraction
-            res = await asyncio.to_thread(core.library.lookup, d, ids, body.duration_ms, None)
-            if res["candidates"]:
-                exp = core.caps.current_exp()
-                for c in res["candidates"]:
-                    cap = core.caps.cap(d, c["preview_id"], exp)
-                    c["vtt_url"] = f"{base}/v1/c/{cap}/{c['preview_id']}/thumbs.vtt?exp={exp}&layout=hybrid"
-                return JSONResponse({"state": "reused", **res}, status_code=200)
-        policy = ContributionPolicy(core.policy, core.contrib_hosts(), s.contrib_https_only,
-                                    on_denied=lambda h: core.contrib_denied.append((time.time(), h)))
-        hints = {"imdb_id": ids.imdb, "tmdb_id": ids.tmdb, "season": ids.season, "episode": ids.episode}
-        try:
-            job = await asyncio.to_thread(jobs.create, d, body.source.url, filter_forwarded_headers(body.source.headers), None, 0,
-                                          "hybrid", None, hints, policy, True)
-        except SourceForbidden:
-            return err(403, "source_not_allowed")                 # unsafe, private, redirected off-list: never says which
-        except Busy:
-            return err(429, "busy", {"Retry-After": "60"})
-        return JSONResponse(preview_body(request, job, job.preview_id), status_code=202)
-
-    def _my_contribution(request: Request, preview_id: str):
-        if not is_preview_id(preview_id):
-            return None
-        job = jobs.get(device(request), preview_id)
-        return job if job is not None and job.contributed else None
-
-    @app.get("/v1/contribute/{preview_id}")
-    async def contribution_status(request: Request, preview_id: str):
-        job = _my_contribution(request, preview_id)
-        if job is None or not core.can_contribute(device(request)):
-            return err(404, "not_found")
-        jobs.touch(job)
-        await asyncio.to_thread(jobs.resume, job)         # continues after a pause or an owner preemption; cached tiles are kept
-        return preview_body(request, job, preview_id)
-
-    @app.post("/v1/contribute/{preview_id}/telemetry", status_code=204)
-    async def contribution_telemetry(request: Request, preview_id: str, body: TelemetryIn):
-        job = _my_contribution(request, preview_id)
-        if job is None or not core.can_contribute(device(request)):
-            return err(404, "not_found")
-        jobs.telemetry(job, body.buffer_ms, body.rebuffering, body.host, body.conns)     # the viewer's playback guards HER job
-        return Response(status_code=204)
-
-    @app.delete("/v1/contribute/{preview_id}", status_code=204)
-    async def contribution_stop(request: Request, preview_id: str):
-        job = _my_contribution(request, preview_id)
-        if job is None:
-            return err(404, "not_found")
-        await asyncio.to_thread(jobs.delete, job)
-        return Response(status_code=204)
-
-    @app.put("/v1/previews/{preview_id}/offset")
-    async def set_offset(request: Request, preview_id: str, body: OffsetIn):
-        if not is_preview_id(preview_id):
-            return err(404, "not_found")
-        r = await asyncio.to_thread(core.library.set_offset, device(request), preview_id, body.offset_ms)
-        return r if r is not None else err(404, "not_found")
-
-    @app.delete("/v1/previews/{preview_id}/offset", status_code=204)
-    async def clear_offset(request: Request, preview_id: str):
-        if not is_preview_id(preview_id) or not await asyncio.to_thread(core.library.clear_offset, device(request), preview_id):
-            return err(404, "not_found")
-        return Response(status_code=204)
-
-    @app.post("/v1/previews/{preview_id}/reject", status_code=204)
-    async def reject_preview(request: Request, preview_id: str):
-        if not is_preview_id(preview_id) or not await asyncio.to_thread(core.library.reject, device(request), preview_id):
-            return err(404, "not_found")
-        return Response(status_code=204)
-
-    @app.delete("/v1/previews/{preview_id}", status_code=204)
-    async def delete_preview(request: Request, preview_id: str):
-        job = job_or_404(request, preview_id)
-        if job is None:
-            b = core.db.borrowed(preview_id) if is_preview_id(preview_id) else None
-            if b is not None and b[0] == device(request):
-                return Response(status_code=204)             # a borrowed preview has no job to stop: nothing to do
-            return err(404, "not_found")
-        await asyncio.to_thread(jobs.delete, job)
         return Response(status_code=204)
 
     # ------------------------------------------------------- shared tile pool
@@ -1223,7 +921,7 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
 
     @app.get("/v1/pool/{fp}/nvmt/manifest")
     async def pool_nvmt_manifest(request: Request, fp: str):
-        """Return bounded exact-package metadata before a client fetches NVMT chunks."""
+        """Return exact-package metadata before the client fetches NVMT chunks."""
         pool = core.pool
         if pool is None:
             return err(404, "not_found")
@@ -1238,7 +936,7 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
             if duration_ms and not 1 <= duration_ms <= MAX_MS:
                 return err(400, "bad_duration")
             manifest = await asyncio.to_thread(pool.manifest, fp, PROFILE)
-            tile_slots = []
+            tile_slots: list[int] = []
             stored_duration = 0
             if manifest is not None:
                 stored_duration = int(manifest.get("duration_ms") or 0)
@@ -1378,7 +1076,7 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
                 episode=body.episode, filename=body.filename)
         except UploadError as exc:
             return err(exc.status, exc.code)
-        except (ValueError, ValidationError):
+        except ValueError:
             return err(400, "bad_request")
         return JSONResponse(result, status_code=201, headers={"Cache-Control": "no-store"})
 
@@ -1396,8 +1094,6 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
             result = await asyncio.to_thread(core.uploads.finalize, upload_id)
         except UploadError as exc:
             return err(exc.status, exc.code)
-        # Nuvio follows finalize with a status request; that request is the
-        # request-driven publication trigger on serverless deployments.
         return JSONResponse(result, status_code=202, headers={"Cache-Control": "no-store"})
 
     @app.get("/v1/pool/uploads/{upload_id}")
@@ -1409,14 +1105,12 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
             return err(404, "unknown_upload")
         write_key = pool.authorize(pool_key(request), write=True)
         try:
-            # Check owner/device access before allowing the status poll to
-            # trigger any node-wide queue work.
+            # Check access before allowing the status poll to trigger node-wide work.
             result = await asyncio.to_thread(
                 core.uploads.status, upload_id, device_id=request.state.device_id,
                 write_key=write_key)
             if result["state"] in ("pending", "retrying", "paused"):
-                # A client poll is the request-driven retry trigger after a
-                # Telegram flood wait or a free-tier quota pause.
+                # Client polling is also the retry trigger on deployments without a worker.
                 await asyncio.to_thread(core.uploads.drain, 1)
             result = await asyncio.to_thread(
                 core.uploads.status, upload_id, device_id=request.state.device_id,
@@ -1450,85 +1144,6 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
             return err(503, "tick_failed")
         return JSONResponse(result, headers={"Cache-Control": "no-store"})
 
-    # ---------------------------------------------------------------- data plane
-    def data_access(request: Request, cap: str, preview_id: str):
-        """Returns (device_id, fp, job) when the capability (or Bearer) grants access, else None."""
-        if not is_preview_id(preview_id):
-            return None
-        found = jobs.lookup_data(preview_id)
-        if found is None:
-            return None
-        dev, fp, job = found
-        if core.auth.role_of(dev) is None:
-            return None                                   # revoked or expired device: its URLs stop working at once
-        if request.scope.get("openseek.public") and core.auth.role_of(dev) != "guest":
-            return None                                   # an owner's own previews are never served to the internet
-        if core.auth.role_of(dev) == "guest" and not core.sharing_enabled():
-            return None                                   # kill switch
-        bearer = request.state.device_id
-        if bearer is not None and bearer == dev:
-            return found
-        exp_s = request.query_params.get("exp", "")
-        if not is_cap(cap) or not exp_s.isdigit() or len(exp_s) > 12:
-            return None
-        if not core.caps.verify(cap, dev, preview_id, int(exp_s)):
-            return None
-        return found
-
-    @app.get("/v1/c/{cap}/{preview_id}/thumbs.vtt")
-    async def vtt(request: Request, cap: str, preview_id: str):
-        acc = data_access(request, cap, preview_id)
-        if acc is None:
-            return err(403, "forbidden")
-        dev, fp, job = acc
-        layout = request.query_params.get("layout") or (job.layout if job else "hybrid")
-        if layout not in LAYOUTS:
-            return err(400, "bad_request")
-        base = base_url(request)
-        if base is None:
-            return err(400, "bad_request")
-        if job is not None:
-            jobs.touch(job)
-        e = core.cache.entry(fp) if fp else None
-        exp = core.caps.current_exp()
-        m = core.library.mapping_for(preview_id) if job is None else None      # a borrowed preview: remap onto the guest's timeline
-        text = render(base, core.caps.cap(dev, preview_id, exp), preview_id, exp, layout,
-                      dict(e.tiles) if e else {}, e.duration_ms if e else None, e.n_tiles if e else None,
-                      s.tolerance_ms, (m[0], m[1], m[2]) if m is not None else None)
-        return Response(text, media_type="text/vtt; charset=utf-8", headers={"Cache-Control": "no-store"})
-
-    @app.get("/v1/c/{cap}/{preview_id}/tiles/{name}")
-    async def tile(request: Request, cap: str, preview_id: str, name: str):
-        acc = data_access(request, cap, preview_id)
-        if acc is None:
-            return err(403, "forbidden")
-        dev, fp, job = acc
-        k = parse_index(name[:-4]) if name.endswith(".jpg") else None
-        if k is None or fp is None:
-            return err(404, "not_found")
-        data = await asyncio.to_thread(core.cache.tile_bytes, fp, k)
-        if data is None:
-            return err(404, "not_found")
-        if job is not None:
-            jobs.touch(job)
-        return Response(data, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=86400"})
-
-    @app.get("/v1/c/{cap}/{preview_id}/sheets/{name}")
-    async def sheet(request: Request, cap: str, preview_id: str, name: str):
-        acc = data_access(request, cap, preview_id)
-        if acc is None:
-            return err(403, "forbidden")
-        dev, fp, job = acc
-        n = parse_index(name[:-4], 99_999) if name.endswith(".jpg") else None
-        if n is None or fp is None:
-            return err(404, "not_found")
-        got = await asyncio.to_thread(core.cache.sheet_bytes, fp, n)
-        if got is None:
-            return err(404, "not_found")
-        if job is not None:
-            jobs.touch(job)
-        return Response(got[0], media_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
-
     return Guard(app, core, public=public)  # type: ignore[return-value]
 
 
@@ -1546,38 +1161,74 @@ table{border-collapse:collapse}td,th{border:1px solid #ccc;padding:.3em .6em}.co
 letter-spacing:.15em;font-family:monospace}button{font-size:1em;margin:.2em}</style></head><body>
 <h1>OpenSeek</h1><div id=s>loading…</div>
 <script>
+const PROFILE='__PROFILE__';
 const T=(location.hash||'').slice(1)||sessionStorage.getItem('osk')||'';if(T)sessionStorage.setItem('osk',T);history.replaceState(null,'',location.pathname);
 const H={'X-OpenSeek-Admin':T};
+const PAIR_KEY='oskPairing';
 function esc(t){return String(t).replace(/[&<>"']/g,c=>'&#'+c.charCodeAt(0)+';')}
-async function act(m,u){await fetch(u,{method:m,headers:H});load()}
+function setupErrorText(code){const messages={telegram_access_denied:'OpenSeek cannot read this channel. Add the bot or account to the channel and grant access to its message history.',telegram_login_required:'Telegram rejected these credentials. Check the bot token or StringSession and Telegram API ID/hash.',telegram_unavailable:'Telegram could not be reached. Check the network and try again.',telegram_error:'Telegram could not verify this channel. Check the channel ID and account permissions.'};return messages[code]||('Setup failed ('+code+'). Check the channel ID, Telegram credentials, and channel permissions.')}
+async function act(m,u){await fetch(u,{method:m,headers:H});if(m==='DELETE'&&u==='/admin/pair'){sessionStorage.removeItem(PAIR_KEY);window.lastPairing=''}load()}
+async function openPair(){const r=await fetch('/admin/pair',{method:'POST',headers:H});const j=await r.json();
+window.lastPairing=r.ok?('Nuvio code: '+j.code+' | TLS pin: '+j.spki_pin+(j.join?' | Join link: '+j.join:'')):'Could not open pairing: '+(j.error||'request_failed');
+if(r.ok)sessionStorage.setItem(PAIR_KEY,window.lastPairing);else sessionStorage.removeItem(PAIR_KEY);load()}
 async function sharing(on){await fetch('/admin/sharing',{method:'PUT',headers:Object.assign({'Content-Type':'application/json'},H),body:JSON.stringify({enabled:on})});load()}
-async function meta(on){await fetch('/admin/library',{method:'PUT',headers:Object.assign({'Content-Type':'application/json'},H),body:JSON.stringify({metadata_index:on})});load()}
+async function poolContributions(on){await fetch('/admin/pool/contributions',{method:'PUT',headers:Object.assign({'Content-Type':'application/json'},H),body:JSON.stringify({enabled:on})});load()}
+async function deviceContribution(id,on){await fetch('/admin/devices/'+encodeURIComponent(id)+'/permissions',{method:'PUT',headers:Object.assign({'Content-Type':'application/json'},H),body:JSON.stringify({contribute:on})});load()}
 async function mkinvite(){const r=await fetch('/admin/invites',{method:'POST',headers:Object.assign({'Content-Type':'application/json'},H),body:JSON.stringify({public:!!window.pubOn})});
 const j=await r.json();window.lastInvite=r.ok?('Server '+j.address+' - code '+j.code+' (valid '+Math.round(j.expires_in_s/3600)+' h, one use). Join string: '+j.join):'Could not create: '+j.error;load()}
-async function load(){if(!T){document.getElementById('s').textContent='Open this page with: python -m openseek dashboard';return}
-const r=await (await fetch('/admin/status',{headers:H})).json();let h='';
-h+='<h2>Server</h2><p>API port <code>'+esc(r.server.port)+'</code>, addresses: <code>'+esc(r.server.addresses.join(', '))+
-'</code><br>Pin: <code>'+esc(r.server.spki_pin)+'</code></p><h2>Pairing</h2>';
-if(r.pairing.open){h+='<p class=code>'+esc(r.pairing.code)+'</p><p>expires in '+esc(r.pairing.expires_in_s)+
+async function generate(event){event.preventDefault();const d=Object.fromEntries(new FormData(event.currentTarget));d.season=Number(d.season||0);d.episode=Number(d.episode||0);
+const r=await fetch('/admin/generations',{method:'POST',headers:Object.assign({'Content-Type':'application/json'},H),body:JSON.stringify(d)});const j=await r.json();window.generationMessage=r.ok?'Generation started: '+j.generation_id:'Could not start generation: '+(j.error||'request_failed');load()}
+window.setupScreen=false;
+async function setupSubmit(event){event.preventDefault();const f=event.currentTarget;const d=Object.fromEntries(new FormData(f));d.telegram_api_id=Number(d.telegram_api_id);
+const r=await fetch('/admin/setup',{method:'POST',headers:Object.assign({'Content-Type':'application/json'},H),body:JSON.stringify(d)});const j=await r.json();
+if(!r.ok){document.getElementById('setupError').textContent=setupErrorText(j.error||'setup_failed');return}
+window.setupMessage='Telegram history is readable. Initial scan indexed '+j.initial_scan.indexed+' tiles; '+(j.channel_writable?'channel posting is available.':'this channel is read-only, so uploads are disabled. Grant the bot Post Messages permission to enable uploads.');window.setupScreen=false;load()}
+async function load(){if(!T){document.getElementById('s').textContent=PROFILE==='vercel'?'Open this page with the admin secret in the URL fragment: https://'+location.host+'/#<OPENSEEK_ADMIN_TOKEN>':'Open this page with: python -m openseek dashboard';return}
+const cfg=await (await fetch('/admin/setup',{headers:H})).json();if(cfg.setup_required){if(!window.setupScreen){window.setupScreen=true;document.getElementById('s').innerHTML=
+'<h2>Connect the Telegram pool</h2><p>OpenSeek stores packages in Telegram. Enter the channel and Telegram API details. Provide one identity: a bot token or a StringSession. The channel must allow history access; posting permission enables uploads.</p>'+
+'<form onsubmit="setupSubmit(event)"><p><label>Channel ID or username<br><input name="telegram_channel_id" required maxlength="128"></label></p>'+
+'<p><label>Telegram API ID<br><input name="telegram_api_id" type="number" min="1" required></label></p>'+
+'<p><label>Telegram API hash<br><input name="telegram_api_hash" type="password" autocomplete="off" required></label></p>'+
+'<p><label>Bot token (leave blank when using a StringSession)<br><input name="telegram_bot_token" type="password" autocomplete="off"></label></p>'+
+'<p><label>StringSession (leave blank when using a bot token)<br><input name="telegram_session" type="password" autocomplete="off"></label></p>'+
+'<p>Credentials are saved in the per-install private .env file. They are never shown in logs or returned by the server.</p>'+
+'<button type="submit">Verify channel and start scan</button> <span id="setupError" role="alert"></span></form>';}return}
+window.setupScreen=false;const r=await (await fetch('/admin/status',{headers:H})).json();
+if(!r.pairing.open){sessionStorage.removeItem(PAIR_KEY);window.lastPairing=''}else if(!window.lastPairing){window.lastPairing=sessionStorage.getItem(PAIR_KEY)||''}
+let h='';
+if(window.setupMessage){h+='<p>'+esc(window.setupMessage)+'</p>';window.setupMessage=''}
+h+='<h2>Server</h2><p>'+(r.server.profile==='vercel'?'Dashboard host <code>'+esc(location.host)+'</code>':'API port <code>'+esc(r.server.port)+'</code>, addresses: <code>'+esc(r.server.addresses.join(', '))+'</code>')+
+'<br>Pin: <code>'+esc(r.server.spki_pin)+'</code></p><h2>Pairing</h2>';
+if(window.lastPairing)h+='<p>'+esc(window.lastPairing)+'</p>';
+if(r.pairing.open){h+=(r.pairing.code?'<p class=code>'+esc(r.pairing.code)+'</p>':'')+'<p>expires in '+esc(r.pairing.expires_in_s)+
 ' s, attempts left '+esc(r.pairing.attempts_left)+'</p><button onclick="act(\\'DELETE\\',\\'/admin/pair\\')">Close</button>'}
 else{h+=(r.pairing.burned?'<p><b>Last window burned after too many wrong codes.</b></p>':'')+
-'<button onclick="act(\\'POST\\',\\'/admin/pair\\')">Open pairing window</button>'}
-h+='<h2>Devices</h2><table><tr><th>id</th><th>name</th><th></th></tr>';
-for(const d of r.devices){h+='<tr><td><code>'+esc(d.device_id)+'</code></td><td>'+esc(d.name)+
+'<button onclick="openPair()">Open pairing window</button>'}
+h+='<h2>Devices</h2><table><tr><th>id</th><th>name</th><th>NVMT uploads</th><th></th></tr>';
+for(const d of r.devices){h+='<tr><td><code>'+esc(d.device_id)+'</code></td><td>'+esc(d.name)+'</td><td>'+
+(d.role==='guest'?'<button onclick="deviceContribution(\\''+esc(d.device_id)+'\\','+(!d.contribute)+')">'+(d.contribute?'Disable':'Enable')+'</button>': 'Owner')+
 '</td><td><button onclick="act(\\'DELETE\\',\\'/admin/devices/'+esc(d.device_id)+'\\')">Revoke</button></td></tr>'}
 h+='</table>';
 const sh=await (await fetch('/admin/sharing',{headers:H})).json();
-h+='<h2>Sharing</h2><p>Sharing is <b>'+(sh.enabled?'ON':'OFF')+'</b> <button onclick="sharing('+(sh.enabled?'false':'true')+')">Turn '+(sh.enabled?'off':'on')+
-'</button> &nbsp; Title index (ids only) is <b>'+(sh.metadata_index?'ON':'OFF')+'</b> <button onclick="meta('+(sh.metadata_index?'false':'true')+')">Turn '+(sh.metadata_index?'off':'on')+'</button></p>';
+h+='<h2>Sharing</h2><p>Sharing is <b>'+(sh.enabled?'ON':'OFF')+'</b> <button onclick="sharing('+(sh.enabled?'false':'true')+')">Turn '+(sh.enabled?'off':'on')+'</button></p>';
+if(sh.enabled){h+='<p>Guest NVMT contributions are <b>'+(sh.pool_contributions_enabled?'ON':'OFF')+'</b> <button onclick="poolContributions('+(sh.pool_contributions_enabled?'false':'true')+')">Turn guest uploads '+(sh.pool_contributions_enabled?'off':'on')+'</button></p>'}
 window.pubOn=!!(sh.public&&sh.public.listening&&sh.public.host);if(sh.enabled){h+='<button onclick="mkinvite()">Create invitation'+(window.pubOn?' (public: '+esc(sh.public.host)+')':' (LAN)')+'</button> <span id=inv>'+esc(window.lastInvite||'')+'</span><table><tr><th>invitation</th><th>state</th><th>expires in</th><th></th></tr>';
 for(const i of sh.invites){h+='<tr><td>'+esc(i.label||i.invite_id.slice(0,8))+'</td><td>'+esc(i.state)+'</td><td>'+esc(i.expires_in_s)+' s</td><td>'+
 (i.state=='open'?'<button onclick="act(\\'DELETE\\',\\'/admin/invites/'+esc(i.invite_id)+'\\')">Revoke</button>':'')+'</td></tr>'}
 h+='</table>'}
 h+='<h2>Pool</h2>';
-const p=await (await fetch('/admin/pool/status',{headers:H})).json();
+ h+='<h2>Generate NVMT package</h2><p>This runs only when you start it here. It reads the media URL and publishes the generated package to Telegram.</p><form onsubmit="generate(event)">'+
+'<p><label>Media URL<br><input name="source_url" type="url" required maxlength="4096" style="width:100%"></label></p><p><label>Profile <select name="profile"><option>nvmt-v1-g10</option><option>nvmt-v1-g5</option></select></label> '+
+'<label>IMDb ID <input name="imdb" placeholder="tt1234567"></label> <label>Season <input name="season" type="number" min="0" value="0"></label> <label>Episode <input name="episode" type="number" min="0" value="0"></label></p>'+
+'<p><label>Filename hint <input name="filename" maxlength="1024"></label> <button type="submit">Generate and publish</button></p></form>'+
+(window.generationMessage?'<p role="status">'+esc(window.generationMessage)+'</p>':'')+'<div id="generationJobs"></div>';
+const gj=await (await fetch('/admin/generations',{headers:H})).json();document.getElementById('generationJobs').innerHTML=gj.jobs.map(j=>'<p><code>'+esc(j.generation_id)+'</code> '+esc(j.state)+' · '+esc(j.tiles_done||0)+'/'+esc(j.tiles_total||'?')+' tiles'+(j.error?' · '+esc(j.error):'')+'</p>').join('');
+const pr=await fetch('/admin/pool/status',{headers:H});const p=await pr.json();
+if(!pr.ok)h+='<p role="alert">Pool setup check failed: '+esc(setupErrorText(p.reason||p.error||'setup_failed'))+'</p>';
 h+='<p>Mode <b>'+esc(p.mode)+'</b>';
-if(p.mode==='channel'){h+='; channel <code>'+esc(p.channel_id)+'</code>; '+esc(p.tiles)+' tiles; last message '+
-esc(p.last_message_id)+'; pending uploads '+esc(p.outbox)+' <button onclick="act(\\'POST\\',\\'/admin/pool/scan\\')">Scan</button> '+
+if(p.mode==='channel'){h+='; channel <code>'+esc(p.channel_id)+'</code>; '+esc(p.tiles)+' tiles; history '+
+(p.history_readable?'readable':'unavailable')+'; posting '+(p.channel_writable?'available':'read-only')+(p.channel_writable?'':'; grant the bot Post Messages permission to enable uploads')+'; last message '+
+esc(p.last_message_id)+'; pending uploads '+esc(p.outbox)+(p.last_error?'; last error '+esc(setupErrorText(p.last_error)):'')+' <button onclick="act(\\'POST\\',\\'/admin/pool/scan\\')">Scan</button> '+
 '<button onclick="act(\\'POST\\',\\'/admin/pool/rebuild\\')">Rebuild index</button>'}
 else if(p.mode==='host'){h+='; API '+(p.api_enabled?'enabled':'disabled')+(p.api_url?'; URL <code>'+esc(p.api_url)+'</code>':'')+
 '; '+esc(p.tiles)+' tiles; '+
@@ -1612,110 +1263,92 @@ def create_admin_app(core: Core) -> FastAPI:
 
     @app.get("/", response_class=HTMLResponse)
     async def index():
-        return HTMLResponse(_ADMIN_HTML, headers={
+        return HTMLResponse(_ADMIN_HTML.replace("const PROFILE='__PROFILE__';",
+                                               f"const PROFILE='{core.settings.profile}';"), headers={
             "Content-Security-Policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
                                        "connect-src 'self'; frame-ancestors 'none'"})
 
+    @app.get("/admin/setup")
+    async def setup_status():
+        return {"profile": core.settings.profile,
+                "setup_required": core.settings.profile == "local" and
+                                 core.settings.effective_pool_mode == "local"}
+
+    @app.post("/admin/setup")
+    async def setup(body: AdminSetupIn):
+        if core.settings.profile == "vercel":
+            return err(409, "set_environment_variables_in_vercel")
+        if core.channel_index is not None:
+            return err(409, "already_configured")
+        channel_id = body.telegram_channel_id.strip()
+        bot_token = (body.telegram_bot_token or "").strip()
+        session = (body.telegram_session or "").strip()
+        if not channel_id or bool(bot_token) == bool(session):
+            return err(400, "bad_telegram_settings")
+        if session and (any(sep in session for sep in ("/", "\\")) or
+                        session.startswith("~") or session.endswith(".session")):
+            return err(400, "telegram_session_must_be_a_string_session")
+
+        settings = replace(core.settings, profile="local", pool_mode="channel", pool_enabled=False,
+                           telegram_channel_id=channel_id, telegram_api_id=body.telegram_api_id,
+                           telegram_api_hash=body.telegram_api_hash.strip(), telegram_bot_token=bot_token,
+                           telegram_session=session, telegram_session_file=None, contribution=False,
+                           pool_channel_writable="auto")
+        try:
+            settings.validate()
+            probe = TelegramMTProtoStore(settings)
+            probe.start()                         # resolves the channel and checks readable history + posting rights
+            probe.scan(0, 1)                      # verify that history can actually be read
+        except (ValueError, PoolError) as exc:
+            if "probe" in locals():
+                probe.close()
+            return err(400 if isinstance(exc, ValueError) else exc.status,
+                       getattr(exc, "code", "bad_telegram_settings"))
+
+        try:
+            write_env_file(core.data_dir / ".env", {
+                "OPENSEEK_PROFILE": "local", "OPENSEEK_POOL_MODE": "channel",
+                "OPENSEEK_TELEGRAM_CHANNEL_ID": channel_id,
+                "OPENSEEK_TELEGRAM_API_ID": str(body.telegram_api_id),
+                "OPENSEEK_TELEGRAM_API_HASH": settings.telegram_api_hash,
+                "OPENSEEK_TELEGRAM_BOT_TOKEN": bot_token,
+                "OPENSEEK_TELEGRAM_SESSION": session,
+                "OPENSEEK_POOL_CHANNEL_WRITABLE": "auto",
+                "OPENSEEK_CONTRIBUTION": "0",
+            })
+            core._configure_channel_pool(settings, probe)
+            scan = await asyncio.to_thread(core.channel_index.refresh, True)
+            core.channel_index.start()
+        except (OSError, PoolError) as exc:
+            if core.channel_store is not probe:
+                probe.close()
+            log.warning("browser Telegram setup failed (%s)", type(exc).__name__)
+            return err(503, getattr(exc, "code", "setup_failed"))
+        return {"configured": True, "profile": "local", "history_readable": probe.history_readable,
+                "channel_writable": probe.can_post, "initial_scan": scan}
+
     @app.get("/admin/status")
     async def status():
-        return {"server": {"port": core.settings.port, "addresses": lan_addresses(), "spki_pin": core.spki_pin},
-                "pairing": core.pairing.admin_status(), "devices": core.db.devices(),
+        pairing = core.pairing.admin_status()
+        if core.settings.profile == "vercel":
+            active = [invite for invite in core.invites.listing()
+                      if invite["role"] == "owner" and invite["state"] == "open"]
+            pairing = {"open": bool(active), "expires_in_s": max(
+                (invite["expires_in_s"] for invite in active), default=0),
+                "attempts_left": min((invite["attempts_left"] for invite in active), default=0)}
+        return {"server": {"profile": core.settings.profile, "port": core.settings.port,
+                            "addresses": lan_addresses(), "spki_pin": core.spki_pin},
+                "pairing": pairing, "devices": core.auth.devices(),
                 "cache": core.cache.stats(), "active_sources": len(core.jobs.running_sources())}
-
-    @app.get("/admin/metrics")
-    async def metrics():
-        # No upstream URLs, capabilities, device identities or pairing material.
-        sources = []
-        with core.jobs.lock:
-            current = list(core.jobs.sources.values())
-            failed_jobs = [{"error": j.error, "host": j.diagnostic_host}
-                           for j in core.jobs.jobs.values() if j.error]
-        for src in current:
-            entry = core.cache.entry(src.fp)
-            covered_ms = duration_ms = 0
-            pts_sorted: list[int] = []
-            tile_keys: set[int] = set()
-            if entry is not None:
-                with entry.lock:
-                    duration_ms = entry.duration_ms or 0
-                    pts_sorted = sorted(entry.tiles.values())
-                    tile_keys = set(entry.tiles.keys())
-                    end = 0
-                    for pts in pts_sorted:
-                        a = max(0, pts - core.settings.tolerance_ms)
-                        b = min(duration_ms, pts + core.settings.tolerance_ms)
-                        covered_ms += max(0, b - max(end, a))
-                        end = max(end, b)
-            tol = core.settings.tolerance_ms
-            if duration_ms > 0 and pts_sorted:
-                pgaps = ([pts_sorted[0]]
-                         + [pts_sorted[i + 1] - pts_sorted[i] for i in range(len(pts_sorted) - 1)]
-                         + [max(0, duration_ms - pts_sorted[-1])])
-                max_point_gap_ms = max(pgaps)
-                ugaps = ([max(0, pts_sorted[0] - tol)]
-                         + [max(0, (pts_sorted[i + 1] - tol) - (pts_sorted[i] + tol))
-                            for i in range(len(pts_sorted) - 1)]
-                         + [max(0, duration_ms - (pts_sorted[-1] + tol))])
-                max_uncovered_gap_ms = max(ugaps)
-            else:
-                max_point_gap_ms = duration_ms
-                max_uncovered_gap_ms = duration_ms
-            with src.lock:
-                scheduler = src.scheduler
-                n_total = scheduler.n if scheduler else 0
-                g60 = {k for k in range(0, n_total, 6)} if n_total > 0 else set()
-                g30 = {k for k in range(0, n_total, 3)} if n_total > 0 else set()
-                cov_60s = (len(tile_keys & g60) / len(g60)) if g60 else 0.0
-                cov_30s = (len(tile_keys & g30) / len(g30)) if g30 else 0.0
-                upstream_error = src.proxy_src.last_error if src.proxy_src else None
-                reason = upstream_error.reason if upstream_error else None
-                if reason and not re.fullmatch(r"[a-z_]+|http_[0-9]{3}", reason):
-                    reason = "other"
-                sources.append({
-                    "source": src.fp[:16], "running": src.running, "contributed": src.contributed,
-                    "error": src.error,
-                    "upstream_error_reason": reason,
-                    "total": n_total,
-                    "done": len(scheduler.done) if scheduler else 0,
-                    "failed": len(scheduler.failed) if scheduler else 0,
-                    "duration_ms": duration_ms, "accurate_covered_ms": covered_ms,
-                    "cov_60s": round(cov_60s, 4),
-                    "cov_30s": round(cov_30s, 4),
-                    "max_point_gap_ms": max_point_gap_ms,
-                    "max_uncovered_gap_ms": max_uncovered_gap_ms,
-                    "p2_paused": scheduler.p2_paused() if scheduler else False,
-                    "events": [asdict(e) for e in src.events],
-                    "upstream": src.upstream.stats.snapshot() if src.upstream else None,
-                    "multirange": ({"enabled": src.proxy_src.multi_enabled and src.proxy_src.planner is not None,
-                                    "requests": src.proxy_src.multi_requests, "parts": src.proxy_src.multi_parts,
-                                    "bytes": src.proxy_src.multi_bytes, "fallbacks": src.proxy_src.multi_fallbacks,
-                                    "waits": src.proxy_src.prefetch_waits, "hits": src.proxy_src.prefetch_hits}
-                                   if src.proxy_src is not None else None),
-                    "guard": src.guard.stats() if src.guard is not None else None,
-                    "telemetry": src.governor.stats() if src.guard is not None else None,   # what the guard hears from the player
-                    "alt": core.jobs.alt_metrics(src),
-                })
-        return {"monotonic": core.jobs.clock(), "failed_jobs": failed_jobs, "config": {
-            "bg_mbps": core.settings.bg_mbps, "pregen": core.settings.pregen,
-            "upstream_rps": core.settings.upstream_rps,
-            "p2_pause_s": core.settings.p2_pause_s,
-            "p1_interleave": core.settings.p1_interleave,
-            "hierarchical": core.settings.hierarchical,
-            "workers_per_source": core.settings.workers_per_source,
-            "multirange_prefetch": core.settings.multirange_prefetch, "multirange_batch": core.settings.multirange_batch,
-            "playback_guard": core.settings.playback_guard, "guard_stall_s": core.settings.guard_stall_s,
-            "alt_source": core.settings.alt_source, "alt_dry_run": core.settings.alt_dry_run,
-            "alt_rps": core.settings.alt_rps, "alt_mbps": core.settings.alt_mbps,
-            "alt_max_conc": core.settings.alt_max_conc,
-            "tolerance_ms": core.settings.tolerance_ms}, "sources": sources}
 
     @app.get("/admin/sharing")
     async def sharing_status():
-        return {"enabled": core.sharing_enabled(), "metadata_index": core.library.enabled(),
+        return {"enabled": core.sharing_enabled(),
+                "pool_contributions_enabled": core.pool_contributions_enabled(),
                 "public": {"listening": bool(core.settings.public_port), "port": core.settings.public_port,
                            "host": core.settings.public_host, **core.public_limiter.snapshot()},
                 "invites": core.invites.listing(),
-                "guests": [d for d in core.db.devices() if d["role"] == "guest"]}
+                "guests": [d for d in core.auth.devices() if d["role"] == "guest"]}
 
     @app.delete("/admin/public/blocks", status_code=204)
     async def public_unblock():
@@ -1724,41 +1357,13 @@ def create_admin_app(core: Core) -> FastAPI:
 
     @app.put("/admin/sharing")
     async def sharing_set(body: SharingIn):
-        core.db.set_setting("sharing_enabled", "1" if body.enabled else "0")
-        if not body.enabled:
-            await asyncio.to_thread(core.jobs.stop_contributions)       # the kill switch stops guest extraction too
+        core.state_store.set_setting("sharing_enabled", "1" if body.enabled else "0")
         return {"enabled": core.sharing_enabled()}
 
-    @app.get("/admin/contributions")
-    async def contributions_get():
-        return {"enabled": core.db.get_setting("contrib_enabled") == "1", "effective": core.contributions_enabled(),
-                "hosts": core.contrib_hosts(), "max_sources": core.settings.contrib_max_sources, "mbps": core.settings.contrib_mbps,
-                "denied_hosts": sorted({h for _, h in core.contrib_denied}), "jobs": core.jobs.contributed_jobs(),
-                "contributors": [d["device_id"] for d in core.db.devices() if d["contribute"]]}
-
-    @app.put("/admin/contributions")
-    async def contributions_set(body: ContribAdminIn):
-        if body.enabled is not None:
-            core.db.set_setting("contrib_enabled", "1" if body.enabled else "0")
-            if not body.enabled:
-                await asyncio.to_thread(core.jobs.stop_contributions)
-        if body.hosts is not None:
-            core.db.set_setting("contrib_hosts", json.dumps(clean_hosts(body.hosts)))
-        return await contributions_get()
-
-    @app.delete("/admin/contributions/{preview_id}", status_code=204)
-    async def contribution_admin_stop(preview_id: str):
-        if not is_preview_id(preview_id) or not await asyncio.to_thread(core.jobs.stop_contributions, None, preview_id):
-            return err(404, "not_found")
-        return Response(status_code=204)
-
-    @app.put("/admin/devices/{device_id}/permissions")
-    async def device_permissions(device_id: str, body: PermIn):
-        if not is_device_id(device_id) or not core.db.set_contribute(device_id, body.contribute):
-            return err(404, "not_found")          # unknown device, or an owner (owners never need it)
-        if not body.contribute:
-            await asyncio.to_thread(core.jobs.stop_contributions, device_id)
-        return {"device_id": device_id, "contribute": body.contribute}
+    @app.put("/admin/pool/contributions")
+    async def pool_contributions_set(body: PoolContributionsIn):
+        core.state_store.set_setting("contrib_enabled", "1" if body.enabled else "0")
+        return {"enabled": core.pool_contributions_enabled()}
 
     @app.post("/admin/invites")
     async def invite_create(request: Request, body: InviteIn | None = None):
@@ -1768,8 +1373,14 @@ def create_admin_app(core: Core) -> FastAPI:
         if b.public and not (core.settings.public_port and core.settings.public_host):
             return err(409, "public_endpoint_not_configured")
         inv = await asyncio.to_thread(core.invites.create, b.label, b.ttl_s or 86400, "guest", b.device_days, not b.read_only)
-        addrs = lan_addresses()
-        host = core.settings.public_host if b.public else f"{addrs[0]}:{core.settings.port}"
+        if core.settings.profile == "vercel":
+            host = request_host(request)
+            if host is None:
+                await asyncio.to_thread(core.invites.revoke, inv["invite_id"])
+                return err(400, "bad_host")
+        else:
+            addrs = lan_addresses()
+            host = core.settings.public_host if b.public else f"{addrs[0]}:{core.settings.port}"
         from urllib.parse import quote
         inv["address"] = host
         inv["join"] = (f"openseek://join/1?h={quote(host, safe='')}&p={quote(core.spki_pin, safe='')}"
@@ -1782,54 +1393,15 @@ def create_admin_app(core: Core) -> FastAPI:
 
     @app.delete("/admin/invites/{invite_id}", status_code=204)
     async def invite_revoke(invite_id: str):
-        if not is_preview_id(invite_id) or not core.invites.revoke(invite_id):
+        if not is_invite_id(invite_id) or not core.invites.revoke(invite_id):
             return err(404, "not_found")
         return Response(status_code=204)
 
-    @app.get("/admin/library")
-    async def library_status():
-        return {"metadata_index": core.library.enabled(), "releases": len(core.db.release_rows()),
-                "stored_per_cache_entry": ["imdb_id", "tmdb_id", "season", "episode", "size_bytes (observed by the server)"],
-                "never_stored": ["titles", "file names", "URLs", "headers", "client size/hash claims"]}
-
-    @app.put("/admin/library")
-    async def library_set(body: LibraryIn):
-        core.library.set_enabled(body.metadata_index, purge=body.purge)
-        return {"metadata_index": core.library.enabled(), "releases": len(core.db.release_rows())}
-
-    @app.get("/admin/library/releases")
-    async def library_releases():
-        return {"releases": core.db.release_rows()}
-
-    @app.put("/admin/library/entries/{fp}")
-    async def library_tag(fp: str, body: EntryTagIn):
-        """Identify an EXISTING cache entry (ids only; no thumbnail is touched or regenerated)."""
-        from .ids import is_fingerprint
-        ids = clean_ids(body.imdb_id, body.tmdb_id, body.season, body.episode)
-        row = core.db.q("SELECT duration_ms FROM entries WHERE fp=?", (fp,)) if is_fingerprint(fp) else []
-        if not row:
+    @app.put("/admin/devices/{device_id}/permissions")
+    async def device_permissions(device_id: str, body: PermIn):
+        if not is_device_id(device_id) or not core.auth.set_contribute(device_id, body.contribute):
             return err(404, "not_found")
-        if ids is None:
-            return err(400, "bad_request")
-        core.db.upsert_release_meta(fp, ids.imdb, ids.tmdb, ids.season, ids.episode, 0)
-        return {"fp": fp, "imdb_id": ids.imdb, "tmdb_id": ids.tmdb, "season": ids.season, "episode": ids.episode}
-
-    @app.delete("/admin/library/entries/{fp}", status_code=204)
-    async def library_remove(fp: str):
-        """Delete ONE cached title (files, rows, shares). Refused while the title is being extracted or played from."""
-        from .ids import is_fingerprint
-        if not is_fingerprint(fp):
-            return err(404, "not_found")
-        if any(getattr(s, "fp", None) == fp for s in core.jobs.running_sources()):
-            return err(409, "in_use")
-        if not await asyncio.to_thread(core.cache.remove_entry, fp):
-            return err(404, "not_found")
-        await asyncio.to_thread(core.jobs.forget_source, fp)
-        return Response(status_code=204)
-
-    @app.delete("/admin/library/releases")
-    async def library_purge():
-        return {"purged": core.db.purge_release_meta()}
+        return {"device_id": device_id, "contribute": body.contribute}
 
     @app.post("/admin/pool/purge")
     async def pool_purge(body: PoolPurgeIn):
@@ -1847,11 +1419,10 @@ def create_admin_app(core: Core) -> FastAPI:
     async def pool_status():
         mode = core.settings.effective_pool_mode
         if mode == "channel" and core.channel_index is not None:
-            librarian_status = ("attached" if core.librarian is not None and
-                                getattr(core.channel_store, "_handler_attached", True) else
-                                "disabled" if not core.settings.librarian_enabled else "unavailable")
             result = {"mode": mode, **core.channel_index.status(),
-                      "librarian_status": librarian_status,
+                      "librarian_status": ("attached" if core.librarian is not None and
+                                            getattr(core.channel_store, "_handler_attached", True) else
+                                            "disabled" if not core.settings.librarian_enabled else "unavailable"),
                       "contribution_path": core.pool_write_policy.contribution_path()}
         elif mode == "host" and core.pool is not None:
             result = {"mode": mode, "api_enabled": True,
@@ -1865,11 +1436,45 @@ def create_admin_app(core: Core) -> FastAPI:
         else:
             result = {"mode": mode, "api_enabled": False}
         if mode == "channel":
-            pending = core.db.q("SELECT COUNT(*) FROM pool_channel_outbox")
-            result["outbox"] = int(pending[0][0]) if pending else 0
+            if core.uploads is not None:
+                result["outbox"] = await asyncio.to_thread(core.uploads.store.pending_count)
+            else:
+                pending = core.db.q("SELECT COUNT(*) FROM pool_channel_outbox")
+                result["outbox"] = int(pending[0][0]) if pending else 0
             result["last_error"] = (core.pool_sync.last_error if core.pool_sync else
                                     core.channel_index.last_error if core.channel_index else "")
         return result
+
+    @app.post("/admin/generations", status_code=202)
+    async def generation_start(background_tasks: BackgroundTasks, body: GenerationIn):
+        if core.pool is None or core.channel_store is None:
+            return err(409, "pool_unavailable")
+        try:
+            generation_id, job = await asyncio.to_thread(
+                core.generations.start, body.source_url, body.profile, body.imdb,
+                body.season, body.episode, body.filename)
+        except GenerationError as exc:
+            return err(429 if exc.code in ("generation_busy", "busy") else 400, exc.code)
+        except SourceForbidden:
+            return err(400, "source_forbidden")
+        background_tasks.add_task(core.generations.run, generation_id, job)
+        return JSONResponse({"generation_id": generation_id, "state": "generating"},
+                            status_code=202, headers={"Cache-Control": "no-store"})
+
+    @app.get("/admin/generations")
+    async def generation_list():
+        return {"jobs": await asyncio.to_thread(core.generations.recent)}
+
+    @app.get("/admin/generations/{generation_id}")
+    async def generation_status(generation_id: str):
+        status = await asyncio.to_thread(core.generations.status, generation_id)
+        return status if status is not None else err(404, "not_found")
+
+    @app.delete("/admin/generations/{generation_id}", status_code=204)
+    async def generation_cancel(generation_id: str):
+        if not await asyncio.to_thread(core.generations.cancel, generation_id):
+            return err(409, "not_running")
+        return Response(status_code=204)
 
     @app.post("/admin/pool/scan")
     async def pool_scan():
@@ -1889,23 +1494,38 @@ def create_admin_app(core: Core) -> FastAPI:
         except PoolError as exc:
             return err(exc.status, exc.code)
 
-    @app.post("/admin/alt/release")
-    async def alt_release():
-        return {"released": core.jobs.alt_release()}
-
     @app.post("/admin/pair")
-    async def open_pair():
+    async def open_pair(request: Request):
+        if core.settings.profile == "vercel":
+            host = request_host(request)
+            if host is None:
+                return err(400, "bad_host")
+            if any(invite["role"] == "owner" and invite["state"] == "open"
+                   for invite in core.invites.listing()):
+                return err(409, "pairing_already_open")
+            invite = await asyncio.to_thread(
+                core.invites.create, "Nuvio device", 600, "owner", None, False)
+            from urllib.parse import quote
+            join = (f"openseek://join/1?h={quote(host, safe='')}&p={quote(core.spki_pin, safe='')}"
+                    f"&i={invite['invite_id']}&c={quote(invite['secret'], safe='')}")
+            return {"code": invite["code"], "join": join, "invite_id": invite["invite_id"],
+                    "expires_in_s": invite["expires_in_s"], "spki_pin": core.spki_pin}
         code, ttl = await asyncio.to_thread(core.pairing.open_window)
         return {"code": code, "expires_in_s": int(ttl), "spki_pin": core.spki_pin}
 
     @app.delete("/admin/pair", status_code=204)
     async def close_pair():
-        core.pairing.close_window()
+        if core.settings.profile == "vercel":
+            for invite in core.invites.listing():
+                if invite["role"] == "owner" and invite["state"] == "open":
+                    await asyncio.to_thread(core.invites.revoke, invite["invite_id"])
+        else:
+            core.pairing.close_window()
         return Response(status_code=204)
 
     @app.get("/admin/devices")
     async def devices():
-        return {"devices": core.db.devices()}
+        return {"devices": core.auth.devices()}
 
     @app.delete("/admin/devices/{device_id}", status_code=204)
     async def revoke(device_id: str):

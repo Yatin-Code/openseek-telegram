@@ -16,10 +16,10 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from .envfile import read_env_file
+
 GiB = 1 << 30
 MiB = 1 << 20
-
-PREGEN_MODES = ("off", "overview", "full")
 
 log = logging.getLogger("openseek.config")
 
@@ -29,8 +29,8 @@ log = logging.getLogger("openseek.config")
 # environment.
 CONFIG_FILE_KEYS = frozenset({
     "port", "admin_port", "host", "cache_max_bytes", "retention_days", "bg_mbps", "upstream_rps",
-    "workers_per_source", "max_active_sources", "playback_guard", "multirange_prefetch", "public_port",
-    "public_bind", "public_host", "log_level", "contrib_mbps", "contrib_max_sources", "contrib_hosts"})
+    "workers_per_source", "max_active_sources", "multirange_prefetch", "public_port",
+    "public_bind", "public_host", "log_level"})
 _BIND_KEYS = ("host", "public_bind")
 _LAN_NETS = tuple(ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7"))
 _CONFIG_FILE_MAX = 64 * 1024
@@ -122,61 +122,35 @@ class Settings:
     admin_port: int = 8788                 # always bound to 127.0.0.1 (contract)
     cache_max_bytes: int = 2 * GiB
     retention_days: float = 30.0
-    bg_mbps: float = 8.0                   # P2 (background) token bucket, Mbit/s
+    bg_mbps: float = 8.0                   # background extraction cap, Mbit/s
     upstream_rps: float = 0.0              # opt-in global request pacing; 0 disables
     job_bytes: int = 4 * GiB               # per-job upstream byte budget
     tolerance_s: float = 5.0
-    pregen: str = "full"                   # off | overview | full
-    p2_pause_s: float = 5.0
-    p1_interleave: int = 0                 # 0 preserves strict P1 priority
     nearest_keyframe: bool = False         # also accept the keyframe just after a slot (cuts forward decoding)
-    alt_source: bool = False               # low-resolution thumbnail source (OPENSEEK_ALT_SOURCE); off by default
-    alt_mbps: float = 64.0                 # byte allowance for extraction from the alternative source
-    alt_rps: float = 12.0                  # request pacing for the alternative source
-    alt_shared_caps: bool = False          # ONE request bucket and ONE byte bucket for playback source + alternative
-    alt_hold_after_reject: bool = False    # after a rejected candidate wait for a release before offering the next
-    alt_report_names: bool = False         # release names in the loopback diagnostics (never persisted by the server)
-    alt_skip_names: str = ""               # comma-separated release-name fragments never offered (experiments)
     admin_token: str = ""                  # secret the loopback admin API requires (empty: a random one in <data>/admin.token)
     cron_secret: str = ""                  # Bearer secret for POST /v1/internal/tick (empty: admin token only)
-    capture_source_file: str = ""          # diagnostics: write the playback source's resolved CDN link here after preflight
+    capture_source_file: str = ""          # diagnostics: write the source's resolved CDN link here after preflight
     multirange_prefetch: bool = False      # EXPERIMENTAL: fetch several keyframe windows per request (multipart/byteranges)
     multirange_batch: int = 8              # windows per multi-range request (2..16)
-    playback_guard: bool = False           # pause background extraction on rebuffer / stale telemetry / CDN stall
-    guard_stall_s: float = 6.0             # a request without a first byte (or a body that stopped) this long = CDN stall
-    guard_time_scale: float = 1.0          # scales every guard/telemetry timer (tests only)
-    alt_dry_run: bool = False              # negotiate and report eligible candidates, but never offer/resolve one
-    alt_max_resolutions_5min: int = 6      # ceiling on alt link resolutions (each may cost one provider API call)
-    alt_probe_conc: int = 3                # parallel probe workers during validation (latency-bound)
-    alt_min_gain_s: float = 8.0            # only negotiate/validate when the projected saving is at least this
-    alt_validation_est_s: float = 8.0      # prior for validation time (replaced by measured values)
-    alt_max_conc: int = 4                  # hard ceiling on concurrent alt range requests (<= workers_per_source)
-    hierarchical: bool = False             # coarse-to-fine full-timeline scheduling (60s -> 30s -> 10s)
     allowed_ports: frozenset[int] = field(default_factory=lambda: frozenset({80, 443, 8080, 8443}))
     allow_http_sources: bool = True        # http only ever reaches *public* destinations
     allow_public_clients: bool = False     # SR-17
-    contrib_mbps: float = 16.0             # extra byte cap for guest-contributed extraction ONLY while the owner is busy (idle: same as the owner)
-    contrib_max_sources: int = 1           # guest-contributed sources running at once (one slot always stays free for the owner)
-    contrib_hosts: str = "torbox.app,tb-cdn.io,real-debrid.com,debrid.link,alldebrid.com,premiumize.me"   # default allowlist (the owner can edit it)
-    contrib_https_only: bool = True        # tests only
     public_port: int = 0                   # the internet-facing GUEST listener (0 = not started); see public.py
     public_bind: str = "0.0.0.0"
-    public_host: str = ""                  # advertised in invitations / borrowed URLs: "name.duckdns.org:443"
+    public_host: str = ""                  # advertised in invitations: "name.duckdns.org:443"
     tls_cert_file: Path | None = None      # optional trusted certificate for public pool HTTPS
     tls_key_file: Path | None = None       # matching private key; otherwise use the generated self-signed cert
+    public_tls_pin: str = ""                # Vercel edge certificate SPKI pin used by paired Nuvio clients
     max_active_sources: int = 2            # global cap on sources with a live worker (429 busy)
     workers_per_source: int = 1            # bounded parallel extraction workers per active source (1..4)
-    max_jobs_per_device: int = 1           # older active job of that device is stopped
-    max_jobs_total: int = 256              # job records kept in memory
-    idle_timeout_s: float = 600.0          # worker killed after 10 min without client activity
+    idle_timeout_s: float = 600.0          # worker killed after 10 min without generation activity
     frame_timeout_s: float = 30.0          # hard per-frame timeout (accurate mode gets 2x)
     open_timeout_s: float = 45.0           # worker open/probe timeout
-    create_wait_s: float = 4.0             # POST /v1/previews waits this long for preflight
+    create_wait_s: float = 4.0             # dashboard generation waits this long for source preflight
     max_duration_s: float = 12 * 3600.0    # SR-12
     max_dimension: int = 8192              # SR-13
     upstream_timeout_s: float = 15.0
-    # Optional shared thumbnail pool. Video decoding always stays on this instance;
-    # the pool moves already-rendered JPEG tiles and stores them in Telegram.
+    # Optional shared package/tile pool; Telegram stores the durable media objects.
     pool_enabled: bool = False
     pool_mode: str = ""                    # host | channel; empty is local-only except legacy POOL_ENABLED
     pool_url: str = ""
@@ -225,7 +199,14 @@ class Settings:
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Settings":
+        explicit = env is not None
         env = dict(os.environ if env is None else env)
+        if env.get("VERCEL", "").strip().lower() not in ("1", "true", "yes", "on"):
+            env_file = env.get("OPENSEEK_ENV_FILE")
+            if env_file or not explicit:
+                path = Path(env_file) if env_file else Path(env.get("OPENSEEK_DATA_DIR", "data")) / ".env"
+                for key, value in read_env_file(path).items():
+                    env.setdefault(key, value)         # process environment wins over the protected file
         s = cls()
         conv = {
             "DATA_DIR": ("data_dir", Path),
@@ -243,46 +224,23 @@ class Settings:
             "UPSTREAM_RPS": ("upstream_rps", float),
             "JOB_BYTES": ("job_bytes", int),
             "TOLERANCE_S": ("tolerance_s", float),
-            "PREGEN": ("pregen", str),
-            "P2_PAUSE_S": ("p2_pause_s", float),
-            "P1_INTERLEAVE": ("p1_interleave", int),
-            "HIERARCHICAL": ("hierarchical", _bool),
-            "ALT_SOURCE": ("alt_source", _bool),
-            "ALT_MBPS": ("alt_mbps", float),
-            "ALT_RPS": ("alt_rps", float),
-            "ALT_MAX_CONC": ("alt_max_conc", int),
-            "ALT_MIN_GAIN_S": ("alt_min_gain_s", float),
-            "ALT_PROBE_CONC": ("alt_probe_conc", int),
-            "ALT_DRY_RUN": ("alt_dry_run", _bool),
-            "PLAYBACK_GUARD": ("playback_guard", _bool),
-            "GUARD_STALL_S": ("guard_stall_s", float),
-            "GUARD_TIME_SCALE": ("guard_time_scale", float),
             "MULTIRANGE_PREFETCH": ("multirange_prefetch", _bool),
             "MULTIRANGE_BATCH": ("multirange_batch", int),
             "CAPTURE_SOURCE_FILE": ("capture_source_file", str),
             "ADMIN_TOKEN": ("admin_token", str),
             "CRON_SECRET": ("cron_secret", str),
-            "ALT_SKIP_NAMES": ("alt_skip_names", str),
-            "ALT_SHARED_CAPS": ("alt_shared_caps", _bool),
-            "ALT_HOLD_AFTER_REJECT": ("alt_hold_after_reject", _bool),
-            "ALT_REPORT_NAMES": ("alt_report_names", _bool),
-            "ALT_MAX_RESOLUTIONS_5MIN": ("alt_max_resolutions_5min", int),
-            "ALT_VALIDATION_EST_S": ("alt_validation_est_s", float),
             "NEAREST_KEYFRAME": ("nearest_keyframe", _bool),
             "ALLOWED_PORTS": ("allowed_ports", _ports),
             "ALLOW_HTTP_SOURCES": ("allow_http_sources", _bool),
             "ALLOW_PUBLIC_CLIENTS": ("allow_public_clients", _bool),
             "PUBLIC_PORT": ("public_port", int),
-            "CONTRIB_MBPS": ("contrib_mbps", float),
-            "CONTRIB_MAX_SOURCES": ("contrib_max_sources", int),
-            "CONTRIB_HOSTS": ("contrib_hosts", str),
             "PUBLIC_BIND": ("public_bind", str),
             "PUBLIC_HOST": ("public_host", str),
             "TLS_CERT_FILE": ("tls_cert_file", Path),
             "TLS_KEY_FILE": ("tls_key_file", Path),
+            "PUBLIC_TLS_PIN": ("public_tls_pin", str),
             "MAX_ACTIVE_SOURCES": ("max_active_sources", int),
             "WORKERS_PER_SOURCE": ("workers_per_source", int),
-            "MAX_JOBS_PER_DEVICE": ("max_jobs_per_device", int),
             "IDLE_TIMEOUT_S": ("idle_timeout_s", float),
             "FRAME_TIMEOUT_S": ("frame_timeout_s", float),
             "CREATE_WAIT_S": ("create_wait_s", float),
@@ -388,6 +346,11 @@ class Settings:
         if self.profile not in ("local", "vercel"):
             raise ConfigError("OPENSEEK_PROFILE must be local or vercel")
         if self.profile == "vercel":
+            from .tls import valid_spki_pin
+            if self.public_tls_pin and not valid_spki_pin(self.public_tls_pin):
+                raise ConfigError("OPENSEEK_PUBLIC_TLS_PIN must be a valid sha256// SPKI pin when configured")
+            if not self.setup_pending and len(self.admin_token) < 16:
+                raise ConfigError("OPENSEEK_PROFILE=vercel requires OPENSEEK_ADMIN_TOKEN with at least 16 characters")
             if self.effective_pool_mode != "channel":
                 raise ConfigError("OPENSEEK_PROFILE=vercel requires OPENSEEK_POOL_MODE=channel")
             if not self.setup_pending:
@@ -413,25 +376,19 @@ class Settings:
             if (not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,62}", self.supabase_bucket) or
                     ".." in self.supabase_bucket):
                 raise ConfigError("OPENSEEK_SUPABASE_BUCKET must be 1..63 safe bucket-name characters")
-        if not 0 <= self.p2_pause_s <= 60 or not 0 <= self.p1_interleave <= 100:
-            raise ConfigError("P2_PAUSE_S must be 0..60; P1_INTERLEAVE must be 0..100")
-        if self.pregen not in PREGEN_MODES:
-            raise ConfigError("OPENSEEK_PREGEN must be off|overview|full")
         if not 0 < self.tolerance_s <= 5.0:
             # the 10 s grid only guarantees non-overlapping cues for tolerance <= 5 s
             raise ConfigError("OPENSEEK_TOLERANCE_S must be in (0, 5]")
         if self.bg_mbps <= 0:
             raise ConfigError("OPENSEEK_BG_MBPS must be > 0")
-        if not 1.0 <= self.guard_stall_s <= 60.0 or not 0.01 <= self.guard_time_scale <= 1.0:
-            raise ConfigError("OPENSEEK_GUARD_STALL_S must be 1..60")
         if not 2 <= self.multirange_batch <= 16:
             raise ConfigError("OPENSEEK_MULTIRANGE_BATCH must be 2..16")
         if not 0 <= self.upstream_rps <= 100:
             raise ConfigError("OPENSEEK_UPSTREAM_RPS must be 0..100")
         if self.job_bytes < 1 * MiB:
             raise ConfigError("OPENSEEK_JOB_BYTES must be >= 1 MiB")
-        if self.max_active_sources < 1 or self.max_jobs_per_device < 1:
-            raise ConfigError("source/job caps must be >= 1")
+        if self.max_active_sources < 1:
+            raise ConfigError("OPENSEEK_MAX_ACTIVE_SOURCES must be >= 1")
         if not 1 <= self.workers_per_source <= 4:
             raise ConfigError("OPENSEEK_WORKERS_PER_SOURCE must be 1..4")
         if self.cache_max_bytes < 16 * MiB:
@@ -439,8 +396,6 @@ class Settings:
         for p in (self.port, self.admin_port, self.public_port):
             if not 0 <= p <= 65535:
                 raise ConfigError("bad port")
-        if not 0.5 <= self.contrib_mbps <= 1000 or not 1 <= self.contrib_max_sources <= 4:
-            raise ConfigError("OPENSEEK_CONTRIB_MBPS must be 0.5..1000 and CONTRIB_MAX_SOURCES 1..4")
         if self.public_port and self.public_port in (self.port, self.admin_port):
             raise ConfigError("OPENSEEK_PUBLIC_PORT must differ from the API and admin ports")
         if self.public_host and not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?:\d{1,5}", self.public_host):

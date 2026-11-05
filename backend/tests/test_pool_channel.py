@@ -15,7 +15,7 @@ from PIL import Image
 import pytest
 import httpx
 
-from openseek.app import Core, create_api_app
+from openseek.app import Core, create_admin_app, create_api_app
 from openseek.cache import Cache, PROFILE
 from openseek.channel_pool import ChannelPoolService, PoolWritePolicy
 from openseek.channel_index import ChannelIndex
@@ -272,6 +272,94 @@ def test_channel_mode_uploads_nvmt_tiles_and_retry_keeps_first_writer(tmp_path):
         assert duplicate.status_code == 200 and duplicate.json()["duplicate"] is True
         assert sum(bool(message.document_size) for message in store.messages) == 2
         assert sum(message.caption.startswith("openseek:hints:v1:") for message in store.messages) == 1
+    finally:
+        core.stop()
+
+
+@pytest.mark.parametrize(
+    ("pool_contributions_enabled", "sharing_enabled", "device_enabled", "expected_status"),
+    [(True, True, True, 201), (False, True, True, 403),
+     (True, False, True, 403), (True, True, False, 403)],
+)
+def test_guest_pool_package_write_requires_global_and_device_permissions(
+        tmp_path, pool_contributions_enabled, sharing_enabled, device_enabled, expected_status):
+    store = MemoryChannel()
+    settings = Settings(data_dir=tmp_path, pool_mode="channel", contribution=False,
+                        pool_write_key="w" * 40, telegram_api_id=123,
+                        telegram_api_hash="a" * 32, telegram_bot_token="123456:test",
+                        telegram_channel_id=store.channel_id)
+    core = Core(settings, pool_storage=store)
+    token = "G" * 43
+    device_id = core.auth.register("Guest TV", hashlib.sha256(token.encode()).hexdigest(), role="guest")
+    core.auth.set_contribute(device_id, device_enabled)
+    if sharing_enabled:
+        core.db.set_setting("sharing_enabled", "1")
+    if pool_contributions_enabled:
+        core.db.set_setting("contrib_enabled", "1")
+    fp = hashlib.sha256(f"guest upload {pool_contributions_enabled} {sharing_enabled} {device_enabled}".encode()).hexdigest()
+    package = encode_nvmt(5_000, 4, {0: (0, jpeg()), 2: (10_000, jpeg((30, 40, 50)))})
+    app = create_api_app(core)
+
+    async def put():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                     base_url="https://openseek.test") as client:
+            return await client.put(
+                f"/v1/pool/{fp}/nvmt?profile=nvmt-v1-g5&duration_ms=20000",
+                content=package, headers={"Authorization": f"Bearer {token}",
+                                          "Content-Type": "application/vnd.openseek.nvmt"})
+
+    try:
+        response = asyncio.run(put())
+        assert response.status_code == expected_status, response.text
+        assert bool(store.messages) is (expected_status == 201)
+    finally:
+        core.stop()
+
+
+def test_dashboard_controls_guest_pool_contributions(tmp_path):
+    store = MemoryChannel()
+    settings = Settings(data_dir=tmp_path, pool_mode="channel", admin_token="owner-secret-long-enough",
+                        telegram_api_id=123, telegram_api_hash="a" * 32,
+                        telegram_bot_token="123456:test", telegram_channel_id=store.channel_id)
+    core = Core(settings, pool_storage=store)
+    device_token = "D" * 43
+    device_id = core.auth.register("Guest TV", hashlib.sha256(device_token.encode()).hexdigest(), role="guest")
+    app = create_admin_app(core)
+
+    async def set_enabled(enabled):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                     base_url="http://127.0.0.1:8788",
+                                     headers={"X-OpenSeek-Admin": settings.admin_token}) as client:
+            return await client.put("/admin/pool/contributions", json={"enabled": enabled})
+
+    async def dashboard():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                     base_url="http://127.0.0.1:8788",
+                                     headers={"X-OpenSeek-Admin": settings.admin_token}) as client:
+            return await client.get("/")
+
+    async def set_device_permission(enabled):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                     base_url="http://127.0.0.1:8788",
+                                     headers={"X-OpenSeek-Admin": settings.admin_token}) as client:
+            return await client.put(f"/admin/devices/{device_id}/permissions",
+                                    json={"contribute": enabled})
+
+    try:
+        page = asyncio.run(dashboard())
+        assert page.status_code == 200 and "NVMT uploads" in page.text
+        permission = asyncio.run(set_device_permission(True))
+        assert permission.status_code == 200 and permission.json()["contribute"] is True
+        assert core.auth.can_contribute(device_id)
+        assert not core.pool_contributions_enabled()
+        enabled = asyncio.run(set_enabled(True))
+        assert enabled.status_code == 200 and enabled.json() == {"enabled": False}
+        assert core.db.get_setting("contrib_enabled") == "1"
+        core.db.set_setting("sharing_enabled", "1")
+        assert core.pool_contributions_enabled()
+        disabled = asyncio.run(set_enabled(False))
+        assert disabled.status_code == 200 and disabled.json() == {"enabled": False}
+        assert core.db.get_setting("contrib_enabled") == "0"
     finally:
         core.stop()
 
