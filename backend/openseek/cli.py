@@ -38,6 +38,9 @@ def main(argv: list[str] | None = None) -> int:
     setup.add_argument("--state", type=Path, help="resume participant setup from this local state file")
     setup.add_argument("--new-pairing", action="store_true",
                        help="create a replacement one-time Nuvio pairing invite for the participant's node")
+    setup.add_argument("--provider", choices=("cli", "rest"), default=None,
+                       help="provider access: official Vercel/Supabase CLIs (default) "
+                            "or account tokens through the provider APIs")
     sub.add_parser("pair", help="open a 10-minute pairing window and print the code")
     sub.add_parser("devices", help="list paired devices")
     sub.add_parser("dashboard", help="open the local admin dashboard (the secret travels in the URL fragment, never over the network)")
@@ -69,7 +72,8 @@ def main(argv: list[str] | None = None) -> int:
     a = ap.parse_args(argv)
     if a.cmd == "setup":
         from .setup import run_setup
-        return run_setup(state_path=a.state, new_pairing=a.new_pairing)
+        return run_setup(state_path=a.state, new_pairing=a.new_pairing,
+                         provider=a.provider)
     try:
         env = dict(os.environ)
         if a.cmd == "pool" and a.pool_action == "login":
