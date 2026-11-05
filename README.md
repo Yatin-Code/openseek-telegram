@@ -45,6 +45,100 @@ There are a few one-time setup actions: sign in to Vercel and Supabase, authoriz
 
 The host API remains available for communities that choose a trusted host. Direct Telegram and participant Vercel modes avoid requiring one shared OpenSeek API. These modes use the same Nuvio pool protocol, so clients still try exact matches first, then hints, and generate locally for missing tiles.
 
+## Environment variables
+
+The setup wizard writes most of these values for you. Use this table when configuring a node by hand, or when checking what a wizard-managed deployment uses. [`.env.example`](.env.example) is a local/VPS template; [docs/INSTALL.md](docs/INSTALL.md) and [docs/VERCEL.md](docs/VERCEL.md) cover the surrounding steps.
+
+- **Local/VPS:** keep the `OPENSEEK_*` values in the file named by `OPENSEEK_ENV_FILE`, or in `<OPENSEEK_DATA_DIR>/.env` when `OPENSEEK_ENV_FILE` is unset. Restrict the file to mode `0600`. Set `OPENSEEK_DATA_DIR` and `OPENSEEK_ENV_FILE` in the service environment, not in the file. The file reader ignores keys without the `OPENSEEK_` prefix, and the process environment wins over the file.
+- **Vercel:** add the values under **Project → Settings → Environment Variables → Production**, then redeploy. There is no `.env` file on Vercel.
+- **Secrets:** values in angle brackets are placeholders. Never commit the file or paste its values into issues.
+
+| Variable | Local/VPS | Vercel | Notes |
+|---|---|---|---|
+| `OPENSEEK_PROFILE` | `local` (default) | `vercel` (required) | `VERCEL=1` also selects the Vercel profile. |
+| `OPENSEEK_DATA_DIR` | service environment; default `data` | not set; `/tmp` scratch only | Holds SQLite, the TLS key, the admin token, and the cache. Keep it outside the checkout and private. |
+| `OPENSEEK_ENV_FILE` | service environment; optional | not used | Path to the `.env` file. Defaults to `<OPENSEEK_DATA_DIR>/.env`. |
+| `OPENSEEK_POOL_MODE` | `channel` for a Telegram pool; omit for local-only | `channel` (required) | `host` is the host-API mode. |
+| `OPENSEEK_ADMIN_TOKEN` | optional; random value in the data directory | required; at least 16 characters | Owner dashboard secret. Keep it out of source control. |
+| `OPENSEEK_TELEGRAM_CHANNEL_ID` | required for `channel` | required | Shared supergroup ID, for example `-1001234567890`. |
+| `OPENSEEK_TELEGRAM_API_ID` | required for `channel` | required | Numeric application ID from [my.telegram.org](https://my.telegram.org). |
+| `OPENSEEK_TELEGRAM_API_HASH` | required for `channel` | required | Application hash from [my.telegram.org](https://my.telegram.org). Keep it secret. |
+| `OPENSEEK_TELEGRAM_BOT_TOKEN` | one identity option | rejected | A local node can use a bot added by a group admin. Vercel requires a user session instead. |
+| `OPENSEEK_TELEGRAM_SESSION_FILE` | one identity option | not usable | Local user-session file. Create it with `python -m openseek pool login` and keep it private. |
+| `OPENSEEK_TELEGRAM_SESSION` | one identity option | required | Telethon StringSession. On Vercel this must be the user-session string, not a file path. |
+| `OPENSEEK_CONTRIBUTION` | `0` by default; set `1` to publish | set `1` to publish | The server-side publishing switch. Nuvio still gates submissions with its own opt-in setting. |
+| `OPENSEEK_POOL_CHANNEL_WRITABLE` | `auto` (default) | `auto` (default) | `1` or `0` overrides the detected Telegram post permission. |
+| `OPENSEEK_SUPABASE_URL` | not used | required | `https://<project>.supabase.co`; HTTPS origin only. |
+| `OPENSEEK_SUPABASE_SERVICE_KEY` | not used | required | Service-role key; never the anon key. |
+| `OPENSEEK_SUPABASE_BUCKET` | not used | `openseek-staging` (default) | Private staging bucket for temporary upload bytes. |
+| `OPENSEEK_POOL_WRITE_KEY` | host mode or contribution relay | optional | At least 24 characters. Required with `OPENSEEK_POOL_CONTRIB_URL`; the Vercel wizard normally uses paired-device tokens instead. |
+| `OPENSEEK_POOL_CONTRIB_URL` | read-only node only | not needed by default | HTTPS origin of a writable OpenSeek node that accepts contributions. |
+| `OPENSEEK_LIBRARIAN` | optional relay | optional | Bot username or HTTPS URL used as an alternative contribution path. |
+| `OPENSEEK_LIBRARIAN_KEY` | with `OPENSEEK_LIBRARIAN` | optional | At least 24 characters; only when the relay requires a bearer key. |
+| `OPENSEEK_LIBRARIAN_ENABLED` | relay host only | not usable | `1` on the relay host's bot. It requires a bot token, which the Vercel profile rejects. |
+| `OPENSEEK_PUBLIC_TLS_PIN` | optional | optional | `sha256//<spki-pin>` for clients that pin the deployment certificate. |
+| `CRON_SECRET` | not needed | optional | Bearer secret for `/v1/internal/tick`; the admin token is also accepted. Vercel's cron integration sends this value when it is configured. |
+| `OPENSEEK_CRON_SECRET` | optional | optional | Prefixed equivalent for `.env` files; the file reader ignores `CRON_SECRET`. |
+| `OPENSEEK_POOL_URL` | host mode only | ignored in channel mode | HTTPS origin of the upstream pool API. HTTP is allowed only for loopback tests. |
+| `OPENSEEK_POOL_READ_KEY` | host mode only | ignored in channel mode | At least 24 characters. Channel-mode nodes use paired-device tokens instead. |
+| `OPENSEEK_POOL_SHARE` | host mode only | ignored in channel mode | Allow this host to accept shared contributions; requires `OPENSEEK_POOL_WRITE_KEY`. |
+| `OPENSEEK_POOL_ENABLED` | legacy host switch | ignored in channel mode | Still written by the host setup wizard; prefer `OPENSEEK_POOL_MODE=host` for new configurations. |
+
+Use exactly one Telegram identity: a bot token, a local session file, or a StringSession. A Vercel node needs the user StringSession because its functions cannot keep a session file and the profile rejects bot tokens.
+
+Local-only mode needs only `OPENSEEK_PROFILE=local`; leave `OPENSEEK_POOL_MODE` unset and supply no Telegram or Supabase values. Host API mode uses `OPENSEEK_POOL_MODE=host`, `OPENSEEK_POOL_ENABLED=1`, `OPENSEEK_TELEGRAM_BOT_TOKEN`, `OPENSEEK_TELEGRAM_CHANNEL_ID`, `OPENSEEK_POOL_READ_KEY`, and `OPENSEEK_POOL_WRITE_KEY`; the host setup wizard writes that set.
+
+### Minimal local/VPS pool
+
+Service environment:
+
+```sh
+OPENSEEK_DATA_DIR=/var/lib/openseek
+OPENSEEK_ENV_FILE=/var/lib/openseek/.env
+```
+
+`/var/lib/openseek/.env` (mode `0600`):
+
+```dotenv
+OPENSEEK_PROFILE=local
+OPENSEEK_POOL_MODE=channel
+OPENSEEK_TELEGRAM_CHANNEL_ID=-1001234567890
+OPENSEEK_TELEGRAM_API_ID=123456
+OPENSEEK_TELEGRAM_API_HASH=<api-hash>
+OPENSEEK_TELEGRAM_BOT_TOKEN=<bot-token>
+# Or replace the bot token with a user session:
+# OPENSEEK_TELEGRAM_SESSION_FILE=/var/lib/openseek/telegram/openseek.session
+OPENSEEK_POOL_CHANNEL_WRITABLE=auto
+OPENSEEK_CONTRIBUTION=1
+# Optional; otherwise generated in <OPENSEEK_DATA_DIR>/admin.token
+# OPENSEEK_ADMIN_TOKEN=<at-least-16-characters>
+```
+
+### Minimal Vercel node
+
+Set these as Production environment variables:
+
+```dotenv
+OPENSEEK_PROFILE=vercel
+OPENSEEK_POOL_MODE=channel
+OPENSEEK_ADMIN_TOKEN=<at-least-16-characters>
+OPENSEEK_TELEGRAM_CHANNEL_ID=-1001234567890
+OPENSEEK_TELEGRAM_API_ID=123456
+OPENSEEK_TELEGRAM_API_HASH=<api-hash>
+OPENSEEK_TELEGRAM_SESSION=<telethon-string-session>
+OPENSEEK_SUPABASE_URL=https://<project>.supabase.co
+OPENSEEK_SUPABASE_SERVICE_KEY=<service-role-key>
+OPENSEEK_SUPABASE_BUCKET=openseek-staging
+OPENSEEK_CONTRIBUTION=1
+# Optional:
+# CRON_SECRET=<cron-secret>
+# OPENSEEK_PUBLIC_TLS_PIN=sha256//<spki-pin>
+```
+
+The Vercel setup wizard creates the Telegram session, Supabase schema, bucket, and environment variables for you. Its temporary `OPENSEEK_SETUP_PENDING` and `OPENSEEK_SETUP_KEY` values are wizard-managed; do not set them by hand. The optional REST wizard also reads `OPENSEEK_VERCEL_TOKEN` and `OPENSEEK_SUPABASE_ACCESS_TOKEN` from your local environment; neither is a deployed node setting.
+
+Runtime tuning that is not needed to start a pool node (ports, cache, worker limits, preview tolerance, public guest listener, TLS files, and logging) is documented with its defaults in `backend/openseek/config.py`.
+
 ## Participant-owned Vercel setup
 
 The wizard runs on the participant's computer. It uses the official Vercel and Supabase CLIs for browser sign-in, creates or links the participant's own projects, applies the OpenSeek schema, configures a private staging bucket, deploys the node, and checks its health. Provider credentials are not written to the wizard's resume file.
