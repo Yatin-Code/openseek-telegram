@@ -14,7 +14,9 @@ An opted-in contribution contains generated JPEG tiles, their timing and NVMT pr
 
 ## How the pool fits together
 
-![OpenSeek pool architecture: Nuvio clients use participant owned nodes and a shared Telegram supergroup](docs/images/pool-architecture.png)
+![OpenSeek pool architecture: a Nuvio client paired with a Vercel or local/VPS node; both node types read from and publish to a shared Telegram supergroup](docs/images/pool-architecture.png)
+
+A Vercel node and a local/VPS node are peers, not separate roles. Either deployment can serve exact and hint lookups and publish accepted contributions. The main difference is where the rebuildable index lives (Supabase for Vercel, SQLite for local/VPS); Vercel also uses temporary staging for large uploads.
 
 Nuvio generates thumbnails locally while playback continues. It can ask a pool node for an **exact match** using the media fingerprint and NVMT profile. If no exact package is available, it can try a **hint-ranked candidate** using allowed catalog and file hints. Hint matches are approximate and use a timing map.
 

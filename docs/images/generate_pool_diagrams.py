@@ -53,6 +53,11 @@ def text(d: ImageDraw.ImageDraw, xy, value: str, size=15, fill=INK, bold=False):
     d.text((xy[0] * S, xy[1] * S), value, font=font(size, bold), fill=fill)
 
 
+def centered_text(d: ImageDraw.ImageDraw, cx, y, value: str, size=12, fill=MUTED, bold=False):
+    f = font(size, bold)
+    d.text((cx * S - d.textlength(value, font=f) / 2, y * S), value, font=f, fill=fill)
+
+
 def line(d: ImageDraw.ImageDraw, points, color=LINE, width=3, arrow=True):
     scaled = [(int(x * S), int(y * S)) for x, y in points]
     d.line(scaled, fill=color, width=width * S, joint="curve")
@@ -75,57 +80,65 @@ def save(image: Image.Image, name: str):
 def architecture():
     image, d = canvas(
         1600, 760, "OpenSeek architecture", "A community pool without a central OpenSeek API",
-        "Every participant owns their node. Telegram holds accepted packages; each node keeps its own rebuildable index.")
+        "Vercel and local/VPS nodes are peers: each reads the pool and publishes contributions. "
+        "Telegram holds accepted packages; each node rebuilds its own index.")
 
     # Nuvio clients
-    rounded(d, (64, 220, 420, 520), fill=WHITE, outline="#B8D5E7")
-    rounded(d, (88, 242, 396, 282), fill=PALE_BLUE, outline=PALE_BLUE, radius=12)
-    text(d, (108, 254), "NUVIO CLIENTS", 13, BLUE, True)
-    text(d, (92, 312), "Generate thumbnails locally", 19, INK, True)
-    text(d, (92, 354), "Exact file match first", 15, MUTED)
-    text(d, (92, 382), "Hint match when exact misses", 15, MUTED)
-    text(d, (92, 410), "Validate returned NVMT tiles", 15, MUTED)
-    text(d, (92, 438), "Fill gaps with local frames", 15, MUTED)
-    rounded(d, (92, 470, 392, 502), fill=PALE_ORANGE, outline=PALE_ORANGE, radius=10)
-    text(d, (106, 478), "Sharing starts only after opt-in", 12, ORANGE, True)
+    rounded(d, (64, 221, 424, 599), fill=WHITE, outline="#B8D5E7")
+    rounded(d, (88, 243, 400, 283), fill=PALE_BLUE, outline=PALE_BLUE, radius=12)
+    text(d, (112, 255), "NUVIO CLIENTS", 13, BLUE, True)
+    text(d, (88, 319), "Generate thumbnails locally", 19, INK, True)
+    text(d, (88, 363), "Exact match first", 15, MUTED)
+    text(d, (88, 391), "Hint match when exact misses", 15, MUTED)
+    text(d, (88, 419), "Validate returned NVMT tiles", 15, MUTED)
+    text(d, (88, 447), "Fill gaps with local frames", 15, MUTED)
+    rounded(d, (88, 489, 400, 527), fill=PALE_ORANGE, outline=PALE_ORANGE, radius=10)
+    text(d, (112, 499), "Sharing starts only after opt-in", 12, ORANGE, True)
+    text(d, (88, 557), "One paired node: Vercel or local/VPS", 12, MUTED)
 
-    # Participant-owned nodes
-    rounded(d, (580, 204, 1012, 386), fill=WHITE, outline="#B8D5E7")
-    rounded(d, (604, 226, 988, 266), fill=PALE_BLUE, outline=PALE_BLUE, radius=12)
-    text(d, (624, 238), "PARTICIPANT NODE A  ·  VERCEL", 13, BLUE, True)
-    text(d, (610, 290), "OpenSeek API + Telegram user session", 17, INK, True)
-    text(d, (610, 324), "Own Vercel · own Supabase · own credentials", 13, MUTED)
-    text(d, (610, 350), "Supabase stores a rebuildable index and queue", 13, MUTED)
+    # Participant-owned nodes: identical capabilities, different index storage
+    rounded(d, (560, 210, 1000, 388), fill=WHITE, outline="#B8D5E7")
+    rounded(d, (584, 232, 976, 272), fill=PALE_BLUE, outline=PALE_BLUE, radius=12)
+    text(d, (608, 244), "PARTICIPANT NODE A  ·  VERCEL", 13, BLUE, True)
+    text(d, (584, 298), "OpenSeek API + Telegram identity", 17, INK, True)
+    text(d, (584, 332), "Own Vercel · own Supabase · own credentials", 13, MUTED)
+    text(d, (584, 358), "Rebuildable index + upload queue", 13, MUTED)
 
-    rounded(d, (580, 420, 1012, 602), fill=WHITE, outline="#C2DDD8")
-    rounded(d, (604, 442, 988, 482), fill=PALE_TEAL, outline=PALE_TEAL, radius=12)
-    text(d, (624, 454), "PARTICIPANT NODE B  ·  LOCAL / VPS", 13, TEAL, True)
-    text(d, (610, 506), "OpenSeek API + Telegram user session", 17, INK, True)
-    text(d, (610, 540), "Own host · own rebuildable SQLite index", 13, MUTED)
-    text(d, (610, 566), "Same client protocol; no Vercel required", 13, MUTED)
+    rounded(d, (560, 432, 1000, 610), fill=WHITE, outline="#C2DDD8")
+    rounded(d, (584, 454, 976, 494), fill=PALE_TEAL, outline=PALE_TEAL, radius=12)
+    text(d, (608, 466), "PARTICIPANT NODE B  ·  LOCAL / VPS", 13, TEAL, True)
+    text(d, (584, 520), "OpenSeek API + Telegram identity", 17, INK, True)
+    text(d, (584, 554), "Own host · own SQLite · own credentials", 13, MUTED)
+    text(d, (584, 580), "Rebuildable index + upload queue", 13, MUTED)
 
     # Telegram pool
-    rounded(d, (1172, 244, 1536, 540), fill=WHITE, outline="#E6C59F")
-    rounded(d, (1196, 266, 1512, 306), fill=PALE_ORANGE, outline=PALE_ORANGE, radius=12)
-    text(d, (1215, 278), "SHARED TELEGRAM SUPERGROUP", 13, ORANGE, True)
-    text(d, (1204, 338), "Canonical durable pool", 18, INK, True)
-    text(d, (1204, 382), "NVMT tile documents", 15, MUTED)
-    text(d, (1204, 412), "Versioned hint manifests", 15, MUTED)
-    text(d, (1204, 442), "Each participant posts as their", 14, MUTED)
-    text(d, (1204, 466), "own authorized Telegram account", 14, MUTED)
-    text(d, (1204, 504), "No per-user bot to add", 13, TEAL, True)
+    rounded(d, (1160, 250, 1536, 570), fill=WHITE, outline="#E6C59F")
+    rounded(d, (1184, 272, 1512, 312), fill=PALE_ORANGE, outline=PALE_ORANGE, radius=12)
+    text(d, (1208, 284), "SHARED TELEGRAM SUPERGROUP", 13, ORANGE, True)
+    text(d, (1184, 354), "Canonical durable pool", 18, INK, True)
+    text(d, (1184, 392), "Either node reads and publishes here", 13, TEAL, True)
+    text(d, (1184, 426), "NVMT tiles + versioned hint manifests", 14, MUTED)
+    text(d, (1184, 462), "Each participant posts as their own", 14, MUTED)
+    text(d, (1184, 486), "authorized Telegram account", 14, MUTED)
+    text(d, (1184, 528), "No per-user bot to add", 13, TEAL, True)
 
-    line(d, [(420, 334), (500, 334), (500, 324), (580, 324)], BLUE)
-    line(d, [(1012, 324), (1088, 324), (1088, 356), (1172, 356)], TEAL)
-    line(d, [(1172, 420), (1096, 420), (1096, 506), (1012, 506)], ORANGE)
-    line(d, [(580, 538), (500, 538), (500, 438), (420, 438)], BLUE)
-    text(d, (454, 290), "HTTPS", 12, BLUE, True)
-    text(d, (1030, 289), "publish", 12, TEAL, True)
-    text(d, (1031, 453), "read", 12, ORANGE, True)
-    text(d, (453, 520), "bounded NVMT", 12, BLUE, True)
+    # Nuvio <-> node: paired pool traffic in both directions
+    for y in (299, 521):
+        line(d, [(424, y), (560, y)], BLUE)
+        line(d, [(560, y), (424, y)], BLUE)
+        centered_text(d, 492, y - 30, "HTTPS", 11, BLUE, True)
+        centered_text(d, 492, y + 10, "reads + uploads", 11, MUTED)
 
-    rounded(d, (64, 648, 1536, 710), fill="#EAF0F4", outline="#EAF0F4", radius=14)
-    text(d, (92, 670), "A pool node can pause or disappear. Nuvio keeps making thumbnails locally.", 15, INK, True)
+    # Node <-> Telegram: every node both reads (orange) and publishes (teal)
+    for y in (299, 521):
+        line(d, [(1080, y), (1000, y)], ORANGE)
+        line(d, [(1080, y), (1160, y)], TEAL)
+        centered_text(d, 1080, y - 30, "read + publish", 11, MUTED, True)
+
+    rounded(d, (64, 650, 1536, 716), fill="#EAF0F4", outline="#EAF0F4", radius=14)
+    text(d, (92, 674), "Both node types read from and publish to the same pool. "
+                       "If a node pauses or disappears, Nuvio keeps making thumbnails locally.",
+         15, INK, True)
     save(image, "pool-architecture.png")
 
 
