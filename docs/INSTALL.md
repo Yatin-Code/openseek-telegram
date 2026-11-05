@@ -4,6 +4,18 @@ OpenSeek needs Python 3.12 or newer (pins in `backend/requirements.txt`). The ff
 Pick a data directory outside the source tree and back it up if you want to keep your pairings and cache: it holds the
 database, the TLS identity (`tls/`), the admin token and the local extraction cache.
 
+## Choose a deployment profile
+
+- **Local/VPS:** run OpenSeek as a Python service. Its channel index and temporary state use the protected data directory
+  and SQLite. The browser dashboard is served on loopback port 8788. A Telegram channel can be connected from the
+  dashboard's first-run setup; no Supabase account is needed.
+- **Vercel:** run the same dashboard and pool API as a Python function. Telegram remains the durable pool store;
+  Supabase PostgreSQL holds the rebuildable index and upload state, and a private Supabase Storage bucket holds only
+  temporary upload bytes. Follow [the Vercel deployment guide](VERCEL.md) for the full project, schema, bucket,
+  environment-variable, and first-deploy steps.
+
+For a Telegram-backed pool, both profiles use `OPENSEEK_POOL_MODE=channel`. Local/VPS keeps its state on disk; Vercel needs the Supabase settings and Telegram credentials in Vercel's Production environment. The dashboard and operator checks are described in [Telegram pool setup](TELEGRAM-POOL.md).
+
 ## Windows, run the server from source
 
 ```powershell
@@ -81,14 +93,18 @@ It only stops a process that listens on the API port and whose command line is `
 It expects the virtual environment at `backend\.venv`. `-CodeTag` checks out a git tag in the repository; do not use it unless you
 know you want that.
 
-## Linux
+## Local/VPS on Linux
 
 ```sh
 sudo useradd --system --home-dir /var/lib/openseek --create-home --shell /usr/sbin/nologin openseek
-sudo git clone https://github.com/obadevyh/openseek.git /opt/openseek
+sudo git clone https://github.com/Yatin-Code/openseek-telegram.git /opt/openseek
 cd /opt/openseek/backend
 sudo python3 -m venv .venv && sudo .venv/bin/pip install -r requirements.txt -c requirements-lock.txt
+sudo install -d -o openseek -g openseek -m 0700 /var/lib/openseek
+sudo install -o openseek -g openseek -m 0600 /opt/openseek/.env.example /var/lib/openseek/.env
 ```
+
+The example file starts in the local profile and leaves the pool unconfigured. The dashboard can add Telegram settings on first use. The process reads `/var/lib/openseek/.env` when `OPENSEEK_ENV_FILE` points to it; keep that file and the data directory readable only by the service account.
 
 `/etc/systemd/system/openseek.service`:
 
@@ -102,6 +118,7 @@ Wants=network-online.target
 User=openseek
 WorkingDirectory=/opt/openseek/backend
 Environment=OPENSEEK_DATA_DIR=/var/lib/openseek
+Environment=OPENSEEK_ENV_FILE=/var/lib/openseek/.env
 ExecStart=/opt/openseek/backend/.venv/bin/python -m openseek serve
 Restart=on-failure
 NoNewPrivileges=true
@@ -124,8 +141,24 @@ WantedBy=multi-user.target
 
 ```sh
 sudo systemctl daemon-reload && sudo systemctl enable --now openseek
-sudo -u openseek env OPENSEEK_DATA_DIR=/var/lib/openseek /opt/openseek/backend/.venv/bin/python -m openseek pair
+cd /opt/openseek/backend
+sudo -u openseek env OPENSEEK_DATA_DIR=/var/lib/openseek OPENSEEK_ENV_FILE=/var/lib/openseek/.env \
+  .venv/bin/python -m openseek pair
 ```
+
+On the same desktop host, visit `http://127.0.0.1:8788/#<admin-secret>` or run `python -m openseek dashboard` with the
+same `OPENSEEK_DATA_DIR` and `OPENSEEK_ENV_FILE` values to open it. For a VPS, keep port 8788 closed to the network
+and forward it over SSH from your workstation:
+
+```sh
+ssh -L 8788:127.0.0.1:8788 operator@your-vps
+```
+
+Then read `/var/lib/openseek/admin.token` on the VPS as an administrator and open
+`http://127.0.0.1:8788/#<admin-secret>` in the workstation browser. Unless you set `OPENSEEK_ADMIN_TOKEN`, that file
+contains the secret. The dashboard removes the URL fragment after it stores the secret in that browser session. Its
+first-run form verifies Telegram history access and performs the initial scan. See
+[Telegram pool setup](TELEGRAM-POOL.md) for channel permissions, scan/status commands, and Vercel checks.
 
 The hardening options in the unit are a sensible starting point; they have not been run on every distribution, so check `systemctl status` and the journal after enabling them.
 Firewall: allow TCP 8787 from your LAN only.
