@@ -1308,16 +1308,26 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
 
     # ---------------------------------------------------------------- Vercel staged uploads
     @app.post("/v1/pool/uploads", status_code=201)
-    async def pool_upload_create(request: Request, body: UploadIn):
+    async def pool_upload_create(request: Request):
         pool = core.pool
         if pool is None:
-            # A plain local node has no pool surface either; staging is the contract answer.
-            return err(400, "staging_unavailable") if core.uploads is None else err(404, "not_found")
+            # No pool surface at all: the uniform refused answer, leaking nothing.
+            return err(404, "not_found")
         denied = pool_write_denial(request, pool)
         if denied is not None:
             return denied
         if core.uploads is None:
             return err(400, "staging_unavailable")      # local/VPS: direct PUT is the only path
+        try:
+            json = await request.json()
+        except ValueError:
+            return err(400, "bad_request")
+        if not isinstance(json, dict):
+            return err(400, "bad_request")
+        try:
+            body = UploadIn.model_validate(json)
+        except ValidationError:
+            return err(400, "bad_request")
         try:
             result = await asyncio.to_thread(
                 core.uploads.create, device_id=request.state.device_id, fp=body.fp,

@@ -319,14 +319,15 @@ def test_local_profile_refuses_staging_and_writes_no_rows(tmp_path):
         env.core.stop()
 
 
-def test_plain_local_profile_also_reports_staging_unavailable(tmp_path):
+def test_plain_local_profile_reports_no_pool_surface(tmp_path):
     core = Core(Settings(data_dir=tmp_path / "plain-local"), proxy=NoSourceProxy())
     try:
         env = SimpleNamespace(core=core, app=create_api_app(core))
         response = call(env, "POST", "/v1/pool/uploads",
                         body=upload_body(hashlib.sha256(b"plain local").hexdigest()), token=None)
-        assert response.status_code == 400
-        assert response.json() == {"error": "staging_unavailable"}
+        # A node with no pool surface answers like every other pool route and leaks nothing.
+        assert response.status_code == 404
+        assert response.json() == {"error": "not_found"}
     finally:
         core.stop()
 
