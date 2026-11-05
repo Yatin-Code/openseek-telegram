@@ -33,7 +33,8 @@ class StatefulSupabase:
 
     TABLES = ("pool_channel_tiles", "pool_channel_state", "pool_hints",
               "pool_episode_packages", "pool_uploads", "pool_publication_queue",
-              "pool_devices", "pool_invites")
+              "pool_devices", "pool_invites", "pool_owner_settings",
+              "pool_generation_jobs")
 
     def __init__(self):
         self.tables = {name: [] for name in self.TABLES}
@@ -288,6 +289,10 @@ def test_wizard_pair_publish_exact_and_hint_read_on_independent_nodes(
     owner_store = StatefulSupabase()
     receiver_store = StatefulSupabase()
     owner, owner_app = _node(tmp_path, "owner", telegram, owner_store)
+    # A fresh node starts with sharing off; the owner turns it on from the dashboard
+    # before creating the Nuvio invite.
+    owner.state_store.set_setting("sharing_enabled", "1")
+    owner.state_store.set_setting("contrib_enabled", "1")
     receiver, receiver_app = _node(tmp_path, "receiver", telegram, receiver_store,
                                    contribution=False)
     state_path = tmp_path / "participant" / "setup.json"
