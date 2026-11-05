@@ -9,6 +9,8 @@ All notable changes are documented here. The format follows [Keep a Changelog](h
 * Explicit dashboard NVMT generation with progress, bounded job execution, validated package assembly, and Telegram publication; player and pool lookup requests never start generation.
 * Participant-owned Vercel setup wizard for creating or linking each participant's own Vercel and Supabase projects,
   authorizing a Telegram user session, joining the shared supergroup, and pairing Nuvio without per-participant bots.
+* Token-based participant setup (`openseek setup --provider rest`) driving the same journey through the Vercel and
+  Supabase management APIs, for hosts without the provider CLIs.
 * Vercel channel-pool deployment profile with Supabase-backed rebuildable index and temporary upload staging; Telegram remains the only durable package store.
 * Bounded NVMT staging and publication with retryable/paused upload states, Supabase quota backoff, Telegram FloodWait/slow-mode handling,
   and cleanup of expired or terminal staging objects.

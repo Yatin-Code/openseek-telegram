@@ -27,6 +27,9 @@ class StepRecord:
     outcome: str                      # done | failed
     detail: str = ""
     created: float = field(default_factory=time.time)
+    # The ProviderError behind a failed step, kept in memory for status mapping.
+    # It is deliberately not serialized: the state file stores plain prose only.
+    error: object | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass

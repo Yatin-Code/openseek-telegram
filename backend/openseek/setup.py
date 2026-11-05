@@ -41,7 +41,7 @@ def _write_env(path: Path, lines: list[str]) -> None:
 
 def run_setup(input_fn: Callable[[str], str] = input, print_fn: Callable[[str], None] = print,
               output_path: Path = Path("openseek.env"), state_path: Path | None = None,
-              new_pairing: bool = False) -> int:
+              new_pairing: bool = False, provider: str | None = None) -> int:
     print_fn("OpenSeek pool setup")
     print_fn("1) Host a public pool")
     print_fn("2) Join a community pool")
@@ -59,7 +59,21 @@ def run_setup(input_fn: Callable[[str], str] = input, print_fn: Callable[[str], 
         if not (source_dir / "vercel.json").exists() and (source_dir / "backend" / "vercel.json").exists():
             source_dir = source_dir / "backend"
         resume_file = (state_path or Path.home() / ".config" / "openseek" / "participant-setup.json")
-        return ParticipantSetup(CliSetupProvider(), source_dir=source_dir,
+        # Choose the provider backend: the official CLIs (browser sign-in) or the
+        # provider APIs with an account token. Tokens in the environment select the
+        # REST backend without an extra flag; --provider always wins.
+        selected = (provider or os.environ.get("OPENSEEK_SETUP_PROVIDER", "").strip().lower() or
+                    ("rest" if os.environ.get("OPENSEEK_VERCEL_TOKEN") and
+                     os.environ.get("OPENSEEK_SUPABASE_ACCESS_TOKEN") else "cli"))
+        if selected == "rest":
+            from .provision.provider import RestSetupProvider
+            setup_provider = RestSetupProvider(input_fn=input_fn)
+        elif selected == "cli":
+            setup_provider = CliSetupProvider()
+        else:
+            print_fn("Unknown setup provider; choose cli or rest.")
+            return 2
+        return ParticipantSetup(setup_provider, source_dir=source_dir,
                                 state_path=resume_file, input_fn=input_fn,
                                 print_fn=print_fn, new_pairing=new_pairing).run()
 

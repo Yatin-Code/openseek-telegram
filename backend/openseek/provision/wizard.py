@@ -81,6 +81,7 @@ def node_env(state: WizardState) -> dict[str, str]:
     return {
         "OPENSEEK_PROFILE": "vercel",
         "OPENSEEK_POOL_MODE": "channel",
+        "OPENSEEK_SETUP_PENDING": "1",
         "OPENSEEK_SUPABASE_URL": state.supabase_url,
         "OPENSEEK_SUPABASE_SERVICE_KEY": state.service_key,
         "OPENSEEK_SUPABASE_BUCKET": state.staging_bucket or DEFAULT_STAGING_BUCKET,
@@ -461,7 +462,7 @@ class ProvisionWizard:
 
     def _close_clients(self) -> None:
         # A token change means the previous client now holds a stale credential.
-        if self._vercel_client is not None and self._supabase_client is not None:
+        if self._vercel_client is None and self._supabase_client is None:
             return
         for client in (self._vercel_client, self._supabase_client):
             if client is not None:
@@ -533,7 +534,8 @@ class ProvisionWizard:
             code, status_, text = PROVIDER, 0, (
                 "That step failed with an unexpected error. Run the wizard again "
                 "to resume; completed steps stay completed.")
-        self._state.completed[name] = StepRecord(name, "failed", text)
+        self._state.completed[name] = StepRecord(name, "failed", text,
+                                                 error=exc if isinstance(exc, ProviderError) else None)
         if name == "wait_deploy" and code in (DEPLOYMENT, NOT_FOUND, PROVIDER):
             self._state.completed.pop("deploy_node", None)
             self._state.deployment_id = ""
@@ -545,9 +547,7 @@ class ProvisionWizard:
         self._print_fn("This attempt can be resumed by running the wizard again.")
 
     def _failure_status(self, name: str) -> str:
-        record = self._state.completed.get(name)
-        code = getattr(record, "detail", "") and ""     # placeholder replaced below
-        return _status_for(record)
+        return _status_for(self._state.completed.get(name))
 
     def _save(self) -> None:
         state_mod.save(self._state_path, self._state)

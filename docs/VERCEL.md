@@ -14,10 +14,26 @@ root):
 python -m openseek setup
 ```
 
-Choose **Join the shared pool on my own Vercel account**. The wizard signs in through
-the official Vercel and Supabase CLIs. Their browser sign-in flows keep provider
-credentials in the providers' own CLI credential stores; OpenSeek never asks you to
-paste those credentials into chat or writes them to the setup progress file.
+Choose **Join the shared pool on my own Vercel account**. By default the wizard signs
+in through the official Vercel and Supabase CLIs. Their browser sign-in flows keep
+provider credentials in the providers' own CLI credential stores; OpenSeek never asks
+you to paste those credentials into chat or writes them to the setup progress file.
+
+If you would rather not install the CLIs, the same wizard can use account tokens.
+Create a Vercel token at <https://vercel.com/account/tokens> and a Supabase personal
+access token (`sbp_...`) at <https://supabase.com/dashboard/account/tokens>, then run:
+
+```sh
+export OPENSEEK_VERCEL_TOKEN=...
+export OPENSEEK_SUPABASE_ACCESS_TOKEN=sbp_...
+python -m openseek setup --provider rest
+```
+
+The REST backend performs the same steps: create or select the Supabase project, apply
+the schema, create the private staging bucket, deploy, check health, connect Telegram,
+and print the Nuvio pairing bundle. The tokens are held in memory for the run and are
+never written to the resume file. With both variables set the REST backend is selected
+automatically; `--provider cli` always forces the CLI flow.
 
 The wizard lets you select an existing Supabase project or create one in an
 organization you can access. For a new project it asks for a name and database region.
@@ -50,7 +66,8 @@ one. Contribution stays disabled until you opt in later in setup.
 ## Local requirements
 
 - Python 3.12 or later and the OpenSeek backend dependencies.
-- The Vercel CLI and Supabase CLI installed and available on `PATH`.
+- Either the Vercel CLI and Supabase CLI on `PATH` (default), or a Vercel token and a
+  Supabase personal access token for `--provider rest`.
 - Accounts with access to the projects you select. Free tiers have provider-defined
   quotas; when they are exhausted, setup pauses and can be resumed after capacity is
   available. OpenSeek never enables a paid plan.

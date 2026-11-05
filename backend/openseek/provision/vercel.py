@@ -105,6 +105,26 @@ class VercelClient:
         envs = response.json().get("envs", [])
         return {entry.get("key", "") for entry in envs if isinstance(entry, dict)}
 
+    def list_projects(self, limit: int = 100) -> list[dict]:
+        """Projects on this account: [{id, name}] (one page, newest first)."""
+        response = self._request("GET", "/v9/projects", params=[("limit", str(limit))])
+        body = response.json()
+        rows = body.get("projects", []) if isinstance(body, dict) else []
+        return [{"id": row.get("id", ""), "name": row.get("name", "")}
+                for row in rows if isinstance(row, dict) and row.get("name")]
+
+    def delete_env_key(self, project_id_or_name: str, key: str) -> None:
+        """Remove every Production environment entry named `key`; absent keys are fine."""
+        response = self._request("GET",
+                                 f"/v10/projects/{quote(project_id_or_name, safe='')}/env")
+        entries = response.json().get("envs", [])
+        for entry in entries:
+            if isinstance(entry, dict) and entry.get("key") == key and entry.get("id"):
+                self._request(
+                    "DELETE",
+                    f"/v9/projects/{quote(project_id_or_name, safe='')}"
+                    f"/env/{quote(str(entry['id']), safe='')}")
+
     def create_deployment(self, name: str, files: list[tuple[str, bytes]]) -> dict:
         """Upload sources (sha1 digest each) and create a production deployment.
 
