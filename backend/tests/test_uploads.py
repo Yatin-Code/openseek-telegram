@@ -26,7 +26,7 @@ from openseek.db import DB
 from openseek.pool import MAX_DURATION_MS, MAX_NVMT_BYTES, PoolError, decode_nvmt, encode_nvmt
 from openseek.remote import RemoteStoreError, RemoteUploadQueueStore, SupabaseClient
 from openseek.store import ChannelStore, UploadQueueStore
-from openseek.uploads import UploadService
+from openseek.uploads import QUOTA_RETRY_S, UploadService
 from test_pool_channel import MemoryChannel, jpeg
 
 READ_KEY = "r" * 40
@@ -47,6 +47,15 @@ class FakeSupabase:
         self.deleted_objects: list[str] = []
         self.requests: list[tuple[str, str]] = []
         self.delete_failures = 0
+        self.object_get_status = 0
+        self.injected_failures: list[tuple[str, str, str, int, str | None]] = []
+
+    def fail_next_status(self, method: str, path_prefix: str, status: int,
+                         retry_after: str | None = None) -> None:
+        self.injected_failures.append((method, path_prefix, "status", status, retry_after))
+
+    def fail_next_connection(self, method: str, path_prefix: str) -> None:
+        self.injected_failures.append((method, path_prefix, "connect", 0, None))
 
     # -- helpers
     def add_object(self, path: str, data: bytes) -> None:
@@ -101,6 +110,16 @@ class FakeSupabase:
         self.requests.append((request.method, request.url.path))
         path = request.url.path
         params = list(request.url.params.multi_items())
+        injected = next((item for item in self.injected_failures
+                         if request.method == item[0] and path.startswith(item[1])), None)
+        if injected is not None:
+            self.injected_failures.remove(injected)
+            if injected[2] == "connect":
+                raise httpx.ConnectError("injected Supabase outage", request=request)
+            headers = {"Retry-After": injected[4]} if injected[4] else None
+            return httpx.Response(injected[3], json={"message": "injected provider error"},
+                                  headers=headers,
+                                  request=request)
         if path == "/rest/v1/rpc/enqueue_pool_publication" and request.method == "POST":
             args = json.loads(request.content or b"{}")
             upload_id = args["p_upload_id"]
@@ -167,6 +186,9 @@ class FakeSupabase:
             if request.method == "HEAD":
                 return httpx.Response(200 if object_path in self.objects else 404)
             if request.method == "GET":
+                if self.object_get_status:
+                    return httpx.Response(self.object_get_status,
+                                          json={"message": "storage temporarily unavailable"})
                 if object_path not in self.objects:
                     return httpx.Response(404, json={"message": "Object not found"})
                 return httpx.Response(200, content=self.objects[object_path])
@@ -202,6 +224,7 @@ class RecordingPool:
     def __init__(self):
         self.calls: list[dict] = []
         self.fail_with: PoolError | None = None
+        self.read_fail_with: RemoteStoreError | None = None
 
     def authorize(self, given: str | None, write: bool = False) -> bool:
         wanted = self.write_key if write else self.read_key
@@ -214,12 +237,19 @@ class RecordingPool:
                            "data": data, **kwargs})
         return {"stored": True, "duplicate": False}
 
+    def candidates(self, **_hints):
+        if self.read_fail_with is not None:
+            raise self.read_fail_with
+        return []
+
 
 def make_settings(tmp_path, *, profile="vercel", cron_secret=CRON_SECRET) -> Settings:
+    telegram_identity = ({"telegram_session": "1abc"} if profile == "vercel" else
+                         {"telegram_bot_token": "123456:test-token"})
     return Settings(
         data_dir=tmp_path / "data", profile=profile, pool_mode="channel",
         supabase_url=SUPABASE_URL, supabase_service_key=SERVICE_KEY,
-        telegram_channel_id="-100123456", telegram_bot_token="123456:test-token",
+        telegram_channel_id="-100123456", **telegram_identity,
         telegram_api_id=1, telegram_api_hash="test-hash",
         pool_read_key=READ_KEY, pool_write_key=WRITE_KEY, cron_secret=cron_secret)
 
@@ -295,14 +325,14 @@ def test_local_profile_refuses_staging_and_writes_no_rows(tmp_path):
         env.core.stop()
 
 
-def test_plain_local_profile_also_reports_staging_unavailable(tmp_path):
+def test_plain_local_profile_hides_pool_upload_route(tmp_path):
     core = Core(Settings(data_dir=tmp_path / "plain-local"), proxy=NoSourceProxy())
     try:
         env = SimpleNamespace(core=core, app=create_api_app(core))
         response = call(env, "POST", "/v1/pool/uploads",
                         body=upload_body(hashlib.sha256(b"plain local").hexdigest()), token=None)
-        assert response.status_code == 400
-        assert response.json() == {"error": "staging_unavailable"}
+        assert response.status_code == 404
+        assert response.json() == {"error": "not_found"}
     finally:
         core.stop()
 
@@ -379,14 +409,154 @@ def create_upload(env, fp: str | None = None, **changes) -> dict:
     return response.json()
 
 
-def test_finalize_moves_pending_to_queued_once(tmp_path):
+@pytest.mark.parametrize("method,path_prefix,status,expected", [
+    ("POST", "/storage/v1/object/upload/sign/", 503, "staging_unavailable"),
+    ("POST", "/rest/v1/pool_uploads", 503, "queue_unavailable"),
+])
+def test_create_maps_supabase_sign_and_database_failures(tmp_path, method, path_prefix,
+                                                         status, expected):
+    env = make_env(tmp_path)
+    fp = hashlib.sha256(f"create outage {path_prefix}".encode()).hexdigest()
+    env.fake.fail_next_status(method, path_prefix, status)
+    try:
+        response = call(env, "POST", "/v1/pool/uploads", body=upload_body(fp))
+        assert response.status_code == 503
+        assert response.json() == {"error": expected}
+        assert env.fake.rows("pool_uploads") == []
+    finally:
+        env.core.stop()
+
+
+def test_finalize_and_status_map_supabase_database_failures(tmp_path):
+    env = make_env(tmp_path)
+    try:
+        first = create_upload(env)
+        env.fake.fail_next_status("POST", "/rest/v1/rpc/enqueue_pool_publication", 503)
+        finalize = call(env, "POST", f"/v1/pool/uploads/{first['upload_id']}/finalize")
+        assert finalize.status_code == 503
+        assert finalize.json() == {"error": "queue_unavailable"}
+        assert env.fake.rows("pool_uploads")[0]["state"] == "pending"
+
+        second = create_upload(env, hashlib.sha256(b"status outage").hexdigest())
+        env.fake.fail_next_status("GET", "/rest/v1/pool_uploads", 503)
+        status = call(env, "GET", f"/v1/pool/uploads/{second['upload_id']}")
+        assert status.status_code == 503
+        assert status.json() == {"error": "upload_status_unavailable"}
+    finally:
+        env.core.stop()
+
+
+def test_supabase_network_outage_keeps_staging_and_retries(tmp_path):
+    env = make_env(tmp_path)
+    fp = hashlib.sha256(b"staging network outage").hexdigest()
+    try:
+        created = create_upload(env, fp)
+        path = env.fake.rows("pool_uploads")[0]["object_path"]
+        env.fake.add_object(path, b"valid staged bytes")
+        assert call(env, "POST", f"/v1/pool/uploads/{created['upload_id']}/finalize").status_code == 202
+        env.fake.fail_next_connection("GET", "/storage/v1/object/")
+
+        tick = call(env, "POST", "/v1/internal/tick", token=CRON_SECRET)
+        assert tick.status_code == 200
+        assert tick.json() == {"processed": 1, "accepted": 0, "failed": 1}
+        status = call(env, "GET", f"/v1/pool/uploads/{created['upload_id']}")
+        assert status.json() == {"upload_id": created["upload_id"], "state": "retrying",
+                                 "error": "staging_unavailable"}
+        assert path in env.fake.objects
+        assert env.fake.rows("pool_publication_queue")[0]["attempts"] == 1
+    finally:
+        env.core.stop()
+
+
+def test_supabase_retry_after_header_sets_the_next_retry_time(tmp_path):
+    env = make_env(tmp_path)
+    fp = hashlib.sha256(b"provider retry-after header").hexdigest()
+    try:
+        created = create_upload(env, fp)
+        path = env.fake.rows("pool_uploads")[0]["object_path"]
+        env.fake.add_object(path, b"package")
+        env.fake.fail_next_status("GET", "/storage/v1/object/", 429, retry_after="600")
+        assert call(env, "POST", f"/v1/pool/uploads/{created['upload_id']}/finalize").status_code == 202
+
+        status = call(env, "GET", f"/v1/pool/uploads/{created['upload_id']}")
+        assert status.json()["state"] == "paused"
+        assert env.fake.rows("pool_publication_queue")[0]["next_attempt"] == env.clock.t + 600
+    finally:
+        env.core.stop()
+
+
+@pytest.mark.parametrize("provider_status,state,error", [
+    (429, "paused", "quota_paused"),
+    (500, "retrying", "staging_unavailable"),
+])
+def test_supabase_rate_limit_and_project_errors_have_distinct_states(
+        tmp_path, provider_status, state, error):
+    env = make_env(tmp_path)
+    fp = hashlib.sha256(f"storage status {provider_status}".encode()).hexdigest()
+    try:
+        created = create_upload(env, fp)
+        path = env.fake.rows("pool_uploads")[0]["object_path"]
+        env.fake.add_object(path, b"package")
+        env.fake.object_get_status = provider_status
+        assert call(env, "POST", f"/v1/pool/uploads/{created['upload_id']}/finalize").status_code == 202
+
+        status = call(env, "GET", f"/v1/pool/uploads/{created['upload_id']}")
+        assert status.json() == {"upload_id": created["upload_id"], "state": state, "error": error}
+        assert path in env.fake.objects
+        assert env.fake.rows("pool_publication_queue")[0]["attempts"] == 1
+        if provider_status == 429:
+            assert env.fake.rows("pool_publication_queue")[0]["next_attempt"] == env.clock.t + QUOTA_RETRY_S
+    finally:
+        env.core.stop()
+
+
+@pytest.mark.parametrize("telegram_code", ["telegram_flood_wait", "telegram_slow_mode"])
+def test_telegram_rate_limits_keep_staged_contribution_retryable(tmp_path, telegram_code):
+    env = make_env(tmp_path, real_channel=True)
+    fp = hashlib.sha256(telegram_code.encode()).hexdigest()
+    try:
+        created = create_upload(env, fp)
+        row = env.fake.rows("pool_uploads")[0]
+        path = row["object_path"]
+        env.fake.add_object(path, nvmt_bytes(fp))
+        env.channel.fail_with = PoolError(429, telegram_code, retry_after=90)
+        assert call(env, "POST", f"/v1/pool/uploads/{created['upload_id']}/finalize").status_code == 202
+
+        status = call(env, "GET", f"/v1/pool/uploads/{created['upload_id']}")
+        assert status.json() == {"upload_id": created["upload_id"], "state": "retrying",
+                                 "error": telegram_code}
+        queue = env.fake.rows("pool_publication_queue")[0]
+        assert queue["next_attempt"] == env.clock.t + 90
+        assert queue["state"] == "queued" and path in env.fake.objects
+    finally:
+        env.core.stop()
+
+
+def test_remote_store_read_error_is_a_retryable_pool_service_error(tmp_path):
+    env = make_env(tmp_path)
+    env.pool.read_fail_with = RemoteStoreError(429, "too_many_requests", "provider details")
+    try:
+        response = call(env, "GET", "/v1/pool/candidates?imdb=tt1234567&duration_ms=20000",
+                        token=READ_KEY)
+        assert response.status_code == 503
+        assert response.json() == {"error": "pool_backend_unavailable"}
+        assert response.headers["retry-after"] == "5"
+        assert "provider details" not in response.text
+    finally:
+        env.core.stop()
+
+
+def test_finalize_triggers_request_driven_publication_once(tmp_path):
     env = make_env(tmp_path)
     created = create_upload(env)
     upload_id = created["upload_id"]
+    row = env.fake.rows("pool_uploads")[0]
+    object_path = row["object_path"]
+    env.fake.add_object(object_path, b"verified by the fake pool")
     try:
         response = call(env, "POST", f"/v1/pool/uploads/{upload_id}/finalize")
         assert response.status_code == 202, response.text
-        assert response.json() == {"upload_id": upload_id, "state": "queued"}
+        assert response.json() == {"upload_id": upload_id, "state": "pending"}
 
         upload = env.fake.rows("pool_uploads")[0]
         queue = env.fake.rows("pool_publication_queue")[0]
@@ -401,8 +571,63 @@ def test_finalize_moves_pending_to_queued_once(tmp_path):
 
         status = call(env, "GET", f"/v1/pool/uploads/{upload_id}")
         assert status.status_code == 200
-        assert status.json() == {"upload_id": upload_id, "state": "queued", "error": None}
+        assert status.json() == {"upload_id": upload_id, "state": "accepted", "error": None}
+        assert env.fake.deleted_objects == [object_path]
         assert status.headers["cache-control"] == "no-store"
+    finally:
+        env.core.stop()
+
+
+def test_status_request_retries_flood_wait_and_keeps_upload_durable(tmp_path):
+    env = make_env(tmp_path, real_channel=True)
+    fp = hashlib.sha256(b"request driven retry").hexdigest()
+    try:
+        created = create_upload(env, fp)
+        upload_id = created["upload_id"]
+        row = env.fake.rows("pool_uploads")[0]
+        object_path = row["object_path"]
+        env.fake.add_object(object_path, nvmt_bytes(fp))
+        env.channel.fail_with = PoolError(429, "telegram_flood_wait", retry_after=120)
+
+        finalized = call(env, "POST", f"/v1/pool/uploads/{upload_id}/finalize")
+        assert finalized.status_code == 202
+        assert env.fake.rows("pool_publication_queue")[0]["state"] == "queued"
+        assert env.fake.rows("pool_publication_queue")[0]["next_attempt"] == env.clock.t
+
+        delayed = call(env, "GET", f"/v1/pool/uploads/{upload_id}")
+        assert delayed.json() == {"upload_id": upload_id, "state": "retrying",
+                                  "error": "telegram_flood_wait"}
+        assert env.fake.rows("pool_publication_queue")[0]["next_attempt"] == env.clock.t + 120
+        assert env.fake.rows("pool_uploads")[0]["state"] == "queued"
+        assert object_path in env.fake.objects
+
+        env.channel.fail_with = None
+        env.clock.t += 121
+        accepted = call(env, "GET", f"/v1/pool/uploads/{upload_id}")
+        assert accepted.json() == {"upload_id": upload_id, "state": "accepted", "error": None}
+        assert env.fake.deleted_objects == [object_path]
+    finally:
+        env.core.stop()
+
+
+def test_supabase_quota_pause_is_visible_and_not_terminal(tmp_path):
+    env = make_env(tmp_path)
+    fp = hashlib.sha256(b"free tier pause").hexdigest()
+    try:
+        created = create_upload(env, fp)
+        upload_id = created["upload_id"]
+        row = env.fake.rows("pool_uploads")[0]
+        env.fake.add_object(row["object_path"], b"package")
+        env.fake.object_get_status = 402
+
+        call(env, "POST", f"/v1/pool/uploads/{upload_id}/finalize")
+        status = call(env, "GET", f"/v1/pool/uploads/{upload_id}")
+        assert status.json() == {"upload_id": upload_id, "state": "paused", "error": "quota_paused"}
+        upload = env.fake.rows("pool_uploads")[0]
+        queue = env.fake.rows("pool_publication_queue")[0]
+        assert upload["state"] == queue["state"] == "queued"
+        assert queue["attempts"] == 1
+        assert row["object_path"] in env.fake.objects
     finally:
         env.core.stop()
 
@@ -450,7 +675,7 @@ def test_expiry_marks_pending_upload_expired_and_refuses_finalize(tmp_path):
         env.clock.t += 901
         status = call(env, "GET", f"/v1/pool/uploads/{upload_id}")
         assert status.status_code == 200
-        assert status.json() == {"upload_id": upload_id, "state": "expired", "error": "expired"}
+        assert status.json() == {"upload_id": upload_id, "state": "failed", "error": "expired"}
         assert env.fake.rows("pool_uploads")[0]["state"] == "expired"
 
         finalize = call(env, "POST", f"/v1/pool/uploads/{upload_id}/finalize")
@@ -650,17 +875,41 @@ def test_tick_transient_failure_backs_off_then_fails_after_five_attempts(tmp_pat
             queue = env.fake.rows("pool_publication_queue")[0]
             assert queue["attempts"] == attempt
             assert upload["error"] == "telegram_unavailable"
-            assert path in env.fake.objects            # never deleted on failure
             if attempt < 5:
                 assert upload["state"] == "queued" and queue["state"] == "queued"
                 assert queue["next_attempt"] == pytest.approx(env.clock.t + 2 ** attempt)
+                assert path in env.fake.objects        # retriable work retains its staged bytes
             else:
                 assert upload["state"] == "failed" and queue["state"] == "failed"
+                assert path not in env.fake.objects and upload["object_path"] == ""
 
         # A terminal failure is not retried by another tick.
         env.clock.t += 301
         response = call(env, "POST", "/v1/internal/tick", token=CRON_SECRET)
         assert response.json() == {"processed": 0, "accepted": 0, "failed": 0}
+    finally:
+        env.core.stop()
+
+
+def test_terminal_storage_outage_cleans_staging_after_retry_limit(tmp_path):
+    env = make_env(tmp_path)
+    fp = hashlib.sha256(b"terminal storage outage").hexdigest()
+    try:
+        created = create_upload(env, fp)
+        path = env.fake.rows("pool_uploads")[0]["object_path"]
+        env.fake.add_object(path, b"staged package")
+        env.fake.object_get_status = 500
+        assert call(env, "POST", f"/v1/pool/uploads/{created['upload_id']}/finalize").status_code == 202
+
+        for _attempt in range(1, 6):
+            env.clock.t += 301
+            response = call(env, "POST", "/v1/internal/tick", token=CRON_SECRET)
+            assert response.status_code == 200
+        upload = env.fake.rows("pool_uploads")[0]
+        queue = env.fake.rows("pool_publication_queue")[0]
+        assert upload["state"] == queue["state"] == "failed"
+        assert upload["error"] == "staging_unavailable"
+        assert upload["object_path"] == "" and path not in env.fake.objects
     finally:
         env.core.stop()
 

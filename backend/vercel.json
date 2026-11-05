@@ -5,8 +5,5 @@
       "maxDuration": 60,
       "excludeFiles": "{tests/**,**/__pycache__/**,**/*.pyc,fixtures/**,**/test_*.py}"
     }
-  },
-  "crons": [
-    { "path": "/v1/internal/tick", "schedule": "* * * * *" }
-  ]
+  }
 }

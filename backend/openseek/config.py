@@ -113,6 +113,7 @@ def _ports(v: str) -> frozenset[int]:
 class Settings:
     data_dir: Path = Path("data")
     profile: str = "local"                 # local | vercel (OPENSEEK_PROFILE; VERCEL=1 implies vercel)
+    setup_pending: bool = False             # temporary healthy Vercel deployment during participant setup
     supabase_url: str = ""
     supabase_service_key: str = ""
     supabase_bucket: str = "openseek-staging"
@@ -229,6 +230,7 @@ class Settings:
         conv = {
             "DATA_DIR": ("data_dir", Path),
             "PROFILE": ("profile", str),
+            "SETUP_PENDING": ("setup_pending", _bool),
             "SUPABASE_URL": ("supabase_url", str),
             "SUPABASE_SERVICE_KEY": ("supabase_service_key", str),
             "SUPABASE_BUCKET": ("supabase_bucket", str),
@@ -388,15 +390,18 @@ class Settings:
         if self.profile == "vercel":
             if self.effective_pool_mode != "channel":
                 raise ConfigError("OPENSEEK_PROFILE=vercel requires OPENSEEK_POOL_MODE=channel")
-            if not self.telegram_channel_id:
-                raise ConfigError("OPENSEEK_PROFILE=vercel requires OPENSEEK_TELEGRAM_CHANNEL_ID")
-            if not self.telegram_api_id or not self.telegram_api_hash:
-                raise ConfigError("OPENSEEK_PROFILE=vercel requires OPENSEEK_TELEGRAM_API_ID and OPENSEEK_TELEGRAM_API_HASH")
-            if not self.telegram_bot_token and not self.telegram_session:
-                raise ConfigError("OPENSEEK_PROFILE=vercel requires a Telegram bot token or StringSession")
-            if (self.telegram_session_file or any(sep in self.telegram_session for sep in ("/", "\\")) or
-                    self.telegram_session.startswith("~") or self.telegram_session.endswith(".session")):
-                raise ConfigError("OPENSEEK_PROFILE=vercel requires a Telegram StringSession, not a session file")
+            if not self.setup_pending:
+                if not self.telegram_channel_id:
+                    raise ConfigError("OPENSEEK_PROFILE=vercel requires OPENSEEK_TELEGRAM_CHANNEL_ID")
+                if not self.telegram_api_id or not self.telegram_api_hash:
+                    raise ConfigError("OPENSEEK_PROFILE=vercel requires OPENSEEK_TELEGRAM_API_ID and OPENSEEK_TELEGRAM_API_HASH")
+                if not self.telegram_bot_token and not self.telegram_session:
+                    raise ConfigError("OPENSEEK_PROFILE=vercel requires a Telegram user session")
+                if self.telegram_bot_token:
+                    raise ConfigError("OPENSEEK_PROFILE=vercel uses a Telegram user session, not a bot token")
+                if (self.telegram_session_file or any(sep in self.telegram_session for sep in ("/", "\\")) or
+                        self.telegram_session.startswith("~") or self.telegram_session.endswith(".session")):
+                    raise ConfigError("OPENSEEK_PROFILE=vercel requires a Telegram StringSession, not a session file")
             if not self.supabase_url:
                 raise ConfigError("OPENSEEK_PROFILE=vercel requires OPENSEEK_SUPABASE_URL")
             parsed = urlsplit(self.supabase_url)
@@ -493,9 +498,12 @@ class Settings:
                 raise ConfigError("OPENSEEK_POOL_INDEX_REFRESH_S must be 10..86400")
             if self.telegram_api_id < 0:
                 raise ConfigError("OPENSEEK_TELEGRAM_API_ID must be a positive integer")
-            if not self.telegram_channel_id or not (self.telegram_bot_token or self.telegram_session or self.telegram_session_file):
+            if not (self.profile == "vercel" and self.setup_pending) and (
+                    not self.telegram_channel_id or
+                    not (self.telegram_bot_token or self.telegram_session or self.telegram_session_file)):
                 raise ConfigError("channel pool mode requires OPENSEEK_TELEGRAM_CHANNEL_ID and a bot token or user session")
-            if not self.telegram_api_id or not self.telegram_api_hash:
+            if not (self.profile == "vercel" and self.setup_pending) and (
+                    not self.telegram_api_id or not self.telegram_api_hash):
                 raise ConfigError("channel pool mode requires OPENSEEK_TELEGRAM_API_ID and OPENSEEK_TELEGRAM_API_HASH")
             if self.contribution and not (self.telegram_bot_token or self.telegram_session or self.telegram_session_file):
                 raise ConfigError("OPENSEEK_CONTRIBUTION requires a Telegram identity")

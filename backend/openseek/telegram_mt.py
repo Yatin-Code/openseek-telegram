@@ -187,7 +187,8 @@ class TelegramMTProtoStore:
             try:
                 permissions = await self._client.get_permissions(self._entity, "me")
                 allowed = (getattr(permissions, "post_messages", False) if is_broadcast else
-                           getattr(permissions, "send_messages", True))
+                           (getattr(permissions, "send_messages", True) is not False and
+                            getattr(permissions, "send_media", True) is not False))
                 self.detected_can_post = allowed is not False
                 self.post_permission_error = ""
             except Exception as exc:
@@ -421,6 +422,8 @@ class TelegramMTProtoStore:
             try:
                 return await operation()
             except Exception as exc:
+                if type(exc).__name__ in ("FloodWaitError", "SlowModeWaitError"):
+                    raise _pool_error(exc) from exc
                 delay = _retry_delay(exc, attempt)
                 if delay is None or attempt == 3:
                     raise
@@ -493,8 +496,8 @@ def _invite_hash(invite: str) -> str:
 
 def _retry_delay(exc: Exception, attempt: int) -> float | None:
     name = type(exc).__name__
-    if name == "FloodWaitError":
-        return min(max(float(getattr(exc, "seconds", 1)), 1.0), 60.0)
+    if name in ("FloodWaitError", "SlowModeWaitError"):
+        return None
     if isinstance(exc, (OSError, TimeoutError, ConnectionError, asyncio.TimeoutError)):
         return min(2 ** attempt, 8)
     return None
@@ -504,11 +507,18 @@ def _pool_error(exc: Exception) -> PoolError:
     if isinstance(exc, PoolError):
         return exc
     name = type(exc).__name__
+    if name in ("FloodWaitError", "SlowModeWaitError"):
+        try:
+            delay = max(1.0, min(float(getattr(exc, "seconds", 1)), 7 * 86400.0))
+        except (TypeError, ValueError):
+            delay = 60.0
+        code = "telegram_flood_wait" if name == "FloodWaitError" else "telegram_slow_mode"
+        return PoolError(429, code, retry_after=delay)
     if name in ("MessageIdInvalidError", "MessageEmptyError"):
         return PoolError(404, "telegram_message_not_found")
     if name in ("ChannelPrivateError", "ChatAdminRequiredError", "UserNotParticipantError"):
         return PoolError(403, "telegram_access_denied")
-    if name in ("FloodWaitError", "TimeoutError", "ConnectionError") or isinstance(exc, (OSError, asyncio.TimeoutError)):
+    if name in ("TimeoutError", "ConnectionError") or isinstance(exc, (OSError, asyncio.TimeoutError)):
         return PoolError(503, "telegram_unavailable")
     if name in ("AuthKeyError", "SessionPasswordNeededError", "PhoneCodeInvalidError"):
         return PoolError(401, "telegram_login_required")

@@ -81,7 +81,11 @@ def test_every_route_requires_auth(core):
             if path in ("/v1/health", "/v1/pair/start", "/v1/pair/claim"):
                 continue
             seen += 1
-            if path.startswith("/v1/c/"):
+            if path == "/v1/setup/pairing":
+                # This first-owner wizard route is gated by its own short-lived
+                # setup key and intentionally looks absent outside Vercel setup.
+                assert r.status_code == 404 and r.json() == {"error": "not_found"}, path
+            elif path.startswith("/v1/c/"):
                 assert r.status_code == 403 and r.json() == {"error": "forbidden"}, path
             elif path.startswith("/v1/pool/"):
                 # Pool routes use their own read/write bearer keys. This core has no pool store enabled.

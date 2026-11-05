@@ -48,9 +48,12 @@ class MemoryChannel:
         self.next_id = 1
         self.fail_next_upload = False
         self.fail_after_uploads: int | None = None
+        self.fail_with: PoolError | None = None
         self.deleted: list[int] = []
 
     def put_tile(self, data, caption, metadata=None, target=None):
+        if self.fail_with is not None:
+            raise self.fail_with
         if self.fail_next_upload:
             self.fail_next_upload = False
             raise PoolError(503, "telegram_unavailable")
@@ -178,12 +181,15 @@ def test_channel_mode_serves_pool_routes_from_index(tmp_path):
             legacy_without_duration = await client.get(
                 f"/v1/pool/{legacy_fp}/nvmt?profile=nvmt-v1-g5", headers=headers)
             sparse = await client.get(f"/v1/pool/{fp}/nvmt?profile=nvmt-v1-g5&slots=0,2", headers=headers)
+            nvmt_manifest = await client.get(
+                f"/v1/pool/{fp}/nvmt/manifest?profile=nvmt-v1-g5&duration_ms=20000&episode_key={episode_key}",
+                headers=headers)
             candidates = await client.get(f"/v1/pool/episodes/{episode_key}?duration_ms=20000", headers=headers)
             missing = await client.get(f"/v1/pool/{'f' * 64}/nvmt?profile=nvmt-v1-g5", headers=headers)
-        return manifest, tile, full, legacy, legacy_without_duration, sparse, candidates, missing
+        return manifest, tile, full, legacy, legacy_without_duration, sparse, nvmt_manifest, candidates, missing
 
     try:
-        manifest, tile, full, legacy, legacy_without_duration, sparse, candidates, missing = asyncio.run(requests())
+        manifest, tile, full, legacy, legacy_without_duration, sparse, nvmt_manifest, candidates, missing = asyncio.run(requests())
         assert manifest.status_code == 200
         assert [item["k"] for item in manifest.json()["tiles"]] == [0, 1]
         assert tile.status_code == 200 and tile.content == tiles[1]
@@ -192,6 +198,9 @@ def test_channel_mode_serves_pool_routes_from_index(tmp_path):
         assert decode_nvmt(legacy_fp, "nvmt-v1-g5", 20_000, legacy.content)[2] == {0: (0, legacy_tile)}
         assert legacy_without_duration.status_code == 404
         assert sparse.status_code == 200
+        assert nvmt_manifest.status_code == 200
+        assert nvmt_manifest.json()["tile_slots"] == [0, 1]
+        assert nvmt_manifest.json()["n_slots"] == 4
         assert full.content == sparse.content
         assert candidates.status_code == 200
         assert [item["fp"] for item in candidates.json()["candidates"]] == [fp]
@@ -810,7 +819,7 @@ def test_doctor_reports_live_channel_identity_and_permissions(monkeypatch, capsy
 
 def test_doctor_reports_vercel_supabase_presence_without_printing_the_key(monkeypatch, capsys, tmp_path):
     settings = Settings(data_dir=tmp_path, pool_mode="channel", profile="vercel",
-                        telegram_bot_token="123456:test", telegram_channel_id="-100123",
+                        telegram_session="1abc", telegram_channel_id="-100123",
                         supabase_url="https://project.supabase.co",
                         supabase_service_key="service-role-secret",
                         supabase_bucket="openseek-staging")

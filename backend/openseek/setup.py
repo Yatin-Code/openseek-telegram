@@ -40,15 +40,28 @@ def _write_env(path: Path, lines: list[str]) -> None:
 
 
 def run_setup(input_fn: Callable[[str], str] = input, print_fn: Callable[[str], None] = print,
-              output_path: Path = Path("openseek.env")) -> int:
+              output_path: Path = Path("openseek.env"), state_path: Path | None = None,
+              new_pairing: bool = False) -> int:
     print_fn("OpenSeek pool setup")
     print_fn("1) Host a public pool")
     print_fn("2) Join a community pool")
     print_fn("3) Skip (local-only)")
+    print_fn("4) Join the shared pool on my own Vercel account")
     choice = _ask("Choose", "3", input_fn)
-    if choice not in ("1", "2", "3"):
-        print_fn("Choose 1, 2, or 3.")
+    if choice not in ("1", "2", "3", "4"):
+        print_fn("Choose 1, 2, 3, or 4.")
         return 2
+
+    if choice == "4":
+        from .participant_setup import CliSetupProvider, ParticipantSetup
+
+        source_dir = Path.cwd()
+        if not (source_dir / "vercel.json").exists() and (source_dir / "backend" / "vercel.json").exists():
+            source_dir = source_dir / "backend"
+        resume_file = (state_path or Path.home() / ".config" / "openseek" / "participant-setup.json")
+        return ParticipantSetup(CliSetupProvider(), source_dir=source_dir,
+                                state_path=resume_file, input_fn=input_fn,
+                                print_fn=print_fn, new_pairing=new_pairing).run()
 
     lines: list[str]
     if choice == "3":

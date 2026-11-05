@@ -13,8 +13,14 @@ The collection of published NVMT packages and matching hints that participating 
 **Pool node**:
 An OpenSeek deployment that indexes the shared pool and serves package requests.
 
+**Pool publisher**:
+The Telegram identity authorized by the pool operator to read from and publish accepted contributions to the shared pool channel.
+
 **Uploader**:
 A Nuvio client or an OpenSeek owner action that submits an NVMT package and its hints to the shared pool.
+
+**Contribution**:
+An opted-in submission of an NVMT package and its matching hints to the shared pool.
 
 **Receiver**:
 A Nuvio client requesting an exact or hint-matched NVMT package for playback.
@@ -24,3 +30,6 @@ A pool node that serves an NVMT package to a receiver.
 
 **Admin generation**:
 An owner-started task that creates an NVMT package from the dashboard, separate from Nuvio's playback-time generation.
+
+**Librarian**:
+A Telegram bot that accepts direct-message contributions, validates their NVMT packages and hints, and republishes accepted contributions to the shared pool.

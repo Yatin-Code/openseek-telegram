@@ -33,6 +33,7 @@ OPEN_ROUTES = (
     ("pool_read", "GET", re.compile(rf"/v1/pool/{_FP}/tiles/{_INDEX}\.jpg")),
     ("pool_write", "PUT", re.compile(rf"/v1/pool/{_FP}/tiles/{_INDEX}\.jpg")),
     ("pool_read", "GET", re.compile(rf"/v1/pool/{_FP}/nvmt")),
+    ("pool_read", "GET", re.compile(rf"/v1/pool/{_FP}/nvmt/manifest")),
     ("pool_read", "GET", re.compile(rf"/v1/pool/episodes/{_EPISODE_KEY}")),
     ("pool_write", "PUT", re.compile(rf"/v1/pool/{_FP}/nvmt")),
 )

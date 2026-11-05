@@ -219,9 +219,10 @@ def _urlopen(req, timeout: float = 8.0):
 
 
 class PoolError(Exception):
-    def __init__(self, status: int, code: str, *, duration_ms: int | None = None):
+    def __init__(self, status: int, code: str, *, duration_ms: int | None = None,
+                 retry_after: float | None = None):
         super().__init__(code)
-        self.status, self.code = status, code
+        self.status, self.code, self.retry_after = status, code, retry_after
         self.duration_ms = duration_ms
 
 

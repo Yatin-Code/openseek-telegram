@@ -120,9 +120,9 @@ def vercel_env(**overrides):
     env = {
         "OPENSEEK_POOL_MODE": "channel",
         "OPENSEEK_TELEGRAM_CHANNEL_ID": "-100123",
-        "OPENSEEK_TELEGRAM_BOT_TOKEN": "123456:test",
         "OPENSEEK_TELEGRAM_API_ID": "123",
         "OPENSEEK_TELEGRAM_API_HASH": "a" * 32,
+        "OPENSEEK_TELEGRAM_SESSION": "1abc",
         "OPENSEEK_SUPABASE_URL": "https://project.supabase.co",
         "OPENSEEK_SUPABASE_SERVICE_KEY": "service-role-key",
     }

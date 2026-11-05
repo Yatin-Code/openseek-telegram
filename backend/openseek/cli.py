@@ -34,7 +34,10 @@ def main(argv: list[str] | None = None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("serve", help="run the daemon (HTTPS API + loopback admin)")
     sub.add_parser("doctor", help="show pool configuration and live channel permissions")
-    sub.add_parser("setup", help="write a protected pool configuration file")
+    setup = sub.add_parser("setup", help="set up a local pool or join the shared pool on your own Vercel node")
+    setup.add_argument("--state", type=Path, help="resume participant setup from this local state file")
+    setup.add_argument("--new-pairing", action="store_true",
+                       help="create a replacement one-time Nuvio pairing invite for the participant's node")
     sub.add_parser("pair", help="open a 10-minute pairing window and print the code")
     sub.add_parser("devices", help="list paired devices")
     sub.add_parser("dashboard", help="open the local admin dashboard (the secret travels in the URL fragment, never over the network)")
@@ -66,7 +69,7 @@ def main(argv: list[str] | None = None) -> int:
     a = ap.parse_args(argv)
     if a.cmd == "setup":
         from .setup import run_setup
-        return run_setup()
+        return run_setup(state_path=a.state, new_pairing=a.new_pairing)
     try:
         env = dict(os.environ)
         if a.cmd == "pool" and a.pool_action == "login":
@@ -186,7 +189,6 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if a.cmd == "openapi":
         import tempfile
-        from pathlib import Path
 
         from .app import Core, api_openapi
         with tempfile.TemporaryDirectory() as d:

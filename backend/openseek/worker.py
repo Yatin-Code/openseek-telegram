@@ -21,6 +21,7 @@ import base64
 import json
 import os
 import queue
+import site
 import subprocess
 import sys
 import threading
@@ -29,9 +30,22 @@ from dataclasses import dataclass
 from pathlib import Path
 
 PACKAGE_PARENT = str(Path(__file__).resolve().parent.parent)
-# -I: isolated mode (ignores PYTHON* env vars, user site and the CWD); the package dir is
-# passed explicitly instead.
-_BOOT = "import sys; sys.path.insert(0, sys.argv[1]); from openseek.worker import main; main()"
+# -I keeps the worker independent of CWD, PYTHONPATH, and other Python env overrides. When
+# OpenSeek was installed with `pip install --user`, its trusted runtime dependencies live in
+# the user site, which -I intentionally omits. Pass that directory explicitly only when the
+# parent interpreter already has it enabled; virtualenv and system installs need no extra path.
+_BOOT = ("import sys; sys.path.insert(0, sys.argv[1]); "
+         "sys.path.insert(0, sys.argv[2]) if sys.argv[2] else None; "
+         "from openseek.worker import main; main()")
+
+
+def _enabled_user_site() -> str:
+    paths = site.getusersitepackages()
+    if isinstance(paths, str):
+        paths = [paths]
+    active = {os.path.normcase(os.path.realpath(path)) for path in sys.path if path}
+    return next((path for path in paths if path and os.path.isdir(path) and
+                 os.path.normcase(os.path.realpath(path)) in active), "")
 
 
 # ===================================================================== child
@@ -143,7 +157,7 @@ def worker_argv() -> list[str]:
     argument (see run_server.py); otherwise an isolated interpreter running the bootstrap."""
     if getattr(sys, "frozen", False):
         return [sys.executable, "--openseek-worker"]
-    return [sys.executable, "-I", "-c", _BOOT, PACKAGE_PARENT]
+    return [sys.executable, "-I", "-c", _BOOT, PACKAGE_PARENT, _enabled_user_site()]
 
 
 def _child_env() -> dict[str, str]:

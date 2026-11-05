@@ -10,11 +10,13 @@ import asyncio
 import hmac
 import logging
 import os
+import secrets
 import threading
 from dataclasses import replace
 from pathlib import Path
 
 from fastapi.responses import JSONResponse
+from fastapi import FastAPI
 
 from .app import Core, Guard, create_api_app
 from .config import ConfigError, Settings
@@ -36,6 +38,17 @@ def build_app(settings: Settings | None = None, *, core: Core | None = None):
     if settings.profile != "vercel":
         raise ConfigError("the Vercel entrypoint requires OPENSEEK_PROFILE=vercel")
     settings.validate()
+    if settings.setup_pending:
+        # The local participant wizard deploys this minimal app before Telegram
+        # authorization. It proves the participant's own deployment is reachable
+        # without opening any pool endpoints or starting a partially configured core.
+        pending = FastAPI(title="OpenSeek setup", docs_url=None, redoc_url=None, openapi_url=None)
+
+        @pending.get("/v1/health")
+        async def setup_health():
+            return {"service": "openseek", "api": "v1", "setup_pending": True}
+
+        return pending
     core = core or Core(settings)
     runtime_core = core
     if core.channel_index is None or core.channel_store is None:
@@ -78,26 +91,54 @@ def build_app(settings: Settings | None = None, *, core: Core | None = None):
     @api.middleware("http")
     async def serverless_channel_refresh(request, call_next):
         path = request.url.path
-        if path.startswith("/v1/pool/") or path == "/v1/internal/tick":
-            scheme, _, token = request.headers.get("authorization", "").partition(" ")
-            token = token if scheme.lower() == "bearer" else ""
-            if path == "/v1/internal/tick":
-                tick_secrets = (core.settings.cron_secret, core.admin_token)
-                authorized = any(token and value and hmac.compare_digest(token, value)
-                                 for value in tick_secrets)
-            else:
-                authorized = bool(
-                    core.pool and
-                    (core.pool.authorize(token, write=False) or core.pool.authorize(token, write=True))
-                ) or bool(getattr(request.state, "device_id", None))
-            if not authorized:
-                return await call_next(request)
-            # The scheduled tick advances initial backfill one bounded page at a time.
-            # Normal pool requests refresh only when the shared index is stale.
+        if not (path.startswith("/v1/pool/") or path == "/v1/internal/tick"):
+            return await call_next(request)
+        scheme, _, token = request.headers.get("authorization", "").partition(" ")
+        token = token if scheme.lower() == "bearer" else ""
+        if path == "/v1/internal/tick":
+            tick_secrets = (core.settings.cron_secret, core.admin_token)
+            authorized = any(token and value and hmac.compare_digest(token, value)
+                             for value in tick_secrets)
+        else:
+            authorized = bool(
+                core.pool and
+                (core.pool.authorize(token, write=False) or core.pool.authorize(token, write=True))
+            ) or bool(getattr(request.state, "device_id", None))
+        if not authorized:
+            return await call_next(request)
+
+        lease = core.telegram_session_lease
+        owner = secrets.token_urlsafe(24)
+        if lease is not None:
+            try:
+                acquired = await asyncio.to_thread(lease.acquire, owner)
+            except Exception as exc:
+                log.warning("Vercel Telegram session lock failed (%s)", type(exc).__name__)
+                return JSONResponse({"error": "telegram_session_lock_unavailable"}, status_code=503,
+                                    headers={"Cache-Control": "no-store", "Retry-After": "5"})
+            if not acquired:
+                return JSONResponse({"error": "telegram_session_busy"}, status_code=503,
+                                    headers={"Cache-Control": "no-store", "Retry-After": "5"})
+        try:
+            # The Supabase lease serializes all invocations sharing this node's
+            # Telegram StringSession. Disconnect before releasing it so another
+            # serverless instance cannot overlap the primary authorization.
             unavailable = await ensure_channel(force_refresh=path == "/v1/internal/tick")
             if unavailable is not None:
                 return unavailable
-        return await call_next(request)
+            return await call_next(request)
+        finally:
+            if lease is not None:
+                close = getattr(core.channel_store, "close", None)
+                if close is not None:
+                    try:
+                        await asyncio.to_thread(close)
+                    except Exception as exc:
+                        log.warning("Vercel Telegram disconnect failed (%s)", type(exc).__name__)
+                try:
+                    await asyncio.to_thread(lease.release, owner)
+                except Exception as exc:
+                    log.warning("Vercel Telegram session unlock failed (%s)", type(exc).__name__)
 
     # Keep the exported object a FastAPI instance for Vercel's framework detector.
     # Guard is installed outermost, so unauthenticated requests cannot trigger a

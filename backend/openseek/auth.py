@@ -26,7 +26,8 @@ class DeviceAuth:
         self._lock = threading.Lock()
         self._hashes: list[tuple[str, str]] = []
         self._roles: dict[str, tuple[str, float | None]] = {}
-        self.reload()
+        if not getattr(self.db, "is_remote", False):
+            self.reload()
 
     def reload(self) -> None:
         with self._lock:
@@ -62,6 +63,11 @@ class DeviceAuth:
         token = authorization[7:].strip()
         if not _TOKEN.fullmatch(token):
             return None
+        # Vercel instances are disposable and can be long-lived after another
+        # function instance creates or revokes a device. Refresh before checking
+        # a syntactically valid device token so all instances see shared state.
+        if getattr(self.db, "is_remote", False):
+            self.reload()
         h = hashlib.sha256(token.encode()).hexdigest()
         found = None
         with self._lock:

@@ -26,5 +26,8 @@ entrypoint = "openseek.vercel:app"
 [tool.setuptools]
 packages = ["openseek"]
 
+[tool.setuptools.package-data]
+openseek = ["supabase/*.sql", "supabase/migrations/*.sql"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

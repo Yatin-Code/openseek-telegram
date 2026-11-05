@@ -8,7 +8,8 @@ import httpx
 import pytest
 
 from openseek.cache import PROFILE
-from openseek.remote import RemoteChannelStore, RemoteStoreError, SupabaseClient
+from openseek.remote import (RemoteChannelStore, RemotePairingStore, RemoteStoreError,
+                             RemoteTelegramSessionLease, SupabaseClient)
 
 KEY = "service-role-key-that-must-not-leak"
 
@@ -105,6 +106,29 @@ def test_selects_use_rest_filters_and_ordering():
     assert state_get["params"]["channel_id"] == "eq.chan"
 
 
+def test_candidate_hints_join_source_profile_to_canonical_channel_tiles():
+    fp = "a" * 64
+    source_hint = {
+        **hints(fp), "profile": "nvmt-v1-g10", "grid": 10_000,
+        "verified": 0,
+    }
+    channel_package = {
+        "fp": fp, "profile": PROFILE, "duration_ms": 20_000, "channel_tiles": 2,
+    }
+    store, fake, _client = make_store({
+        "/rest/v1/pool_hints": [source_hint],
+        "/rest/v1/pool_packages": [channel_package],
+    })
+
+    rows = store.hint_rows_for_candidates(20_000, 3_000, None)
+
+    assert len(rows) == 1
+    assert rows[0][0:2] == (fp, "nvmt-v1-g10")
+    assert rows[0][11] == 2
+    package_request = next(r for r in fake.requests if r["path"] == "/rest/v1/pool_packages")
+    assert package_request["params"]["select"] == "fp,profile,duration_ms,channel_tiles"
+
+
 def test_candidates_join_hints_with_channel_package_counts():
     fp = "a" * 64
     row = {"fp": fp, "profile": PROFILE, "imdb": "tt1234567", "season": 0, "episode": 0,
@@ -112,7 +136,8 @@ def test_candidates_join_hints_with_channel_package_counts():
            "n_tiles": 2, "grid": 5_000, "created": 10.0, "verified": 0}
     store, fake, _client = make_store({
         "/rest/v1/pool_hints": [row],
-        "/rest/v1/pool_packages": [{"fp": fp, "profile": PROFILE, "channel_tiles": 2}],
+        "/rest/v1/pool_packages": [{"fp": fp, "profile": PROFILE,
+                                     "duration_ms": 20_000, "channel_tiles": 2}],
     })
     rows = store.hint_rows_for_candidates(23_000, 90_000, None)
     assert rows == [(fp, PROFILE, "tt1234567", 0, 0, 20_000, 1_000_000,
@@ -169,3 +194,69 @@ def test_transport_failure_is_wrapped():
         store.state("chan")
     assert excinfo.value.status == 0
     assert KEY not in str(excinfo.value)
+
+
+def test_telegram_session_lease_uses_atomic_supabase_rpcs():
+    fake = FakePostgREST({
+        "/rest/v1/rpc/try_acquire_pool_telegram_session": True,
+        "/rest/v1/rpc/release_pool_telegram_session": True,
+    })
+    client = SupabaseClient("https://project.supabase.co", KEY,
+                            transport=httpx.MockTransport(fake))
+    lease = RemoteTelegramSessionLease(client, lease_seconds=80)
+    owner = "owner-token-that-is-long-enough"
+
+    assert lease.acquire(owner) is True
+    assert lease.release(owner) is True
+    acquire, release = fake.requests
+    assert acquire["path"] == "/rest/v1/rpc/try_acquire_pool_telegram_session"
+    assert acquire["json"] == {"p_owner": owner, "p_lease_seconds": 80}
+    assert release["path"] == "/rest/v1/rpc/release_pool_telegram_session"
+    assert release["json"] == {"p_owner": owner}
+
+
+def test_remote_pairing_store_persists_devices_and_invites_in_owner_supabase():
+    device_id = "a1b2c3d4e5f60718"
+    pair_id = "1a2b3c4d5e6f708192a3b4c5d6e7f809"
+    device_row = {"device_id": device_id, "name": "Nuvio TV", "token_hash": "f" * 64,
+                  "role": "guest", "expires": None, "created": 1.0, "last_seen": 1.0,
+                  "contribute": True}
+    invite_row = {"pair_id": pair_id, "label": "Nuvio", "role": "guest", "salt": "a" * 32,
+                  "iterations": 240000, "k_hex": "b" * 64, "created": 1.0, "expires": 100.0,
+                  "max_uses": 1, "uses": 0, "attempts": 0, "revoked": None,
+                  "device_days": None, "contribute": True}
+    fake = FakePostgREST({
+        "/rest/v1/pool_devices": [device_row],
+        "/rest/v1/pool_invites": [invite_row],
+        "/rest/v1/rpc/use_pool_invite": True,
+        "/rest/v1/rpc/revoke_pool_invite": True,
+    })
+    client = SupabaseClient("https://project.supabase.co", KEY,
+                            transport=httpx.MockTransport(fake))
+    store = RemotePairingStore(client)
+
+    assert store.auth_rows() == [("f" * 64, device_id, "guest", None)]
+    store.add_device(device_id, "Nuvio TV", "f" * 64, "guest", None, pair_id)
+    assert store.devices()[0]["device_id"] == device_id
+    assert store.can_contribute(device_id)
+    assert store.set_contribute(device_id, False)
+    assert store.invite(pair_id) == invite_row
+    assert store.invite_by_tag("ABCD", 2.0) == pair_id
+    assert store.tag_in_use("ABCD", 2.0)
+    store.add_invite(pair_id, "Nuvio", "guest", "a" * 32, 240000, "b" * 64,
+                     1.0, 100.0, 1, None, "ABCD", True)
+    assert store.use_invite(pair_id, 2.0, 5)
+    assert store.revoke_invite(pair_id, 2.0)
+    assert store.remove_device(device_id)
+
+    assert all(request["path"].startswith(("/rest/v1/pool_", "/rest/v1/rpc/"))
+               for request in fake.requests)
+    assert any(request["path"] == "/rest/v1/rpc/use_pool_invite" for request in fake.requests)
+    assert all(KEY not in json.dumps(request["json"]) for request in fake.requests if request["json"])
+
+
+def test_telegram_session_lease_reports_contention():
+    fake = FakePostgREST({"/rest/v1/rpc/try_acquire_pool_telegram_session": False})
+    client = SupabaseClient("https://project.supabase.co", KEY,
+                            transport=httpx.MockTransport(fake))
+    assert RemoteTelegramSessionLease(client).acquire("owner-token-that-is-long-enough") is False

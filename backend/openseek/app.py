@@ -33,7 +33,7 @@ from .pairing import InviteManager
 from .altpipeline import AltMeta
 from .altsource import Candidate
 from .auth import CapSigner, DeviceAuth, admin_token, load_or_create_secret
-from .cache import Cache, secure_mkdir
+from .cache import Cache, PROFILE, secure_mkdir
 from .config import Settings
 from .db import DB
 from .fetch import RangeProxy
@@ -44,10 +44,11 @@ from .netpolicy import DestinationPolicy, filter_forwarded_headers
 from .pairing import PairingClosed, PairingFailed, PairingManager, RateLimited
 from .public import PublicLimiter, classify
 from .pool import (MAX_NVMT_BYTES, ChannelPoolClient, ChannelPoolSync, PoolClient,
-                   PoolError, PoolService, PoolSync, TelegramBotStore)
+                   PoolError, PoolService, PoolSync, TelegramBotStore, decode_nvmt)
 from .channel_index import ChannelIndex
 from .channel_pool import ChannelPoolService, PoolWritePolicy
-from .remote import RemoteChannelStore, RemoteUploadQueueStore, SupabaseClient
+from .remote import (RemoteChannelStore, RemotePairingStore, RemoteTelegramSessionLease,
+                     RemoteStoreError, RemoteUploadQueueStore, SupabaseClient)
 from .store import ChannelStore, UploadQueueStore
 from .uploads import UploadError, UploadService
 from .telegram_mt import TelegramMTProtoStore
@@ -60,8 +61,9 @@ log = logging.getLogger("openseek.app")
 
 MAX_BODY = 16 * 1024
 MAX_MS = 12 * 3600 * 1000
+MAX_VERCEL_RESPONSE = 4_500_000
 PUBLIC_PATHS = {"/v1/health", "/v1/pair/start", "/v1/pair/claim",
-                "/v1/internal/tick"}       # tick authenticates its own Bearer secret in the route
+                "/v1/setup/pairing", "/v1/internal/tick"}  # setup/tick authenticate their own Bearer secrets
 # Headers a reverse proxy, tunnel or load balancer adds. The owner and admin APIs are direct-connection only: a request that carries any of them
 # was relayed by something else, so its TCP peer address says nothing about who sent it. Refused (remote access is what the guest listener is for).
 PROXY_HEADERS = ("x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "x-forwarded-port", "forwarded", "x-real-ip",
@@ -92,6 +94,8 @@ class Core:
         self.librarian = None
         self.supabase = None
         self.uploads = None
+        self.telegram_session_lease = None
+        self.pairing_store = self.db
         mode = settings.effective_pool_mode
         self.pool_write_policy = PoolWritePolicy(mode)
         if settings.pool_host_enabled:
@@ -110,6 +114,8 @@ class Core:
                     settings.supabase_url, settings.supabase_service_key,
                     bucket=settings.supabase_bucket)
             if settings.profile == "vercel":
+                self.telegram_session_lease = RemoteTelegramSessionLease(self.supabase)
+                self.pairing_store = RemotePairingStore(self.supabase)
                 index_store = RemoteChannelStore(self.supabase)
                 index_db = None
             else:
@@ -140,9 +146,10 @@ class Core:
             self.data_dir, settings.tls_cert_file, settings.tls_key_file)
         self.caps = CapSigner(load_or_create_secret(self.data_dir / "secret.key"))
         self.admin_token = admin_token(self.data_dir, settings.admin_token)
-        self.auth = DeviceAuth(self.db)
-        self.invites = InviteManager(self.db, self.spki_pin, self.auth.register)
-        self.pairing = PairingManager(self.spki_pin, self.auth.register, invites=self.invites)
+        pairing_pin = "" if settings.profile == "vercel" else self.spki_pin
+        self.auth = DeviceAuth(self.pairing_store)
+        self.invites = InviteManager(self.pairing_store, pairing_pin, self.auth.register)
+        self.pairing = PairingManager(pairing_pin, self.auth.register, invites=self.invites)
         self.pairing.sharing_enabled = self.sharing_enabled
         self.public_limiter = PublicLimiter()
         self.contrib_spacing = Spacing(6)
@@ -159,6 +166,8 @@ class Core:
         self.ffmpeg = _engine_available()
 
     def contributions_enabled(self) -> bool:
+        if self.settings.profile == "vercel":
+            return self.settings.contribution
         return self.sharing_enabled() and self.db.get_setting("contrib_enabled") == "1"
 
     def contrib_hosts(self) -> list[str]:
@@ -172,10 +181,12 @@ class Core:
 
     def can_contribute(self, device_id: str | None) -> bool:
         return bool(device_id and self.contributions_enabled() and self.auth.role_of(device_id) == "guest"
-                    and self.db.can_contribute(device_id))
+                    and self.pairing_store.can_contribute(device_id))
 
     def sharing_enabled(self) -> bool:
         """The owner's kill switch for everything a guest can do. Off unless the owner turned it on."""
+        if self.settings.profile == "vercel":
+            return True
         return self.db.get_setting("sharing_enabled") == "1"
 
     def start(self) -> "Core":
@@ -432,6 +443,13 @@ def _install_error_handlers(app: FastAPI) -> None:
     async def _val(request, exc):  # noqa: ANN001 - never echo the input
         return err(400, "bad_request")
 
+    @app.exception_handler(RemoteStoreError)
+    async def _remote_store(request, exc: RemoteStoreError):
+        # Supabase errors contain provider-specific text and may include project
+        # details. Keep the public code stable and let clients fall back/retry.
+        log.warning("remote pool store unavailable (status=%d)", exc.status)
+        return err(503, "pool_backend_unavailable", {"Retry-After": "5"})
+
     @app.exception_handler(Exception)
     async def _any(request, exc):  # noqa: ANN001
         log.error("unhandled %s", type(exc).__name__)
@@ -619,6 +637,11 @@ class SharingIn(BaseModel):
     enabled: StrictBool
 
 
+class SetupPairingIn(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    label: StrictStr = Field(default="Nuvio TV", max_length=64)
+
+
 # ===================================================================== API app
 def create_api_app(core: Core, public: bool = False) -> FastAPI:
     app = FastAPI(title="OpenSeek", version=__version__, docs_url=None, redoc_url=None, openapi_url=None,
@@ -753,11 +776,29 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
         except PairingFailed:
             return err(403, "pairing_failed")
 
+    @app.post("/v1/setup/pairing")
+    async def setup_pairing(request: Request, body: SetupPairingIn | None = None):
+        # The CLI wizard installs this short-lived key only while it creates the
+        # owner's first Nuvio invite, then removes it and redeploys. It is never
+        # the device bearer token and is not embedded in Nuvio.
+        expected = os.environ.get("OPENSEEK_SETUP_KEY", "")
+        scheme, _, supplied = request.headers.get("authorization", "").partition(" ")
+        if (core.settings.profile != "vercel" or not expected or scheme.lower() != "bearer" or
+                not hmac.compare_digest(supplied, expected)):
+            return err(404, "not_found")
+        label = body.label if body is not None else "Nuvio TV"
+        try:
+            invite = await asyncio.to_thread(core.invites.create, label, 86400, "guest", None, True)
+        except Exception as exc:
+            log.warning("Vercel pairing invite creation failed (%s)", type(exc).__name__)
+            return err(503, "pairing_setup_unavailable", {"Retry-After": "5"})
+        return JSONResponse(invite, headers={"Cache-Control": "no-store"})
+
     @app.get("/v1/pair/status")
     async def pair_status(request: Request):
         d = device(request)
-        name = next((x["name"] for x in core.db.devices() if x["device_id"] == d), None)
-        core.db.touch_device(d)
+        name = next((x["name"] for x in core.pairing_store.devices() if x["device_id"] == d), None)
+        core.pairing_store.touch_device(d)
         return {"device_id": d, "device_name": name, "contribute": core.can_contribute(d)}
 
     @app.delete("/v1/pair", status_code=204)
@@ -1180,6 +1221,63 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
             return err(exc.status, exc.code)
         return JSONResponse({"candidates": candidates}, headers={"Cache-Control": "no-store"})
 
+    @app.get("/v1/pool/{fp}/nvmt/manifest")
+    async def pool_nvmt_manifest(request: Request, fp: str):
+        """Return bounded exact-package metadata before a client fetches NVMT chunks."""
+        pool = core.pool
+        if pool is None:
+            return err(404, "not_found")
+        if not pool_allowed(request, pool):
+            return err(403, "forbidden")
+        profile = request.query_params.get("profile", "")
+        if profile not in ("nvmt-v1-g5", "nvmt-v1-g10"):
+            return err(400, "bad_profile")
+        try:
+            requested_duration = request.query_params.get("duration_ms")
+            duration_ms = int(requested_duration) if requested_duration is not None else 0
+            if duration_ms and not 1 <= duration_ms <= MAX_MS:
+                return err(400, "bad_duration")
+            manifest = await asyncio.to_thread(pool.manifest, fp, PROFILE)
+            tile_slots = []
+            stored_duration = 0
+            if manifest is not None:
+                stored_duration = int(manifest.get("duration_ms") or 0)
+                tile_slots = sorted({int(tile["k"]) for tile in manifest.get("tiles", [])
+                                     if isinstance(tile, dict) and str(tile.get("k", "")).isdigit()})
+            if stored_duration and duration_ms and stored_duration != duration_ms:
+                return err(404, "not_found")
+            duration_ms = stored_duration or duration_ms
+            if not tile_slots and hasattr(pool, "package"):
+                try:
+                    package = await asyncio.to_thread(pool.package, fp, profile)
+                except PoolError as exc:
+                    return err(exc.status, exc.code)
+                if package is not None:
+                    package_bytes, package_meta = package
+                    duration_ms = int(package_meta["duration_ms"])
+                    _grid, _slots, decoded_tiles = decode_nvmt(fp, profile, duration_ms, package_bytes)
+                    tile_slots = sorted(decoded_tiles)
+            if not duration_ms:
+                return err(404, "not_found")
+            max_tiles = (duration_ms + 9_999) // 10_000
+            if not tile_slots or any(slot < 0 or slot >= max_tiles for slot in tile_slots):
+                return err(404, "not_found")
+            episode_key = request.query_params.get("episode_key")
+            if episode_key:
+                try:
+                    await asyncio.to_thread(pool.index_episode_package, fp, profile, episode_key)
+                except PoolError as exc:
+                    return err(exc.status, exc.code)
+        except ValueError:
+            return err(400, "bad_request")
+        except PoolError as exc:
+            return err(exc.status, exc.code)
+        grid = 5_000 if profile == "nvmt-v1-g5" else 10_000
+        return JSONResponse({"fp": fp, "profile": profile, "duration_ms": duration_ms,
+                             "n_slots": (duration_ms + grid - 1) // grid,
+                             "n_tiles": len(tile_slots), "tile_slots": tile_slots},
+                            headers={"Cache-Control": "no-store"})
+
     @app.get("/v1/pool/{fp}/nvmt")
     async def pool_nvmt(request: Request, fp: str):
         pool = core.pool
@@ -1206,6 +1304,8 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
         if got is None:
             return err(404, "not_found")
         data, meta = got
+        if core.settings.profile == "vercel" and len(data) > MAX_VERCEL_RESPONSE:
+            return err(413, "package_chunk_too_large")
         episode_key = request.query_params.get("episode_key")
         if episode_key:
             try:
@@ -1260,17 +1360,17 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
 
     # ---------------------------------------------------------------- Vercel staged uploads
     @app.post("/v1/pool/uploads", status_code=201)
-    async def pool_upload_create(request: Request, body: UploadIn):
+    async def pool_upload_create(request: Request):
         pool = core.pool
         if pool is None:
-            # A plain local node has no pool surface either; staging is the contract answer.
-            return err(400, "staging_unavailable") if core.uploads is None else err(404, "not_found")
+            return err(404, "not_found")
         denied = pool_write_denial(request, pool)
         if denied is not None:
             return denied
         if core.uploads is None:
             return err(400, "staging_unavailable")      # local/VPS: direct PUT is the only path
         try:
+            body = UploadIn.model_validate(await request.json())
             result = await asyncio.to_thread(
                 core.uploads.create, device_id=request.state.device_id, fp=body.fp,
                 profile=body.profile, duration_ms=body.duration_ms,
@@ -1278,6 +1378,8 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
                 episode=body.episode, filename=body.filename)
         except UploadError as exc:
             return err(exc.status, exc.code)
+        except (ValueError, ValidationError):
+            return err(400, "bad_request")
         return JSONResponse(result, status_code=201, headers={"Cache-Control": "no-store"})
 
     @app.post("/v1/pool/uploads/{upload_id}/finalize", status_code=202)
@@ -1294,6 +1396,8 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
             result = await asyncio.to_thread(core.uploads.finalize, upload_id)
         except UploadError as exc:
             return err(exc.status, exc.code)
+        # Nuvio follows finalize with a status request; that request is the
+        # request-driven publication trigger on serverless deployments.
         return JSONResponse(result, status_code=202, headers={"Cache-Control": "no-store"})
 
     @app.get("/v1/pool/uploads/{upload_id}")
@@ -1305,6 +1409,15 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
             return err(404, "unknown_upload")
         write_key = pool.authorize(pool_key(request), write=True)
         try:
+            # Check owner/device access before allowing the status poll to
+            # trigger any node-wide queue work.
+            result = await asyncio.to_thread(
+                core.uploads.status, upload_id, device_id=request.state.device_id,
+                write_key=write_key)
+            if result["state"] in ("pending", "retrying", "paused"):
+                # A client poll is the request-driven retry trigger after a
+                # Telegram flood wait or a free-tier quota pause.
+                await asyncio.to_thread(core.uploads.drain, 1)
             result = await asyncio.to_thread(
                 core.uploads.status, upload_id, device_id=request.state.device_id,
                 write_key=write_key)

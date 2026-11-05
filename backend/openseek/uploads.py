@@ -38,6 +38,7 @@ log = logging.getLogger("openseek.uploads")
 UPLOAD_TTL_S = 900
 MAX_ATTEMPTS = 5
 MAX_BACKOFF_S = 300
+QUOTA_RETRY_S = 3600
 MAX_DRAIN_BATCH = 3
 _UPLOAD_ID_MIN = 8
 _UPLOAD_ID_MAX = 64
@@ -93,14 +94,18 @@ class UploadService:
         upload_id = "u_" + secrets.token_urlsafe(18)
         object_path = f"uploads/{upload_id}.nvmt"
         put_url = self._signed_target(object_path)
-        self.store.create_upload({
-            "upload_id": upload_id, "device_id": device_id or "", "fp": fp,
-            "profile": profile, "duration_ms": duration_ms,
-            "size_bytes": hints["size_bytes"], "imdb": hints["imdb"],
-            "season": hints["season"], "episode": hints["episode"],
-            "filename_norm": hints["filename_norm"], "object_path": object_path,
-            "state": "pending", "created": now, "updated": now,
-            "expires": now + self.ttl_s, "error": None})
+        try:
+            self.store.create_upload({
+                "upload_id": upload_id, "device_id": device_id or "", "fp": fp,
+                "profile": profile, "duration_ms": duration_ms,
+                "size_bytes": hints["size_bytes"], "imdb": hints["imdb"],
+                "season": hints["season"], "episode": hints["episode"],
+                "filename_norm": hints["filename_norm"], "object_path": object_path,
+                "state": "pending", "created": now, "updated": now,
+                "expires": now + self.ttl_s, "error": None})
+        except Exception as exc:
+            log.warning("staged upload row create failed (%s)", type(exc).__name__)
+            raise UploadError(503, "queue_unavailable") from None
         return {"upload_id": upload_id, "put_url": put_url,
                 "expires_at": now + self.ttl_s, "max_bytes": MAX_NVMT_BYTES}
 
@@ -133,7 +138,11 @@ class UploadService:
     def finalize(self, upload_id: str) -> dict:
         if not _valid_upload_id(upload_id):
             raise UploadError(404, "unknown_upload")
-        row = self.store.get_upload(upload_id)
+        try:
+            row = self.store.get_upload(upload_id)
+        except Exception as exc:
+            log.warning("staged upload lookup failed (%s)", type(exc).__name__)
+            raise UploadError(503, "queue_unavailable") from None
         if row is None:
             raise UploadError(404, "unknown_upload")
         now = self.clock()
@@ -141,13 +150,26 @@ class UploadService:
             self._cleanup_staged(row)
             raise UploadError(410, "expired")
         if row["state"] == "pending" and float(row["expires"]) <= now:
-            self._expire_row(row, now)
+            try:
+                self._expire_row(row, now)
+            except Exception as exc:
+                log.warning("staged upload expiry failed (%s)", type(exc).__name__)
+                raise UploadError(503, "queue_unavailable") from None
             raise UploadError(410, "expired")
         if row["state"] != "pending":
             raise UploadError(409, "wrong_state")
-        if not self.store.enqueue(upload_id, now):
+        try:
+            enqueued = self.store.enqueue(upload_id, now)
+        except Exception as exc:
+            log.warning("staged upload enqueue failed (%s)", type(exc).__name__)
+            raise UploadError(503, "queue_unavailable") from None
+        if not enqueued:
             # Another finalize (or a worker) won the transition.
-            current = self.store.get_upload(upload_id)
+            try:
+                current = self.store.get_upload(upload_id)
+            except Exception as exc:
+                log.warning("staged upload race lookup failed (%s)", type(exc).__name__)
+                raise UploadError(503, "queue_unavailable") from None
             if current is not None and (current["state"] == "expired" or
                                          (current["state"] == "pending" and
                                           float(current["expires"]) <= now)):
@@ -157,13 +179,17 @@ class UploadService:
                     self._cleanup_staged(current)
                 raise UploadError(410, "expired")
             raise UploadError(409, "wrong_state")
-        return {"upload_id": upload_id, "state": "queued"}
+        return {"upload_id": upload_id, "state": "pending"}
 
     def status(self, upload_id: str, *, device_id: str | None = None,
                write_key: bool = False) -> dict:
         if not _valid_upload_id(upload_id):
             raise UploadError(404, "unknown_upload")
-        row = self.store.get_upload(upload_id)
+        try:
+            row = self.store.get_upload(upload_id)
+        except Exception as exc:
+            log.warning("staged upload status lookup failed (%s)", type(exc).__name__)
+            raise UploadError(503, "upload_status_unavailable") from None
         if row is None:
             raise UploadError(404, "unknown_upload")
         if not write_key and (not device_id or row["device_id"] != device_id):
@@ -171,13 +197,23 @@ class UploadService:
             raise UploadError(403, "forbidden")
         now = self.clock()
         if row["state"] == "pending" and float(row["expires"]) <= now:
-            self._expire_row(row, now)
+            try:
+                self._expire_row(row, now)
+            except Exception as exc:
+                log.warning("staged upload expiry failed (%s)", type(exc).__name__)
+                raise UploadError(503, "upload_status_unavailable") from None
             row = self.store.get_upload(upload_id) or row
             if row["state"] == "pending":                  # cleanup failed; retried by tick
                 row = {**row, "state": "expired", "error": "expired"}
         elif row["state"] == "expired":
             self._cleanup_staged(row)
-        return {"upload_id": upload_id, "state": row["state"], "error": row.get("error")}
+        state = row["state"]
+        error = row.get("error")
+        if state in ("queued", "publishing"):
+            state = "paused" if error == "quota_paused" else "retrying" if error else "pending"
+        elif state in ("expired", "failed"):
+            state = "failed"
+        return {"upload_id": upload_id, "state": state, "error": error}
 
     # ---------------------------------------------------------------- expiry
     def expire(self) -> int:
@@ -215,7 +251,11 @@ class UploadService:
             if getattr(exc, "status", None) != 404:        # already gone is success
                 log.warning("staged object cleanup failed (%s)", type(exc).__name__)
                 return False
-        return self.store.mark_staging_deleted(row["upload_id"], row["state"], self.clock())
+        try:
+            return self.store.mark_staging_deleted(row["upload_id"], row["state"], self.clock())
+        except Exception as exc:
+            log.warning("staged object cleanup state update failed (%s)", type(exc).__name__)
+            return False
 
     # ---------------------------------------------------------------- cron drain
     def drain(self, limit: int = 1) -> dict:
@@ -272,20 +312,24 @@ class PublicationWorker:
                 episode=int(item.get("episode", 0)), size_bytes=item.get("size_bytes"),
                 filename=item.get("filename_norm"))
         except PoolError as exc:
-            self._failure(item, _code(exc.code, "publication_failed"), now)
+            self._failure(item, _code(exc.code, "publication_failed"), now,
+                          retry_after=exc.retry_after)
             return False
         except Exception as exc:                       # RemoteStoreError or transport
             status = getattr(exc, "status", None)
+            retry_after = getattr(exc, "retry_after", None)
             if status == 404:
                 code = "staged_object_missing"
             elif status == 413:
                 code = "staged_object_too_large"
+            elif status in (402, 429):
+                code = "quota_paused"
             elif isinstance(exc, KeyError):
                 code = "staged_object_missing"
             else:
                 code = "staging_unavailable" if status is not None else "publication_failed"
             log.warning("upload publication failed (%s)", type(exc).__name__)
-            self._failure(item, code, now)
+            self._failure(item, code, now, retry_after=retry_after)
             return False
 
         # Record Telegram acceptance before deleting the temporary bytes. The cleanup
@@ -294,15 +338,27 @@ class PublicationWorker:
         self.service._cleanup_staged({**item, "state": "accepted"})
         return True
 
-    def _failure(self, item: dict, code: str, now: float) -> None:
+    def _failure(self, item: dict, code: str, now: float,
+                 retry_after: float | None = None) -> None:
         attempts = int(item.get("attempts", 0)) + 1
-        terminal = attempts >= self.service.max_attempts or code == "staged_object_too_large"
-        next_attempt = now + min(MAX_BACKOFF_S, 2 ** attempts)
+        resumable = code in ("quota_paused", "telegram_flood_wait", "telegram_slow_mode")
+        terminal = (attempts >= self.service.max_attempts and not resumable) or code == "staged_object_too_large"
+        if retry_after is not None:
+            delay = retry_after
+        elif code == "quota_paused":
+            delay = QUOTA_RETRY_S
+        else:
+            delay = min(MAX_BACKOFF_S, 2 ** attempts)
+        next_attempt = now + max(1.0, min(float(delay), 7 * 86400.0))
         self.service.store.retry(
             item["upload_id"], attempts=attempts, next_attempt=next_attempt,
             error=code, terminal=terminal, now=now)
-        if code == "staged_object_too_large":
-            failed = self.service.store.get_upload(item["upload_id"])
+        if terminal:
+            try:
+                failed = self.service.store.get_upload(item["upload_id"])
+            except Exception as exc:
+                log.warning("terminal staged upload lookup failed (%s)", type(exc).__name__)
+                return
             if failed is not None:
                 self.service._cleanup_staged(failed)
 

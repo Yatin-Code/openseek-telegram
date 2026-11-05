@@ -6,9 +6,13 @@ No new SDK or database driver is used: plain `httpx` over the REST endpoints.
 """
 from __future__ import annotations
 
+from email.utils import parsedate_to_datetime
+import time
 from urllib.parse import quote
 
 import httpx
+
+from .cache import PROFILE
 
 _TILE_COLUMNS = "fp,profile,k,pts_ms,duration_ms,n_tiles,size,sha256,message_id,created"
 _HINT_COLUMNS = ("fp,profile,imdb,season,episode,duration_ms,size_bytes,filename_norm,"
@@ -18,10 +22,25 @@ _HINT_COLUMNS = ("fp,profile,imdb,season,episode,duration_ms,size_bytes,filename
 class RemoteStoreError(RuntimeError):
     """A PostgREST/Storage failure. The message never contains the service key."""
 
-    def __init__(self, status: int, code: str, message: str):
+    def __init__(self, status: int, code: str, message: str,
+                 retry_after: float | None = None):
         self.status = int(status)
         self.code = code
+        self.retry_after = retry_after
         super().__init__(f"supabase {self.status} {code}: {message}")
+
+
+def _retry_after_seconds(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        delay = float(value)
+    except ValueError:
+        try:
+            delay = parsedate_to_datetime(value).timestamp() - time.time()
+        except (TypeError, ValueError, OverflowError):
+            return None
+    return max(0.0, min(delay, 7 * 86400.0))
 
 
 class SupabaseClient:
@@ -55,7 +74,8 @@ class SupabaseClient:
                 pass
             code = str(payload.get("code") or f"HTTP_{response.status_code}")
             message = str(payload.get("message") or response.text[:300] or "request failed")
-            raise RemoteStoreError(response.status_code, code, message)
+            raise RemoteStoreError(response.status_code, code, message,
+                                   _retry_after_seconds(response.headers.get("retry-after")))
         return response
 
     # ---------------------------------------------------------------- PostgREST helpers
@@ -111,7 +131,8 @@ class SupabaseClient:
             raise RemoteStoreError(0, type(exc).__name__, str(exc)) from None
         if response.status_code >= 400:
             raise RemoteStoreError(response.status_code, "storage_upload_failed",
-                                   response.text[:300] or "upload failed")
+                                   response.text[:300] or "upload failed",
+                                   _retry_after_seconds(response.headers.get("retry-after")))
 
     def delete_object(self, path: str) -> None:
         self.request("DELETE",
@@ -144,7 +165,8 @@ class SupabaseClient:
                         pass
                     code = str(payload.get("code") or f"HTTP_{response.status_code}")
                     message = str(payload.get("message") or response.text[:300] or "request failed")
-                    raise RemoteStoreError(response.status_code, code, message)
+                    raise RemoteStoreError(response.status_code, code, message,
+                                           _retry_after_seconds(response.headers.get("retry-after")))
 
                 declared = response.headers.get("content-length", "")
                 if max_bytes is not None and declared.isdigit() and int(declared) > max_bytes:
@@ -170,8 +192,141 @@ class SupabaseClient:
             return False
         if response.status_code >= 400:
             raise RemoteStoreError(response.status_code, "storage_head_failed",
-                                   response.text[:300] or "head failed")
+                                   response.text[:300] or "head failed",
+                                   _retry_after_seconds(response.headers.get("retry-after")))
         return True
+
+
+class RemoteTelegramSessionLease:
+    """A short distributed lease preventing concurrent primary MTProto sessions."""
+
+    def __init__(self, client: SupabaseClient, *, lease_seconds: int = 120):
+        self.client = client
+        self.lease_seconds = min(120, max(1, int(lease_seconds)))
+
+    def acquire(self, owner: str) -> bool:
+        result = self.client.rpc("try_acquire_pool_telegram_session", {
+            "p_owner": owner, "p_lease_seconds": self.lease_seconds,
+        })
+        return result is True
+
+    def release(self, owner: str) -> bool:
+        try:
+            return self.client.rpc("release_pool_telegram_session", {"p_owner": owner}) is True
+        except RemoteStoreError:
+            # The lease expires by itself if a transient outage prevents release.
+            return False
+
+
+class RemotePairingStore:
+    """Durable device credentials and one-time invites for disposable Vercel instances.
+
+    This is intentionally separate from the Telegram package/index tables: each
+    participant's Supabase project contains only that node's pairing state.
+    """
+
+    is_remote = True
+
+    def __init__(self, client: SupabaseClient):
+        self.client = client
+
+    def auth_rows(self) -> list[tuple[str, str, str, float | None]]:
+        rows = self.client.select(
+            "pool_devices", [("select", "token_hash,device_id,role,expires")])
+        return [(str(r["token_hash"]), str(r["device_id"]), str(r["role"]),
+                 float(r["expires"]) if r.get("expires") is not None else None)
+                for r in rows]
+
+    def add_device(self, device_id: str, name: str, token_hash: str, role: str = "owner",
+                   expires: float | None = None, invite_id: str | None = None) -> None:
+        now = time.time()
+        self.client.upsert("pool_devices", [{
+            "device_id": device_id, "name": name, "token_hash": token_hash,
+            "role": role, "created": now, "last_seen": now, "expires": expires,
+            "invite_id": invite_id, "contribute": False,
+        }], on_conflict="device_id")
+
+    def devices(self) -> list[dict]:
+        return self.client.select(
+            "pool_devices", [("select", "device_id,name,created,last_seen,role,expires,contribute"),
+                             ("order", "created.asc")])
+
+    def set_contribute(self, device_id: str, on: bool) -> bool:
+        return bool(self.client.patch(
+            "pool_devices", [("device_id", f"eq.{device_id}"), ("role", "eq.guest")],
+            {"contribute": bool(on)}))
+
+    def can_contribute(self, device_id: str) -> bool:
+        rows = self.client.select(
+            "pool_devices", [("select", "contribute"), ("device_id", f"eq.{device_id}"),
+                             ("role", "eq.guest"), ("limit", "1")])
+        return bool(rows and rows[0].get("contribute"))
+
+    def remove_device(self, device_id: str) -> bool:
+        return bool(self.client.delete("pool_devices", [("device_id", f"eq.{device_id}")]))
+
+    def touch_device(self, device_id: str) -> None:
+        self.client.patch("pool_devices", [("device_id", f"eq.{device_id}")],
+                          {"last_seen": time.time()})
+
+    def add_invite(self, pair_id: str, label: str, role: str, salt: str, iterations: int,
+                   k_hex: str, created: float, expires: float, max_uses: int,
+                   device_days: float | None, tag: str | None = None,
+                   contribute: bool = False) -> None:
+        self.client.upsert("pool_invites", [{
+            "pair_id": pair_id, "label": label, "role": role, "salt": salt,
+            "iterations": int(iterations), "k_hex": k_hex, "created": float(created),
+            "expires": float(expires), "max_uses": int(max_uses), "uses": 0,
+            "attempts": 0, "revoked": None, "device_days": device_days,
+            "tag": tag, "contribute": bool(contribute),
+        }], on_conflict="pair_id")
+
+    def invite_by_tag(self, tag: str, now: float) -> str | None:
+        rows = self.client.select(
+            "pool_invites", [("select", "pair_id,uses,max_uses,attempts"),
+                             ("tag", f"eq.{tag}"), ("revoked", "is.null"),
+                             ("expires", f"gt.{float(now)}"), ("order", "created.desc"),
+                             ("limit", "20")])
+        live = next((row for row in rows
+                     if int(row.get("uses", 0)) < int(row.get("max_uses", 1))
+                     and int(row.get("attempts", 0)) < 5), None)
+        return str(live["pair_id"]) if live else None
+
+    def tag_in_use(self, tag: str, now: float) -> bool:
+        rows = self.client.select(
+            "pool_invites", [("select", "uses,max_uses"), ("tag", f"eq.{tag}"),
+                             ("revoked", "is.null"), ("expires", f"gt.{float(now)}"),
+                             ("limit", "20")])
+        return any(int(row.get("uses", 0)) < int(row.get("max_uses", 1)) for row in rows)
+
+    def invite(self, pair_id: str) -> dict | None:
+        rows = self.client.select(
+            "pool_invites", [("select", "pair_id,label,role,salt,iterations,k_hex,created,expires,"
+                              "max_uses,uses,attempts,revoked,device_days,contribute"),
+                             ("pair_id", f"eq.{pair_id}"), ("limit", "1")])
+        return rows[0] if rows else None
+
+    def invites(self) -> list[dict]:
+        return self.client.select(
+            "pool_invites", [("select", "pair_id,label,role,created,expires,max_uses,uses,attempts,revoked"),
+                             ("order", "created.desc")])
+
+    def bump_invite_attempts(self, pair_id: str) -> None:
+        self.client.rpc("bump_pool_invite_attempts", {"p_pair_id": pair_id})
+
+    def use_invite(self, pair_id: str, now: float, max_attempts: int) -> bool:
+        return self.client.rpc("use_pool_invite", {
+            "p_pair_id": pair_id, "p_now": float(now), "p_max_attempts": int(max_attempts),
+        }) is True
+
+    def revoke_invite(self, pair_id: str, now: float) -> bool:
+        return self.client.rpc("revoke_pool_invite", {
+            "p_pair_id": pair_id, "p_now": float(now),
+        }) is True
+
+    def prune_invites(self, older_than: float) -> int:
+        rows = self.client.delete("pool_invites", [("expires", f"lt.{float(older_than)}")])
+        return len(rows)
 
 
 _UPLOAD_COLUMNS = ("upload_id,device_id,fp,profile,duration_ms,size_bytes,imdb,season,episode,"
@@ -443,18 +598,22 @@ class RemoteChannelStore:
         fps = sorted({row["fp"] for row in hint_rows})
         package_rows = self.client.select(
             "pool_packages",
-            [("select", "fp,profile,channel_tiles"), ("fp", f"in.({','.join(fps)})")])
-        channels = {(row["fp"], row["profile"]): int(row["channel_tiles"])
-                    for row in package_rows}
+            [("select", "fp,profile,duration_ms,channel_tiles"),
+             ("fp", f"in.({','.join(fps)})")])
+        # Hint profiles describe the source NVMT grid; channel tiles always use
+        # cache.PROFILE. They are separate identities and must not be joined
+        # directly.
+        channels = {(row["fp"], int(row["duration_ms"])): int(row["channel_tiles"])
+                    for row in package_rows if row["profile"] == PROFILE}
         out = []
         for row in hint_rows:
-            key = (row["fp"], row["profile"])
+            key = (row["fp"], int(row["duration_ms"]))
             if key not in channels:
                 continue
             out.append((row["fp"], row["profile"], row.get("imdb"), int(row["season"]),
                         int(row["episode"]), int(row["duration_ms"]), row.get("size_bytes"),
                         row.get("filename_norm"), int(row["n_tiles"]), int(row["grid"]),
-                        float(row["created"]), channels[key], int(row.get("verified", 0))))
+                        float(row["created"]), channels[key], int(row.get("verified") or 0)))
         return out
 
     # ---------------------------------------------------------------- legacy episode index
