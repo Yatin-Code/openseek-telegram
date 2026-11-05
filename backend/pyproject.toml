@@ -24,7 +24,7 @@ openseek = "openseek.cli:main"
 entrypoint = "openseek.vercel:app"
 
 [tool.setuptools]
-packages = ["openseek"]
+packages = ["openseek", "openseek.provision"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
