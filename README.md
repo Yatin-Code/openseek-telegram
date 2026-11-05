@@ -403,6 +403,57 @@ Use exactly one Telegram identity. Local-only needs only `OPENSEEK_PROFILE=local
 
 Runtime tuning (ports, cache, workers, preview tolerance, public listener, TLS files, logging) is documented with defaults in `backend/openseek/config.py`.
 
+### Minimal local/VPS pool
+
+Service environment:
+
+```sh
+OPENSEEK_DATA_DIR=/var/lib/openseek
+OPENSEEK_ENV_FILE=/var/lib/openseek/.env
+```
+
+`/var/lib/openseek/.env` (mode `0600`):
+
+```dotenv
+OPENSEEK_PROFILE=local
+OPENSEEK_POOL_MODE=channel
+OPENSEEK_TELEGRAM_CHANNEL_ID=-1001234567890
+OPENSEEK_TELEGRAM_API_ID=123456
+OPENSEEK_TELEGRAM_API_HASH=<api-hash>
+OPENSEEK_TELEGRAM_BOT_TOKEN=<bot-token>
+# Or replace the bot token with a user session:
+# OPENSEEK_TELEGRAM_SESSION_FILE=/var/lib/openseek/telegram/openseek.session
+OPENSEEK_POOL_CHANNEL_WRITABLE=auto
+OPENSEEK_CONTRIBUTION=1
+# Optional; otherwise generated in <OPENSEEK_DATA_DIR>/admin.token
+# OPENSEEK_ADMIN_TOKEN=<at-least-16-characters>
+```
+
+### Minimal Vercel node
+
+Production environment variables:
+
+```dotenv
+OPENSEEK_PROFILE=vercel
+OPENSEEK_POOL_MODE=channel
+OPENSEEK_ADMIN_TOKEN=<at-least-16-characters>
+OPENSEEK_TELEGRAM_CHANNEL_ID=-1001234567890
+OPENSEEK_TELEGRAM_API_ID=123456
+OPENSEEK_TELEGRAM_API_HASH=<api-hash>
+OPENSEEK_TELEGRAM_SESSION=<telethon-string-session>
+OPENSEEK_SUPABASE_URL=https://<project>.supabase.co
+OPENSEEK_SUPABASE_SERVICE_KEY=<service-role-key>
+OPENSEEK_SUPABASE_BUCKET=openseek-staging
+OPENSEEK_CONTRIBUTION=1
+# Optional:
+# CRON_SECRET=<cron-secret>
+# OPENSEEK_PUBLIC_TLS_PIN=sha256//<spki-pin>
+```
+
+The Vercel setup wizard creates the Telegram session, Supabase schema, bucket, and environment variables for you. Its temporary `OPENSEEK_SETUP_PENDING` and `OPENSEEK_SETUP_KEY` values are wizard-managed; do not set them by hand.
+
+
+
 ---
 
 ## How the pool fits together
