@@ -93,6 +93,7 @@ channel-mode deployment (which holds 8787/8788). Left running as the G4 daemon.
 | Configuration | /tmp/qa-g4/openseek.env (mode 0600, written by the setup wizard) |
 | Keys | in that file: OPENSEEK_POOL_READ_KEY, OPENSEEK_POOL_WRITE_KEY |
 | Package | fp 413bb6ee…, 21121 bytes, sha256 b0eb6a7d…f33d0 |
-| Channel document | message 11, caption openseek:nvmt:v1:413bb6ee… |
+| Package storage | local file under <data>/packages, one file per fp and profile |
+| Channel | tiles and hints only; the two pre-refactor package documents (messages 11, 16) were removed |
 | Note | the node was started at 01:21 by an earlier session; this run verified it independently |
 
