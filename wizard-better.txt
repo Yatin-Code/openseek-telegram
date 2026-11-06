@@ -357,3 +357,24 @@ index can read. A test asserts that a fresh index can consume the reposted
 caption.
 
 **Status:** fixed.
+
+---
+
+## 16. 2026-11-07 - The copy path and the wizard path created different schemas
+
+**What I tried:** applied the documented schema.sql, then compared the result with
+what the CLI migration path (used by the participant wizard) produces.
+
+**What happened:** schema.sql created 11 tables. The migrations created 9: the
+dashboard tables pool_owner_settings and pool_generation_jobs were missing. A
+node provisioned by the wizard would have lacked them, while a node provisioned
+by copy-paste had them.
+
+**Why it hurts:** two onboarding routes, two different databases. The failure
+appears later, in the dashboard, far from the setup step that caused it.
+
+**Wizard fix:** a migration now creates both tables, and a test asserts that the
+two paths produce the same table set. Any future drift fails the suite.
+
+**Status:** fixed.
+

@@ -50,3 +50,17 @@ Rules:
 | Served package | fp 413bb6ee018f2dcc751ecd26ae3f3a50469dc76b486fba74f448b567ed6e3d3d |
 | Served bytes | 21121, sha256 b0eb6a7dfd4d7ccf602e3ff72700774ec4fea53cb7fbe8048871a048288f33d0 (identical to the built package) |
 | Removed | the librarian second contribution (messages 7-10) after it exposed the manifest defect below |
+
+## Supabase project (G5)
+
+| Field | Value |
+|---|---|
+| Project | qilkfmndsuwmopfoihzu, https://qilkfmndsuwmopfoihzu.supabase.co |
+| Schema | 11 base tables + 1 view (pool_packages); RLS enabled with no policies |
+| Copy path | schema.sql applied twice over Postgres, first attempt clean |
+| Migration path | 5 migrations; table set identical to schema.sql (test_schema_parity.py) |
+| Bucket | openseek-staging, private, file_size_limit 16777216 |
+| Privacy proof | anonymous public read 400; signed URL 200; anon select returns [] under RLS |
+| Oversize | a 16777217-byte upload is refused (EntityTooLarge) |
+| Keys | qa.env: SUPABASE_ANON_KEY, SUPABASE_SERVICE_KEY, SUPABASE_DB_PASSWORD |
+
