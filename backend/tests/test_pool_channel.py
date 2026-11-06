@@ -1109,6 +1109,15 @@ def test_librarian_accepts_nvmt_package_and_reposts_tiles(tmp_path):
         # Check success DM was sent
         sent_msgs = [m.message for m in store._client.messages.values() if hasattr(m, "message")]
         assert any("Accepted" in m for m in sent_msgs)
+        # The republished manifest must be complete enough for a rebuild to index it.
+        caps = [m.message for m in store._client.messages.values()
+                if str(getattr(m, "message", "")).startswith("openseek:hints:v1:")]
+        assert len(caps) == 1
+        raw = caps[0].split("openseek:hints:v1:", 1)[1]
+        decoded = json.loads(base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)))
+        assert decoded["n_tiles"] == 2 and decoded["grid"] == 10_000
+        assert isinstance(decoded["created"], (int, float))
+        assert ChannelIndex(ChannelStore(db), MemoryChannel()).record_manifest(decoded) is True
     finally:
         db.close()
 

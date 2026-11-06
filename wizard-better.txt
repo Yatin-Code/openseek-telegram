@@ -334,3 +334,26 @@ configuration could never start.
 every entity lookup.
 
 **Status:** fixed.
+
+---
+
+## 15. 2026-11-07 - The librarian republished a manifest its own index rejects
+
+**What I tried:** contributed a package by direct message with a minimal manifest
+(v, fp, profile, imdb, season, episode, duration_ms, size_bytes, filename).
+
+**What happened:** the librarian accepted it ("Accepted package for e67ae65f")
+and reposted the contributor caption verbatim. The channel index requires
+n_tiles, grid and created in a manifest, so a rebuild silently dropped the
+package: the channel showed two packages, the node indexed one.
+
+**Why it hurts:** the write path and the read path disagree about the manifest
+shape. A contribution looks successful and then disappears from every node that
+rebuilds from Telegram.
+
+**Wizard fix:** the librarian now serializes the normalized record (with grid,
+n_tiles and created) and posts that, so the channel copy is exactly what the
+index can read. A test asserts that a fresh index can consume the reposted
+caption.
+
+**Status:** fixed.

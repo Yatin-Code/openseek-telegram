@@ -236,6 +236,17 @@ class TelegramLibrarian:
                 log.info("librarian rejected invalid tile in package (%s)", type(exc).__name__)
                 return
 
+        # Republish a complete manifest. The contributor's caption may carry only
+        # the fields it was asked for; the channel copy must also carry grid,
+        # n_tiles and created, or a rebuild cannot index it.
+        manifest_record = dict(manifest_dict)
+        manifest_record.update({"grid": grid, "n_tiles": len(tiles)})
+        manifest_record.setdefault("v", 1)
+        manifest_record.setdefault("created", int(time.time()))
+        encoded = base64.urlsafe_b64encode(
+            json.dumps(manifest_record, separators=(",", ":"), ensure_ascii=True).encode()).decode().rstrip("=")
+        manifest_cap = f"openseek:hints:v1:{encoded}"
+
         posted_ids: list[int] = []
         posted_messages: list[ChannelMessage] = []
         manifest_posted_id: int | None = None
@@ -253,7 +264,6 @@ class TelegramLibrarian:
                 posted_ids.append(repost_id)
                 posted_messages.append(ChannelMessage(repost_id, tile_cap, len(jpeg_data), out_name))
 
-            manifest_cap = f"openseek:hints:v1:{raw_b64}"
             manifest_msg = await store._retry(lambda: store._client.send_message(
                 store._entity, manifest_cap))
             manifest_posted_id = int(manifest_msg.id)
@@ -274,13 +284,6 @@ class TelegramLibrarian:
         for msg in posted_messages:
             self.index.record_message(msg)
 
-        manifest_record = dict(manifest_dict)
-        manifest_record.update({
-            "grid": grid,
-            "n_tiles": len(tiles),
-        })
-        manifest_record.setdefault("v", 1)
-        manifest_record.setdefault("created", int(time.time()))
         self.index.record_manifest(manifest_record)
 
         await self._delete(event)

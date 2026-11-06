@@ -36,3 +36,17 @@ Rules:
 | Package | /tmp/qa-g2/package.nvmt, 21121 bytes, 3 slots |
 | Telegram messages | 3, 4, 5 (tiles) and 6 (manifest) |
 | Verification | all three tiles re-downloaded and sha256-matched; manifest fingerprint matched |
+
+## Channel-mode node (G3)
+
+| Field | Value |
+|---|---|
+| Base URL | https://127.0.0.1:8787 (loopback, self-signed; pin in the node log) |
+| Data directory | /tmp/qa-g3/data |
+| Mode | channel, entity megagroup, history readable, writable |
+| Paired device | 95b0f1b74973819c (name qa-g3) |
+| Admin listener | http://127.0.0.1:8788 |
+| Indexed pool | 3 tiles, 1 manifest, last message id 6 |
+| Served package | fp 413bb6ee018f2dcc751ecd26ae3f3a50469dc76b486fba74f448b567ed6e3d3d |
+| Served bytes | 21121, sha256 b0eb6a7dfd4d7ccf602e3ff72700774ec4fea53cb7fbe8048871a048288f33d0 (identical to the built package) |
+| Removed | the librarian second contribution (messages 7-10) after it exposed the manifest defect below |
