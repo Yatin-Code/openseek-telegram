@@ -262,3 +262,15 @@ def test_admin_can_revoke_a_paired_device(live_factory):
     again = _admin_call(srv, "DELETE", f"/admin/devices/{device_id}", token=ADMIN_TOKEN)
     assert again.status_code == 404
 
+
+
+def test_local_only_dashboard_renders_setup_and_admin_together(live_factory):
+    from helpers import ADMIN_TOKEN
+    srv = live_factory(None)
+    html = _admin_call(srv, "GET", "/", token=ADMIN_TOKEN).text
+    assert "Connect the Telegram pool" in html
+    assert "let h=setupHtml;" in html
+    assert "Pairing" in html and "Devices" in html
+    cfg = _admin_call(srv, "GET", "/admin/setup", token=ADMIN_TOKEN).json()
+    assert cfg["setup_required"] is True
+

@@ -1202,7 +1202,7 @@ const r=await fetch('/admin/setup',{method:'POST',headers:Object.assign({'Conten
 if(!r.ok){document.getElementById('setupError').textContent=setupErrorText(j.error||'setup_failed');return}
 window.setupMessage='Telegram history is readable. Initial scan indexed '+j.initial_scan.indexed+' tiles; '+(j.channel_writable?'channel posting is available.':'this channel is read-only, so uploads are disabled. Grant the bot Post Messages permission to enable uploads.');window.setupScreen=false;load()}
 async function load(){if(!T){document.getElementById('s').textContent=PROFILE==='vercel'?'Open this page with the admin secret in the URL fragment: https://'+location.host+'/#<OPENSEEK_ADMIN_TOKEN>':'Open this page with: python -m openseek dashboard';return}
-const cfg=await (await fetch('/admin/setup',{headers:H})).json();if(cfg.setup_required){if(!window.setupScreen){window.setupScreen=true;document.getElementById('s').innerHTML=
+const cfg=await (await fetch('/admin/setup',{headers:H})).json();let setupHtml='';if(cfg.setup_required){setupHtml=
 '<h2>Connect the Telegram pool</h2><p>OpenSeek stores packages in Telegram. Enter the channel and Telegram API details. Provide one identity: a bot token or a StringSession. The channel must allow history access; posting permission enables uploads.</p>'+
 '<form onsubmit="setupSubmit(event)"><p><label>Channel ID or username<br><input name="telegram_channel_id" required maxlength="128"></label></p>'+
 '<p><label>Telegram API ID<br><input name="telegram_api_id" type="number" min="1" required></label></p>'+
@@ -1210,10 +1210,10 @@ const cfg=await (await fetch('/admin/setup',{headers:H})).json();if(cfg.setup_re
 '<p><label>Bot token (leave blank when using a StringSession)<br><input name="telegram_bot_token" type="password" autocomplete="off"></label></p>'+
 '<p><label>StringSession (leave blank when using a bot token)<br><input name="telegram_session" type="password" autocomplete="off"></label></p>'+
 '<p>Credentials are saved in the per-install private .env file. They are never shown in logs or returned by the server.</p>'+
-'<button type="submit">Verify channel and start scan</button> <span id="setupError" role="alert"></span></form>';}return}
+'<button type="submit">Verify channel and start scan</button> <span id="setupError" role="alert"></span></form>';}
 window.setupScreen=false;const r=await (await fetch('/admin/status',{headers:H})).json();
 if(!r.pairing.open){sessionStorage.removeItem(PAIR_KEY);window.lastPairing=''}else if(!window.lastPairing){window.lastPairing=sessionStorage.getItem(PAIR_KEY)||''}
-let h='';
+let h=setupHtml;
 if(window.setupMessage){h+='<p>'+esc(window.setupMessage)+'</p>';window.setupMessage=''}
 h+='<h2>Server</h2><p>'+(r.server.profile==='vercel'?'Dashboard host <code>'+esc(location.host)+'</code>':'API port <code>'+esc(r.server.port)+'</code>, addresses: <code>'+esc(r.server.addresses.join(', '))+'</code>')+
 '<br>Pin: <code>'+esc(r.server.spki_pin)+'</code></p><h2>Pairing</h2>';
