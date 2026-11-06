@@ -337,7 +337,7 @@ The pool owner does this once:
 Each contributor needs one identity:
 
 - **User session** (recommended for participants): the account joins the invite and publishes as itself. It needs history read plus Send Messages/Send Media.
-- **Bot:** create it with BotFather; a group admin adds it and grants history + posting. A bot cannot join an invite by itself. A Vercel node cannot use a bot token.
+- **Bot:** create it with BotFather; a group admin adds it and grants posting. A bot cannot read channel history, so a bot identity can publish contributions and run the librarian, but it cannot serve reads or rebuild an index. A bot cannot join an invite by itself, and a Vercel node cannot use a bot token.
 
 Keep the group private. Do not post tokens or sessions in the group.
 

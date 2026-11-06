@@ -274,3 +274,63 @@ table the schema created. If a 401 names service_role, say "expected for this
 endpoint" in the doctor output.
 
 **Status:** open.
+
+---
+
+## 12. 2026-11-07 - The documentation promised a bot could read history
+
+**What I tried:** configured a channel node with a bot token, as INSTALL.md and
+README.md describe.
+
+**What happened:** the node refused to start. Telegram answers `getHistory` with
+`BotMethodInvalidError` for bot clients; history cannot be granted to a bot.
+The docs said "make sure it can read channel history" and "grants history +
+posting".
+
+**Why it hurts:** an operator follows the docs, hits a refusal, and has no way
+to grant the permission the docs asked for.
+
+**Wizard fix:** a bot identity is publishing-only. The node now starts with
+`history_readable = false`, the dashboard says "unavailable (bot identity:
+publishing only)", and both documents describe the split between a bot
+(write) and a user session (read).
+
+**Status:** fixed.
+
+---
+
+## 13. 2026-11-07 - Channel tile upload used an input shape Telethon rejects
+
+**What I tried:** published a package with the publisher session through the
+product's own channel store.
+
+**What happened:** `send_file(entity, (io.BytesIO(data), filename))` raised
+"Failed to convert openseek-tile-...jpg to media": Telethon does not accept a
+tuple, it read the filename as the file. Every real channel upload would fail.
+The unit tests used a fake client that accepted the tuple.
+
+**Why it hurts:** the first self-hoster's first upload fails with a message
+that names a JPEG as if it were the problem.
+
+**Wizard fix:** the store now passes `io.BytesIO(data)` plus
+`DocumentAttributeFilename`, and the fake mirrors the real signature.
+
+**Status:** fixed.
+
+---
+
+## 14. 2026-11-07 - A numeric channel id stored as text does not resolve
+
+**What I tried:** started the store with `OPENSEEK_TELEGRAM_CHANNEL_ID=-100...`.
+
+**What happened:** `get_entity("-1004391668814")` raises `ValueError` while
+`get_entity(-1004391668814)` works. The settings field is a string, so every
+numeric channel id failed at startup.
+
+**Why it hurts:** the wizard writes the id as text, so the most natural
+configuration could never start.
+
+**Wizard fix:** a `_peer()` helper converts a numeric string to int before
+every entity lookup.
+
+**Status:** fixed.

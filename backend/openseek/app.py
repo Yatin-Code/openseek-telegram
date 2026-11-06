@@ -1238,7 +1238,7 @@ const pr=await fetch('/admin/pool/status',{headers:H});const p=await pr.json();
 if(!pr.ok)h+='<p role="alert">Pool setup check failed: '+esc(setupErrorText(p.reason||p.error||'setup_failed'))+'</p>';
 h+='<p>Mode <b>'+esc(p.mode)+'</b>';
 if(p.mode==='channel'){h+='; channel <code>'+esc(p.channel_id)+'</code>; '+esc(p.tiles)+' tiles; history '+
-(p.history_readable?'readable':'unavailable')+'; posting '+(p.channel_writable?'available':'read-only')+(p.channel_writable?'':'; grant the bot Post Messages permission to enable uploads')+'; last message '+
+(p.history_readable?'readable':'unavailable (bot identity: publishing only)')+'; posting '+(p.channel_writable?'available':'read-only')+(p.channel_writable?'':'; grant the bot Post Messages permission to enable uploads')+'; last message '+
 esc(p.last_message_id)+'; pending uploads '+esc(p.outbox)+(p.last_error?'; last error '+esc(setupErrorText(p.last_error)):'')+' <button onclick="act(\\'POST\\',\\'/admin/pool/scan\\')">Scan</button> '+
 '<button onclick="act(\\'POST\\',\\'/admin/pool/rebuild\\')">Rebuild index</button>'}
 else if(p.mode==='host'){h+='; API '+(p.api_enabled?'enabled':'disabled')+(p.api_url?'; URL <code>'+esc(p.api_url)+'</code>':'')+

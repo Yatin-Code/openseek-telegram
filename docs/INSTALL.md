@@ -46,8 +46,9 @@ The router must not forward 8787 or 8788. OpenSeek has no Windows installer; the
 
 ### Optional: Telegram channel pool node
 
-A channel node reads shared JPEG tiles from a Telegram channel and serves them as NVMT packages. Create a Telegram bot, add it to the
-channel, and make sure it can read channel history. For a broadcast channel, grant post permission only if this node should publish
+A channel node reads shared JPEG tiles from a Telegram channel and serves them as NVMT packages. Serving reads needs a Telegram
+**user session**, because a bot cannot read channel history. A bot can publish tiles and host the librarian, but its index stays empty
+until it posts, so it cannot serve reads or rebuild. For a broadcast channel, grant post permission only if this node should publish
 contributions directly. Obtain the Telegram API ID and hash from `my.telegram.org`.
 
 Configure the server with `OPENSEEK_POOL_MODE=channel`, `OPENSEEK_TELEGRAM_API_ID`, `OPENSEEK_TELEGRAM_API_HASH`,

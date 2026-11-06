@@ -1262,3 +1262,40 @@ def test_setup_quotes_shell_sensitive_environment_values():
     value = "folder with spaces/'$(touch /tmp/nope)"
     assignment = _env_assignment("OPENSEEK_TELEGRAM_SESSION_FILE", value)
     assert assignment == "OPENSEEK_TELEGRAM_SESSION_FILE='folder with spaces/'\"'\"'$(touch /tmp/nope)'"
+
+
+def _history_refusing_client():
+    fake = FakeTelethonClient()
+
+    async def refuse(*_args, **_kwargs):
+        raise RuntimeError("bots cannot read history")
+        yield  # pragma: no cover
+
+    fake.iter_messages = refuse
+    return fake
+
+
+def test_bot_identity_starts_when_history_is_unreadable(tmp_path):
+    settings = Settings(data_dir=tmp_path, pool_mode="channel", telegram_api_id=123,
+                        telegram_api_hash="a" * 32, telegram_bot_token="123456:test",
+                        telegram_channel_id="-100123")
+    fake = _history_refusing_client()
+    store = TelegramMTProtoStore(settings, client_factory=lambda *_a, **_k: fake)
+    try:
+        store.start()
+        assert store.entity_resolved is True
+        assert store.history_readable is False
+    finally:
+        store.close()
+
+
+def test_user_identity_still_refuses_to_start_when_history_is_unreadable(tmp_path):
+    settings = Settings(data_dir=tmp_path, pool_mode="channel", telegram_api_id=123,
+                        telegram_api_hash="a" * 32, telegram_channel_id="-100123")
+    fake = _history_refusing_client()
+    store = TelegramMTProtoStore(settings, client_factory=lambda *_a, **_k: fake)
+    try:
+        with pytest.raises(PoolError):
+            store.start()
+    finally:
+        store.close()

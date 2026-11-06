@@ -188,9 +188,18 @@ class TelegramMTProtoStore:
             self.entity_resolved = True
             is_broadcast = bool(getattr(self._entity, "broadcast", False))
             self.entity_type = "broadcast" if is_broadcast else "megagroup"
-            async for _message in self._client.iter_messages(self._entity, limit=1):
-                break
-            self.history_readable = True
+            try:
+                async for _message in self._client.iter_messages(self._entity, limit=1):
+                    break
+                self.history_readable = True
+            except Exception as exc:
+                # A bot identity cannot read channel history. That is a Telegram
+                # restriction, not a misconfiguration: keep the node usable for
+                # publishing and for the librarian, and report the limitation.
+                if not self.settings.telegram_bot_token:
+                    raise
+                self.history_readable = False
+                log.warning("channel history not readable for a bot identity (%s)", type(exc).__name__)
             try:
                 permissions = await self._client.get_permissions(self._entity, "me")
                 allowed = (getattr(permissions, "post_messages", False) if is_broadcast else
