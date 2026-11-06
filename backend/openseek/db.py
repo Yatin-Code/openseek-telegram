@@ -348,6 +348,12 @@ class DB:
             "ON CONFLICT(sender_id, work_key, day) DO UPDATE SET count=count+1 WHERE count<?",
             (sender_id, work_key, day, max(1, int(limit)))) == 1
 
+    def sender_quota_release(self, sender_id: int, work_key: str, day: str) -> None:
+        """Give back a claimed slot when the contribution fails after the claim."""
+        self.x("UPDATE pool_sender_quota SET count=count-1 "
+               "WHERE sender_id=? AND work_key=? AND day=? AND count>0",
+               (sender_id, work_key, day))
+
     def sender_quotas(self) -> list[tuple[int, str, str, int]]:
         return self.q("SELECT sender_id, work_key, day, count FROM pool_sender_quota ORDER BY day DESC")
 

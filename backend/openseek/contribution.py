@@ -174,12 +174,6 @@ class TelegramLibrarian:
 
         work_key = self._compute_work_key(imdb, season, episode)
         today_utc = time.strftime("%Y-%m-%d", time.gmtime())
-        if self.db and work_key and hasattr(self.db, "sender_quota_claim"):
-            if not self.db.sender_quota_claim(sender_id, work_key, today_utc, 3):
-                await self._delete(event)
-                await self._reply_sender(store, sender_id, "Rejected: quota_exceeded")
-                log.info("librarian rejected package (quota_exceeded)")
-                return
 
         try:
             try:
@@ -247,6 +241,13 @@ class TelegramLibrarian:
             json.dumps(manifest_record, separators=(",", ":"), ensure_ascii=True).encode()).decode().rstrip("=")
         manifest_cap = f"openseek:hints:v1:{encoded}"
 
+        if self.db and work_key and hasattr(self.db, "sender_quota_claim"):
+            if not self.db.sender_quota_claim(sender_id, work_key, today_utc, 3):
+                await self._delete(event)
+                await self._reply_sender(store, sender_id, "Rejected: quota_exceeded")
+                log.info("librarian rejected package (quota_exceeded)")
+                return
+
         posted_ids: list[int] = []
         posted_messages: list[ChannelMessage] = []
         manifest_posted_id: int | None = None
@@ -276,6 +277,8 @@ class TelegramLibrarian:
                     await store._client.delete_messages(store._entity, to_delete)
                 except Exception as del_exc:
                     log.warning("failed to rollback reposted messages: %s", del_exc)
+            if self.db and work_key and hasattr(self.db, "sender_quota_release"):
+                self.db.sender_quota_release(sender_id, work_key, today_utc)
             await self._delete(event)
             await self._reply_sender(store, sender_id, "Rejected: repost_failed")
             log.warning("librarian package repost failed (%s)", type(exc).__name__)

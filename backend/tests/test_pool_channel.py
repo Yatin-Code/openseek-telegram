@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 import stat
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -1370,4 +1371,28 @@ def test_bot_node_starts_without_scanning_channel_history(tmp_path):
         assert index.calls == []
     finally:
         core.stop()
+
+
+
+def test_librarian_rejected_package_does_not_consume_quota(tmp_path):
+    fp = "d" * 64
+    manifest = {"v": 1, "fp": fp, "profile": PROFILE, "imdb": "tt1234567",
+                "season": 1, "episode": 1, "duration_ms": 20_000,
+                "size_bytes": 100_000, "filename": "quota.s01e01.mkv"}
+    raw_b64 = base64.urlsafe_b64encode(json.dumps(manifest).encode()).decode().rstrip("=")
+    caption = f"openseek:hints:v1:{raw_b64}"
+    bad = b"NVMT-not-a-package"
+    store = FakeLibrarianStore(bad)
+    db, _ = make_db_cache(tmp_path / "librarian_quota_reject")
+    try:
+        index = ChannelIndex(ChannelStore(db), MemoryChannel())
+        librarian = TelegramLibrarian(store, index)
+        event = FakeEvent(caption, bad, "package.nvmt",
+                          mime_type="application/vnd.openseek.nvmt")
+        asyncio.run(librarian.handle_message(event, store))
+        work_key = TelegramLibrarian._compute_work_key("tt1234567", 1, 1)
+        today = time.strftime("%Y-%m-%d", time.gmtime())
+        assert db.sender_quota_count(event.sender_id, work_key, today) == 0
+    finally:
+        db.close()
 
