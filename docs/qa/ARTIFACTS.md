@@ -82,3 +82,17 @@ channel-mode deployment (which holds 8787/8788). Left running as the G4 daemon.
 | Oversize | a 16777217-byte upload is refused (EntityTooLarge) |
 | Keys | qa.env: SUPABASE_ANON_KEY, SUPABASE_SERVICE_KEY, SUPABASE_DB_PASSWORD |
 
+
+## Host-mode node (G4)
+
+| Field | Value |
+|---|---|
+| Base URL | https://127.0.0.1:18787 (loopback, self-signed) |
+| Admin listener | http://127.0.0.1:18788 |
+| Data directory | /tmp/qa-g4/data |
+| Configuration | /tmp/qa-g4/openseek.env (mode 0600, written by the setup wizard) |
+| Keys | in that file: OPENSEEK_POOL_READ_KEY, OPENSEEK_POOL_WRITE_KEY |
+| Package | fp 413bb6ee…, 21121 bytes, sha256 b0eb6a7d…f33d0 |
+| Channel document | message 11, caption openseek:nvmt:v1:413bb6ee… |
+| Note | the node was started at 01:21 by an earlier session; this run verified it independently |
+
