@@ -1,0 +1,46 @@
+name: tests
+
+# Runs the backend pytest suite on every push and PR (any branch). This is the
+# self-checking half of P1 (#42): a red suite blocks the branch, and a green
+# run is the minimum bar for the qa:agent-pass evidence attached to a ticket.
+#
+# Per-ticket contract checks run by hand via tools/qa/run.py (docs/qa/RUNNER.md)
+# and are deliberately NOT part of CI: they read the operator's secret stores
+# (~/.config/openseek/qa.env) and CI must not.
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # 3.12 is the Linux-verified CPython in backend/requirements.txt;
+          # backend/pyproject.toml requires >=3.12.
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install ffmpeg (the media fixtures shell out to the real encoder)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+
+      - name: Install exact runtime + test dependencies under the lock constraints
+        run: >
+          pip install -r backend/requirements.txt -r backend/requirements-test.txt
+          -c backend/requirements-lock.txt
+
+      - name: Run the suite
+        run: cd backend && pytest -q
