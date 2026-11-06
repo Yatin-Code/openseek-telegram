@@ -17,11 +17,13 @@ Summary
 | 2 | 2026-11-07 | Running the helper | open |
 | 3 | 2026-11-07 | Supabase token type | open |
 | 4 | 2026-11-07 | Supabase organizations | open |
-| 5 | 2026-11-07 | Supabase project creation | open |
+| 5 | 2026-11-07 | Supabase project creation | fixed |
 | 6 | 2026-11-07 | Channel type | open |
 | 7 | 2026-11-07 | Free plan slots | open |
 | 8 | 2026-11-07 | Vercel sign-in path | open |
 | 9 | 2026-11-07 | Tizen emulator (QA only) | open |
+| 10 | 2026-11-07 | CLI login cannot be automated | open |
+| 11 | 2026-11-07 | REST root 401 misreads as a broken key | open |
 
 ---
 
@@ -138,7 +140,13 @@ to start without a TTY ("Cannot use automatic login flow inside non-TTY
 environments"), so the login must happen in the user's own terminal. The token,
 not the client, is the blocker.
 
-**Status:** open. Blocked on a user-scoped token or a dashboard-created project.
+**Resolution (same day):** a "supabase login" in a real terminal produced a
+user-scoped token. "supabase orgs list" then showed both organizations and
+"supabase projects create openseek-qa-node --region ap-northeast-1 --yes"
+succeeded (project qilkfmndsuwmopfoihzu). The original token had been created
+from an organization-scoped page, not Account -> Access Tokens.
+
+**Status:** fixed.
 
 ---
 
@@ -174,6 +182,11 @@ wall with no explanation.
 
 **Why it hurts:** the failure arrives at the slowest step, after the user has
 already pasted schema and keys.
+
+**Follow-up:** this account now has 2 of 2 free projects
+(gamingchannelay@gmail.com's Project and openseek-qa-node). The Deploy Button
+path creates a Supabase project through the Vercel integration, so it will fail
+on this account unless it reuses the existing project.
 
 **Wizard fix:** count projects before creating one and say "this account has N
 of 2 free projects in use". Offer to reuse an existing project instead.
@@ -216,5 +229,48 @@ host, so client tickets wait for a TV or a remote emulator.
 
 **Wizard fix:** not a wizard issue. Track it as QA infrastructure: run the
 emulator elsewhere, or connect a TV with developer mode and `sdb connect`.
+
+**Status:** open.
+
+---
+
+## 10. 2026-11-07 - The CLI login cannot run without a terminal
+
+**What I tried:** "supabase login --no-browser" from a non-interactive shell,
+including under a detached process.
+
+**What happened:** "Cannot use automatic login flow inside non-TTY
+environments. Please provide --token flag or set the SUPABASE_ACCESS_TOKEN
+environment variable." With a real terminal it worked, but the token was stored
+in the OS keyring, not in a dotfile, so no file could be reused by another
+process.
+
+**Why it hurts:** a wizard that shells out to the CLI cannot log the user in.
+It can only reuse a login that already exists, or accept a token explicitly.
+
+**Wizard fix:** detect the CLI session first ("supabase projects list"). If it
+works, use it. If not, ask for a token or print the exact two commands to run
+in a terminal, and never attempt an automatic browser login from a script.
+
+**Status:** open.
+
+---
+
+## 11. 2026-11-07 - The REST root answers 401 with a valid key
+
+**What I tried:** smoke-tested the new project with GET /rest/v1/ and the anon
+key. Got 401: "Invalid API key ... Only the service_role API key can be used
+for this endpoint."
+
+**What happened:** the key was valid. The REST root only accepts service_role,
+and auth/v1/health answered 200 with the same anon key.
+
+**Why it hurts:** a maintainer (or a doctor command) that probes the REST root
+with the anon key concludes the project is broken and starts rotating keys that
+were never wrong.
+
+**Wizard fix:** never health-check /rest/v1/. Use /auth/v1/health, or query a
+table the schema created. If a 401 names service_role, say "expected for this
+endpoint" in the doctor output.
 
 **Status:** open.
