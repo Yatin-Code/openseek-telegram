@@ -97,3 +97,22 @@ channel-mode deployment (which holds 8787/8788). Left running as the G4 daemon.
 | Channel | tiles and hints only; the two pre-refactor package documents (messages 11, 16) were removed |
 | Note | the node was started at 01:21 by an earlier session; this run verified it independently |
 
+## Local-only node (G1)
+
+| Field | Value |
+|---|---|
+| Base URL | https://127.0.0.1:21787 (loopback, self-signed; pin sha256//ioQfpXg4OqYr18ImdJfMWzWc/928yroGWDEg3Br+Bhs=) |
+| LAN address | https://10.228.84.160:21787 (the daemon bound 0.0.0.0, as documented; see defect #71) |
+| Data directory | /tmp/qa-g1/data |
+| Mode | local-only (no pool, no Telegram, no Supabase) |
+| Admin listener | http://127.0.0.1:21788 |
+| Admin secret | /tmp/qa-g1/data/admin.token (file location only; never recorded by value) |
+| Paired device | 3deacc7d2aee0ee6 (name qa-g1-living-room) |
+| Install | fresh venv /tmp/qa-g1/venv from backend/requirements.txt + backend/requirements-lock.txt |
+| Evidence | /tmp/qa-g1/evidence/ |
+| Defects | #69 revoke HTTP 500 leaves this device paired; #70 local-only dashboard shows the Telegram setup form; #71 non-loopback bind not refused |
+
+The device could not be revoked: `python -m openseek revoke 3deacc7d2aee0ee6` returned HTTP 500
+(`AttributeError: 'JobManager' object has no attribute 'revoke_device'`, defect #69). The registry records the id
+because the pairing is still live.
+
