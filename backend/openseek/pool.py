@@ -472,8 +472,14 @@ class PoolService:
         self._package_cache = _PackageCache()
 
     def authorize(self, given: str | None, write: bool = False) -> bool:
-        wanted = self.write_key if write else self.read_key
-        return bool(given and wanted and secrets.compare_digest(given, wanted))
+        if not given:
+            return False
+        if write:
+            return bool(self.write_key and secrets.compare_digest(given, self.write_key))
+        # The write key is a superset of the read capability: a trusted contributor
+        # node that can publish also reads (G4 acceptance). Writes stay write-key-only.
+        return bool(self.read_key and secrets.compare_digest(given, self.read_key)) or \
+            bool(self.write_key and secrets.compare_digest(given, self.write_key))
 
     def upload(self, fp: str, profile: str, k: int, pts_ms: int, duration_ms: int,
                n_tiles: int, data: bytes, contributor: str = "") -> dict:

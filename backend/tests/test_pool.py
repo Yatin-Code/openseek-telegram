@@ -356,6 +356,61 @@ def test_two_instances_through_real_asgi_pool_routes(tmp_path, monkeypatch):
         core.stop()
 
 
+def test_write_key_also_reads_and_read_key_cannot_write(tmp_path, monkeypatch):
+    """G4: the host's write key is a superset of the read capability over real routes.
+    The read key keeps write access denied, and no key is refused before the body moves."""
+    tg = FakeTelegramBotAPI()
+
+    class NoSourceProxy:
+        def stop(self):
+            pass
+
+    async def inline_to_thread(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(app_module.asyncio, "to_thread", inline_to_thread)
+    core = Core(Settings(data_dir=tmp_path / "pool-host", pool_enabled=True,
+                         pool_read_key=READ_KEY, pool_write_key=WRITE_KEY,
+                         telegram_bot_token="123456:test", telegram_channel_id="-100123"),
+                pool_storage=TelegramBotStore("123456:test", "-100123", opener=tg.urlopen),
+                proxy=NoSourceProxy())
+    api = ASGIPoolAPI(create_api_app(core))
+    fp = hashlib.sha256(b"G4 write key reads too").hexdigest()
+    duration_ms, grid = 30_000, 10_000
+    tile = jpeg((8, 80, 200))
+    data = nvmt_package(grid, duration_ms, {0: (0, tile), 1: (10_000, tile), 2: (20_000, tile)})
+    try:
+        url = f"https://pool.test/v1/pool/{fp}/nvmt?profile=nvmt-v1-g10&duration_ms={duration_ms}"
+        put = api(url, data, {"Authorization": f"Bearer {WRITE_KEY}",
+                              "Content-Type": "application/vnd.openseek.nvmt"}, 2)
+        assert put.status == 201, put.read()
+
+        # The write key reads the package, exactly like the read key does.
+        with_write = api(f"https://pool.test/v1/pool/{fp}/nvmt?profile=nvmt-v1-g10", None,
+                         {"Authorization": f"Bearer {WRITE_KEY}"}, 2)
+        with_read = api(f"https://pool.test/v1/pool/{fp}/nvmt?profile=nvmt-v1-g10", None,
+                        {"Authorization": f"Bearer {READ_KEY}"}, 2)
+        assert with_write.status == 200, with_write.read()
+        assert with_read.status == 200 and with_read.data == with_write.data
+
+        # A conflicting refactor keeps the write route write-key-only.
+        tile_denied = api(f"https://pool.test/v1/pool/{fp}/tiles/0.jpg?profile=nvmt-v1-g10",
+                          tile, {"Authorization": f"Bearer {READ_KEY}",
+                                 "Content-Type": "image/jpeg"}, 2)
+        assert tile_denied.status == 403
+        assert json.loads(tile_denied.data)["error"] == "forbidden"
+
+        # No key: refused before the body or content type is ever parsed.
+        no_key = api(url, b"junk-body-not-nvmt",
+                     {"Authorization": "", "Content-Type": "text/plain"}, 2)
+        assert no_key.status in (401, 403)
+        assert json.loads(no_key.data)["error"] == "forbidden"
+        no_key_manifest = api(f"https://pool.test/v1/pool/{fp}/manifest", None, {}, 2)
+        assert no_key_manifest.status == 403
+    finally:
+        core.stop()
+
+
 def test_pool_auth_validation_first_writer_conflict_and_variant_isolation(tmp_path):
     tg = FakeTelegramBotAPI()
     db = DB(tmp_path / "pool.sqlite")

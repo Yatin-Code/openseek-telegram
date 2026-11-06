@@ -67,8 +67,13 @@ class ChannelPoolService:
         self._lock = threading.RLock()
 
     def authorize(self, given: str | None, write: bool = False) -> bool:
-        wanted = self.write_key if write else self.read_key
-        return bool(given and wanted and secrets.compare_digest(given, wanted))
+        if not given:
+            return False
+        if write:
+            return bool(self.write_key and secrets.compare_digest(given, self.write_key))
+        # Same rule as PoolService: the write key also reads; writes stay write-key-only.
+        return bool(self.read_key and secrets.compare_digest(given, self.read_key)) or \
+            bool(self.write_key and secrets.compare_digest(given, self.write_key))
 
     def manifest(self, fp: str, profile: str) -> dict | None:
         return self.index.manifest(fp, profile)

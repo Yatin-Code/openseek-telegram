@@ -862,6 +862,19 @@ def test_channel_contribution_proxy_config_requires_https_and_write_key():
                            "OPENSEEK_POOL_WRITE_KEY": "w" * 32})
 
 
+def test_channel_pool_write_key_authorized_for_reads_writes_stay_write_key_only():
+    """G4: a channel node's write key (a trusted contributor credential) also reads
+    the pool; the read key still cannot write. Mirrors PoolService.authorize."""
+    service = ChannelPoolService(SimpleNamespace(telegram=SimpleNamespace()),      # index unused here
+                                 "r" * 40, "w" * 40)
+    assert service.authorize("r" * 40)
+    assert service.authorize("w" * 40)
+    assert service.authorize("w" * 40, write=True)
+    assert not service.authorize("r" * 40, write=True)
+    assert not service.authorize(None, write=False)
+    assert not service.authorize("") and not service.authorize("wrong")
+
+
 def test_channel_pool_status_reports_history_permissions_and_index_counts(tmp_path):
     store = MemoryChannel()
     store.entity_type = "broadcast"
