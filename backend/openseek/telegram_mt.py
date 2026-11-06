@@ -25,6 +25,13 @@ _CAPTION = re.compile(r"^openseek:v1:([0-9a-f]{64}):([^:]+):(\d+):([0-9a-f]{64})
 _HINTS_CAPTION = re.compile(r"^openseek:hints:v1:([A-Za-z0-9_-]+)$")
 
 
+def _peer(value):
+    """Telethon resolves a numeric peer only as int, not as a numeric string."""
+    if isinstance(value, str) and value.lstrip("-").isdigit():
+        return int(value)
+    return value
+
+
 @dataclass(frozen=True)
 class ChannelMessage:
     message_id: int
@@ -177,7 +184,7 @@ class TelegramMTProtoStore:
         self.history_readable = False
         self.entity_type = "unknown"
         try:
-            self._entity = await self._client.get_entity(self.channel_id)
+            self._entity = await self._client.get_entity(_peer(self.channel_id))
             self.entity_resolved = True
             is_broadcast = bool(getattr(self._entity, "broadcast", False))
             self.entity_type = "broadcast" if is_broadcast else "megagroup"
@@ -305,7 +312,7 @@ class TelegramMTProtoStore:
     async def _post_message(self, text: str, target: str | None) -> int:
         await self._ensure_connected()
         if target:
-            entity = await self._client.get_entity(target)
+            entity = await self._client.get_entity(_peer(target))
         elif self._entity is None:
             await self._verify_entity(True)
             entity = self._entity
@@ -322,16 +329,19 @@ class TelegramMTProtoStore:
     async def _put_tile(self, data: bytes, caption: str, filename: str, target: str | None) -> int:
         await self._ensure_connected()
         if target:
-            entity = await self._client.get_entity(target)
+            entity = await self._client.get_entity(_peer(target))
         elif self._entity is None:
             await self._verify_entity(True)
             entity = self._entity
         else:
             entity = self._entity
         try:
+            from telethon.tl.types import DocumentAttributeFilename
+
             message = await self._retry(lambda: self._client.send_file(
-                entity, (io.BytesIO(data), filename), caption=caption,
-                force_document=True, mime_type="image/jpeg"))
+                entity, io.BytesIO(data), caption=caption, force_document=True,
+                mime_type="image/jpeg",
+                attributes=[DocumentAttributeFilename(filename)]))
             return int(message.id)
         except PoolError:
             raise
@@ -408,7 +418,7 @@ class TelegramMTProtoStore:
     async def _delete_message(self, message_id: int, target: str | None) -> bool:
         await self._ensure_connected()
         if target:
-            entity = await self._client.get_entity(target)
+            entity = await self._client.get_entity(_peer(target))
         elif self._entity is None:
             await self._verify_entity(True)
             entity = self._entity

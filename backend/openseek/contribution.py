@@ -113,9 +113,12 @@ class TelegramLibrarian:
         outgoing_name = (_tile_filename(pts_ms, duration_ms, n_tiles)
                          if metadata is not None else "tile.jpg")
         try:
+            from telethon.tl.types import DocumentAttributeFilename
+
             repost = await store._retry(lambda: store._client.send_file(
-                store._entity, (io.BytesIO(data), outgoing_name), caption=caption,
-                force_document=True, mime_type="image/jpeg"))
+                store._entity, io.BytesIO(data), caption=caption,
+                force_document=True, mime_type="image/jpeg",
+                attributes=[DocumentAttributeFilename(outgoing_name)]))
             repost_id = int(repost.id)
             record = ChannelMessage(repost_id, caption, len(data), outgoing_name)
             if not self.index.record_message(record):
@@ -240,9 +243,12 @@ class TelegramLibrarian:
             for k, pts_ms, jpeg_data, digest in tiles_to_post:
                 tile_cap = f"openseek:v1:{fp}:{PROFILE}:{k}:{digest}"
                 out_name = _tile_filename(pts_ms, duration_ms, n_channel_tiles)
+                from telethon.tl.types import DocumentAttributeFilename
+
                 repost = await store._retry(lambda: store._client.send_file(
-                    store._entity, (io.BytesIO(jpeg_data), out_name),
-                    caption=tile_cap, force_document=True, mime_type="image/jpeg"))
+                    store._entity, io.BytesIO(jpeg_data), caption=tile_cap,
+                    force_document=True, mime_type="image/jpeg",
+                    attributes=[DocumentAttributeFilename(out_name)]))
                 repost_id = int(repost.id)
                 posted_ids.append(repost_id)
                 posted_messages.append(ChannelMessage(repost_id, tile_cap, len(jpeg_data), out_name))

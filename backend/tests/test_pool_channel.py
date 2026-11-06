@@ -947,9 +947,9 @@ class FakeTelethonClient:
     async def get_permissions(self, _entity, _user):
         return SimpleNamespace(send_messages=getattr(self, "can_send", True), post_messages=True)
 
-    async def send_file(self, _entity, file, caption, **_kw):
-        source, filename = file
-        data = source.read()
+    async def send_file(self, _entity, file, caption, attributes=None, **_kw):
+        data = file.read()
+        filename = attributes[0].file_name if attributes else "unnamed"
         mid = self.next_id
         self.next_id += 1
         doc = SimpleNamespace(size=len(data), data=data,
