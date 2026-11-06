@@ -1,0 +1,211 @@
+# wizard-better.txt
+
+A running log of every friction point found while setting OpenSeek up for real.
+
+Purpose: each entry becomes either a wizard step, a preflight check, or one
+clearer line in the documentation. The goal is that the next person does not
+have to discover these.
+
+How to add an entry: append at the bottom with the date and a short title.
+Keep the five fields. Mark the status as open, fixed, or wontfix.
+
+Summary
+-------
+| # | Date | Area | Status |
+|---|------|------|--------|
+| 1 | 2026-11-07 | Telegram session | open |
+| 2 | 2026-11-07 | Running the helper | open |
+| 3 | 2026-11-07 | Supabase token type | open |
+| 4 | 2026-11-07 | Supabase organizations | open |
+| 5 | 2026-11-07 | Supabase project creation | open |
+| 6 | 2026-11-07 | Channel type | open |
+| 7 | 2026-11-07 | Free plan slots | open |
+| 8 | 2026-11-07 | Vercel sign-in path | open |
+| 9 | 2026-11-07 | Tizen emulator (QA only) | open |
+
+---
+
+## 1. 2026-11-07 - Telegram has no "StringSession" screen
+
+**What I tried:** looked for a session string in the Telegram app, the web
+client, and my.telegram.org.
+
+**What happened:** it does not exist there. A StringSession is a Telethon
+concept: a base64 blob containing the auth key and data-center id. It can only
+be produced by running a Telethon login.
+
+**Why it hurts:** the README says "log in with a Telegram user session" as if
+that were one step. A first-time user has no idea a Python program is involved,
+and the word "session" suggests something already present in their account.
+
+**Wizard fix:** add an "email-style" login step to the wizard itself
+(`openseek setup --telegram-login`): ask for the phone number, send the code,
+ask for the code and 2FA, store `OPENSEEK_TELEGRAM_SESSION` directly. Never
+mention Telethon in the prompt. If a session already exists, offer to reuse it.
+
+**Status:** open. Worked around with `tools/telegram-session.py`.
+
+---
+
+## 2. 2026-11-07 - Running a helper inside a virtualenv trips users
+
+**What I tried:** `python ~/.config/openseek/venv/bin/python tools/telegram-session.py`.
+
+**What happened:** `SyntaxError: source code cannot contain null bytes` - the
+interpreter read the ELF binary as a script.
+
+**Why it hurts:** the documented command requires the reader to understand that
+the venv path *is* the interpreter. Typing the familiar `python` prefix is the
+natural mistake.
+
+**Wizard fix:** never ask the user to run a Python file by path. Ship a
+subcommand (`openseek telegram-login`) or a one-word wrapper on PATH. In docs,
+show the exact line and no alternatives.
+
+**Status:** open. Worked around with `~/.local/bin/openseek-session`.
+
+---
+
+## 3. 2026-11-07 - Supabase "client id and secret" is not a management token
+
+**What I tried:** the provided OAuth client id and `sba_...` client secret
+against the Management API.
+
+**What happened:** HTTP 401. Those credentials belong to a Supabase OAuth app
+("Sign in with Supabase"), not to project management. The Management API needs
+a Personal Access Token that starts with `sbp_`.
+
+**Why it hurts:** both look like "API credentials", and the OAuth app screen is
+easy to confuse with the access-token screen. The user loses an hour and still
+has nothing that works.
+
+**Wizard fix (done):** detect the `sba_` prefix and print "this is an OAuth app
+secret, not a personal access token" plus the exact dashboard URL. Say
+"starts with sbp_" in the README, the wizard prompt, and the Vercel guide.
+
+**Status:** open.
+
+---
+
+## 4. 2026-11-07 - Organizations are invisible to a token, and that looks like "no org"
+
+**What I tried:** `GET /v1/organizations` to pick the organization for the new
+project.
+
+**What happened:** `[]` with HTTP 200, while `GET /v1/projects` returned a real
+project and `GET /v1/projects/{ref}` exposed `organization_id`.
+`GET /v1/organizations/{id}` and `.../members` returned 403.
+
+**Why it hurts:** an empty list reads as "your account has no organization",
+which sends the user to create one that they do not need. The truth is that the
+token cannot see it.
+
+**Wizard fix:** treat an empty list as ambiguous. Fall back to reading
+`organization_id` from an existing project. When every organization endpoint is
+403, say "this token cannot read organizations; create a token as the account
+owner" instead of "no organizations found".
+
+**Status:** open.
+
+---
+
+## 5. 2026-11-07 - Creating a project returns a bare 403
+
+**What I tried:** `POST /v1/projects` with a valid organization, name, region,
+and database password, three times: existing organization, newly created
+organization, and with an explicit plan field.
+
+**What happened:** `{"message":"Forbidden"}` every time. Creating an
+organization with the same token succeeded (201), so the token is not simply
+read-only. `GET /v1/profile` explains more: "This endpoint requires a
+user-scoped access token".
+
+**Why it hurts:** the wizard's whole participant flow starts at project
+creation. A generic 403 with no next step is a dead end, and the message does
+not name the account or the missing scope.
+
+**Wizard fix:** preflight the token before the wizard starts: call
+`/v1/profile`, then list projects, then stop with a named cause. Keep a manual
+fallback: "create the project in the dashboard, paste the project ref here" and
+verify it with one read. Never let the wizard end on a bare 403.
+
+**Status:** open. Blocked on a user-scoped token or a dashboard-created project.
+
+---
+
+## 6. 2026-11-07 - A pool channel was created as a broadcast channel
+
+**What I tried:** created a Telegram channel, added the bot as administrator,
+generated an invite link.
+
+**What happened:** `GET /api.telegram.org/bot.../getChat` reports
+`type=channel`, and Telethon reports `broadcast=True, megagroup=False`. The
+README asks for a **supergroup**: "Create a private supergroup (not a broadcast
+channel)". Contributions and history scanning do not work the same way.
+
+**Why it hurts:** the Telegram "New Channel" button is the obvious choice, and
+nothing in the UI explains the difference. The user only learns it when
+contributions silently do nothing.
+
+**Wizard fix:** a preflight check on the channel id. If it is a broadcast
+channel, stop and print the difference in one sentence, plus the exact steps to
+convert or create a supergroup. Also make `doctor` report the channel kind.
+
+**Status:** open.
+
+---
+
+## 7. 2026-11-07 - Free plan slot count is invisible until creation fails
+
+**What I tried:** nothing yet; the account already had one project.
+
+**What happened:** the free plan allows two projects. Nothing in the wizard or
+the README mentions the limit, so the second participant on one account hits a
+wall with no explanation.
+
+**Why it hurts:** the failure arrives at the slowest step, after the user has
+already pasted schema and keys.
+
+**Wizard fix:** count projects before creating one and say "this account has N
+of 2 free projects in use". Offer to reuse an existing project instead.
+
+**Status:** open.
+
+---
+
+## 8. 2026-11-07 - Vercel has two different sign-in paths
+
+**What I tried:** `vercel whoami`, which answered `yatdoescode-8909` with no
+token.
+
+**What happened:** the CLI was already authenticated, so no token was needed.
+A different user will be asked to log in through a browser, or to create a
+token. The Deploy Button path needs a browser click that no CLI can make.
+
+**Why it hurts:** the docs describe the token path and the button path without
+saying which one a given user is already in.
+
+**Wizard fix:** detect `vercel whoami` first. If authenticated, skip the token
+prompt and say so. If not, offer both paths and mark the button path as
+"one click in the browser". Never ask for a token when a session exists.
+
+**Status:** open.
+
+---
+
+## 9. 2026-11-07 - The Tizen emulator cannot run on this machine as-is (QA only)
+
+**What I tried:** checked KVM, disk, display server, and network to
+download.tizen.org.
+
+**What happened:** KVM and network are fine, but only 6.9 GB of disk is free
+(Tizen Studio plus a TV image needs roughly 5-6 GB), and `DISPLAY=:0` has no X
+server behind it. Java 25 is installed; Tizen Studio expects 17.
+
+**Why it hurts:** the client half of the campaign cannot be verified on this
+host, so client tickets wait for a TV or a remote emulator.
+
+**Wizard fix:** not a wizard issue. Track it as QA infrastructure: run the
+emulator elsewhere, or connect a TV with developer mode and `sdb connect`.
+
+**Status:** open.
