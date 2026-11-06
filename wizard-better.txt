@@ -129,6 +129,15 @@ not name the account or the missing scope.
 fallback: "create the project in the dashboard, paste the project ref here" and
 verify it with one read. Never let the wizard end on a bare 403.
 
+**Follow-up (same day):** the official CLI fails the same way. Installing
+Supabase CLI 3.0.0 and running `supabase projects create openseek-qa-node
+--org-id ... --region ap-northeast-1 --db-password ... --yes` ends in
+`HTTP POST https://api.supabase.com/v1/projects` then `{"message":"Forbidden"}`.
+`supabase orgs list` returns an empty table. The CLI's automatic login refuses
+to start without a TTY ("Cannot use automatic login flow inside non-TTY
+environments"), so the login must happen in the user's own terminal. The token,
+not the client, is the blocker.
+
 **Status:** open. Blocked on a user-scoped token or a dashboard-created project.
 
 ---
