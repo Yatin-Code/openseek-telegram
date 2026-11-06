@@ -1549,7 +1549,6 @@ def create_admin_app(core: Core) -> FastAPI:
     async def revoke(device_id: str):
         if not is_device_id(device_id):
             return err(404, "not_found")
-        await asyncio.to_thread(core.jobs.revoke_device, device_id)
         if not core.auth.revoke(device_id):
             return err(404, "not_found")
         return Response(status_code=204)

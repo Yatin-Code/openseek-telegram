@@ -249,3 +249,16 @@ def test_the_compose_file_cannot_collide_with_another_deployment():
     docker = (root / "Dockerfile").read_text(encoding="utf-8")
     assert "openseek:local" not in docker
     assert any(ln.startswith("FROM python:") and "@sha256:" in ln for ln in docker.splitlines())
+
+
+def test_admin_can_revoke_a_paired_device(live_factory):
+    from helpers import ADMIN_TOKEN
+    srv = live_factory(None)
+    _token, device_id = srv.pair("revoke-me")
+    revoked = _admin_call(srv, "DELETE", f"/admin/devices/{device_id}", token=ADMIN_TOKEN)
+    assert revoked.status_code == 204, revoked.text
+    devices = _admin_call(srv, "GET", "/admin/devices", token=ADMIN_TOKEN).json()["devices"]
+    assert all(entry.get("device_id") != device_id for entry in devices)
+    again = _admin_call(srv, "DELETE", f"/admin/devices/{device_id}", token=ADMIN_TOKEN)
+    assert again.status_code == 404
+
