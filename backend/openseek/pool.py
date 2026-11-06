@@ -6,6 +6,7 @@ Telegram is blob storage; SQLite is the lookup index.
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import http.client
 import io
@@ -314,6 +315,14 @@ class TelegramBotStore:
                                       int(metadata["n_tiles"]))
         return self.put_document(data, caption, filename, "image/jpeg")
 
+    def post_message(self, text: str) -> int:
+        result = self._json("sendMessage", {"chat_id": self.channel_id, "text": text,
+                                            "disable_web_page_preview": "true"})
+        message_id = result.get("message_id") if isinstance(result, dict) else None
+        if not isinstance(message_id, int):
+            raise PoolError(502, "telegram_error")
+        return message_id
+
     def put_document(self, data: bytes, caption: str, filename: str,
                      content_type: str = "application/octet-stream") -> tuple[str, int]:
         boundary = "openseek-" + secrets.token_hex(16)
@@ -505,6 +514,50 @@ class PoolService:
                       "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                       (fp, profile, k, pts_ms, duration_ms, n_tiles, len(data), digest, file_id, message_id, time.time()))
         return {"stored": True, "duplicate": False, "sha256": digest}
+
+
+    def _publish_shared_tiles(self, fp: str, profile: str, duration_ms: int,
+                              tiles: dict[int, tuple[int, bytes]], hints: dict, grid: int) -> None:
+        """Publish the package in the shared pool format too: one document per tile, plus hints.
+
+        Channel-mode nodes index those captions and rebuild their catalogue from Telegram.
+        Without this, a host-mode upload exists only as one package document that no other
+        node reads.
+        """
+        if not isinstance(self.storage, TelegramBotStore):
+            return
+        channel_count = (duration_ms + TILE_INTERVAL_MS - 1) // TILE_INTERVAL_MS
+        used: set[int] = set()
+        for target in range(channel_count):
+            target_ms = target * TILE_INTERVAL_MS
+            slot = min(tiles, key=lambda item: (abs(tiles[item][0] - target_ms), item))
+            if slot in used or abs(tiles[slot][0] - target_ms) > grid // 2:
+                continue
+            used.add(slot)
+            pts_ms, tile_data = tiles[slot]
+            try:
+                if profile == "nvmt-v1-g10":
+                    # g10 slots and channel slots are the same key space, so the local
+                    # tile index can record them for the host's own sparse reads.
+                    self.upload(fp, PROFILE, target, pts_ms, duration_ms, channel_count, tile_data)
+                else:
+                    # A g5 package has a different key space. Publish the document for
+                    # shared readers without polluting the host's package-slot index.
+                    digest = validate_tile(fp, PROFILE, target, pts_ms, duration_ms, channel_count, tile_data)
+                    self.storage.put(tile_data, f"openseek:v1:{fp}:{PROFILE}:{target}:{digest}",
+                                     {"pts_ms": pts_ms, "duration_ms": duration_ms,
+                                      "n_tiles": channel_count})
+            except PoolError as exc:
+                if exc.code not in ("tile_conflict", "media_metadata_conflict"):
+                    raise
+        manifest = {"v": 1, "fp": fp, "profile": profile, "imdb": hints["imdb"],
+                    "season": hints["season"], "episode": hints["episode"],
+                    "duration_ms": duration_ms, "size_bytes": hints["size_bytes"],
+                    "filename_norm": hints["filename_norm"], "n_tiles": len(tiles),
+                    "grid": grid, "created": int(time.time())}
+        encoded = base64.urlsafe_b64encode(
+            json.dumps(manifest, separators=(",", ":"), ensure_ascii=True).encode()).decode().rstrip("=")
+        self.storage.post_message(f"openseek:hints:v1:{encoded}")
 
     def manifest(self, fp: str, profile: str) -> dict | None:
         if not is_fingerprint(fp) or profile != PROFILE:
@@ -768,6 +821,7 @@ class PoolService:
                 self._store_package_metadata(fp, profile, duration_ms, n_slots, len(merged), len(package),
                                              digest, previous[5], previous[6], episode_key, hints, grid)
                 return {"stored": False, "duplicate": True, "tiles": len(merged), "sha256": digest}
+            self._publish_shared_tiles(fp, profile, duration_ms, merged, hints, grid)
             caption = f"openseek:nvmt:v1:{fp}:{profile}:{digest}"
             try:
                 file_id, message_id = self.storage.put_document(

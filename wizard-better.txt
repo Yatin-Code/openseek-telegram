@@ -378,3 +378,18 @@ two paths produce the same table set. Any future drift fails the suite.
 
 **Status:** fixed.
 
+
+---
+
+## 17. 2026-11-07 - A host-mode upload was invisible to every channel-mode node
+
+**What I tried:** uploaded a package through the host-mode node, then scanned the same supergroup with a channel-mode node.
+
+**What happened:** the host node published one package document with caption openseek:nvmt:v1. No component reads that caption, so the channel node indexed zero tiles for that fingerprint. The contribution existed in Telegram and no reader could rebuild it.
+
+**Why it hurts:** the shared pool was not shared. Host mode and channel mode used the same channel with two incompatible shapes.
+
+**Wizard fix:** a host upload now also publishes one document per tile in the shared caption format, plus the hints manifest. The package document stays for the host's own read path. Live proof: the channel node indexed the new package (tiles 3 to 6, hints 1 to 2) and served bytes identical to the upload, sha256 b0eb6a7d...f33d0.
+
+**Status:** fixed.
+

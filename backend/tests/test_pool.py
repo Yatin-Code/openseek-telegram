@@ -1,6 +1,7 @@
 """Two-instance Telegram-backed pool tests using a local Bot API-compatible fake."""
 from __future__ import annotations
 
+import base64
 import hashlib
 import io
 import json
@@ -75,6 +76,7 @@ class FakeTelegramBotAPI:
         self.get_file_calls = 0
         self.download_calls = 0
         self.deleted_messages: list[int] = []
+        self.captions: list[str] = []
 
     def urlopen(self, req, timeout=8.0):
         from urllib.parse import urlparse
@@ -87,12 +89,22 @@ class FakeTelegramBotAPI:
             part = next(p for p in mime.iter_parts()
                         if p.get_param("name", header="content-disposition") == "document")
             data = part.get_payload(decode=True)
+            caption_part = next((p for p in mime.iter_parts()
+                                 if p.get_param("name", header="content-disposition") == "caption"), None)
+            if caption_part is not None:
+                self.captions.append(caption_part.get_payload(decode=True).decode())
             self.messages += 1
             file_id = f"file-{self.messages}"
             self.files[file_id] = data
             return FakeResponse(json.dumps({"ok": True, "result": {
                 "message_id": self.messages,
                 "document": {"file_id": file_id, "file_size": len(data)}}}).encode())
+        if url.path.endswith("/sendMessage"):
+            text = parse_qs(body.decode()).get("text", [""])[0]
+            self.captions.append(text)
+            self.messages += 1
+            return FakeResponse(json.dumps({"ok": True, "result": {
+                "message_id": self.messages, "text": text}}).encode())
         if url.path.endswith("/getFile"):
             self.get_file_calls += 1
             file_id = parse_qs(body.decode()).get("file_id", [""])[0]
@@ -480,7 +492,7 @@ def test_nvmt_package_validation_merge_and_asgi_download(tmp_path, monkeypatch):
         assert first.status == 201, first.read()
         second = put({0: (0, replacement), 1: (5_000, b)})
         assert second.status == 201, second.read()
-        assert tg.messages == 2
+        assert sum(c.startswith("openseek:nvmt:v1:") for c in tg.captions) == 2
 
         url = f"https://pool.test/v1/pool/{fp}/nvmt?profile=nvmt-v1-g5"
         got = api(url, None, {"Authorization": f"Bearer {READ_KEY}"}, 2)
@@ -702,7 +714,7 @@ def test_cold_g10_sparse_request_fetches_tile_documents_not_merged_package(tmp_p
                    f"&pts_ms={pts_ms}&duration_ms={duration_ms}&n_tiles=4")
             uploaded = api(url, data, {"Authorization": f"Bearer {WRITE_KEY}",
                                       "Content-Type": "image/jpeg"}, 2)
-            assert uploaded.status == 201
+            assert uploaded.status in (200, 201)
         with core.pool._package_cache.lock:
             core.pool._package_cache.items.clear()
             core.pool._package_cache.bytes = 0
@@ -751,7 +763,7 @@ def test_sparse_request_falls_back_to_the_merged_package_on_bad_tile_rows(tmp_pa
         assert core.pool.upload_package(fp, "nvmt-v1-g10", duration_ms,
                                         nvmt_package(grid, duration_ms, tiles))["stored"]
         # A stale tile row (wrong sha) must not hard-fail the sparse route.
-        core.db.x("INSERT INTO pool_tiles VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        core.db.x("INSERT OR REPLACE INTO pool_tiles VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                   (fp, PROFILE, 0, 0, duration_ms, 4, 99, "f" * 64, "fake-blob", 201, time.time()))
         with core.pool._package_cache.lock:
             core.pool._package_cache.items.clear()
@@ -796,9 +808,9 @@ def test_admin_pool_purge_is_dry_run_by_default_and_sweeps_orphans(tmp_path):
         stale_tile_fp = hashlib.sha256(b"stale tile").hexdigest()
         live_tile_fp = hashlib.sha256(b"live tile").hexdigest()
         stale_package_fp = hashlib.sha256(b"stale package").hexdigest()
-        core.db.x("INSERT INTO pool_tiles VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        core.db.x("INSERT OR REPLACE INTO pool_tiles VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                   (stale_tile_fp, PROFILE, 0, 0, 10_000, 1, 100, "0" * 64, "missing-tile", 101, now))
-        core.db.x("INSERT INTO pool_tiles VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        core.db.x("INSERT OR REPLACE INTO pool_tiles VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                   (live_tile_fp, PROFILE, 0, 0, 10_000, 1, len(live_tile),
                    hashlib.sha256(live_tile).hexdigest(), "live-tile", 102, now))
         core.db.x("INSERT INTO pool_packages VALUES(?,?,?,?,?,?,?,?,?,?)",
@@ -1086,3 +1098,41 @@ def test_pool_device_offset_and_rejection_isolation(tmp_path, monkeypatch):
         assert c1_no_off["b_ms"] == 0
     finally:
         core.stop()
+
+
+def test_host_upload_publishes_tile_documents_and_hints_for_the_shared_pool(tmp_path, monkeypatch):
+    tg = FakeTelegramBotAPI()
+
+    class NoSourceProxy:
+        def stop(self):
+            pass
+
+    async def inline_to_thread(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(app_module.asyncio, "to_thread", inline_to_thread)
+    core = Core(Settings(data_dir=tmp_path / "host-shared", pool_enabled=True,
+                         pool_read_key=READ_KEY, pool_write_key=WRITE_KEY,
+                         telegram_bot_token="123456:test", telegram_channel_id="-100123"),
+                pool_storage=TelegramBotStore("123456:test", "-100123", opener=tg.urlopen),
+                proxy=NoSourceProxy())
+    fp = hashlib.sha256(b"host shared publish").hexdigest()
+    duration_ms, grid = 20_000, 10_000
+    tiles = {k: (k * grid, jpeg((10 + k, 20 + k, 30 + k))) for k in range(2)}
+    try:
+        result = core.pool.upload_package(fp, "nvmt-v1-g10", duration_ms,
+                                          nvmt_package(grid, duration_ms, tiles),
+                                          imdb="tt1234567", season=1, episode=2,
+                                          size_bytes=1234, filename="Shared.S01E02.mkv")
+        assert result["stored"] is True
+        tile_captions = [c for c in tg.captions if c.startswith(f"openseek:v1:{fp}:{PROFILE}:")]
+        assert len(tile_captions) == 2
+        hints = [c for c in tg.captions if c.startswith("openseek:hints:v1:")]
+        assert len(hints) == 1
+        raw = hints[0].split("openseek:hints:v1:", 1)[1]
+        manifest = json.loads(base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)))
+        assert manifest["fp"] == fp and manifest["n_tiles"] == 2 and manifest["grid"] == grid
+        assert manifest["imdb"] == "tt1234567" and manifest["created"] > 0
+    finally:
+        core.stop()
+
