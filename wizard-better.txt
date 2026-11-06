@@ -393,3 +393,18 @@ two paths produce the same table set. Any future drift fails the suite.
 
 **Status:** fixed.
 
+
+---
+
+## 18. 2026-11-07 - The host package was stored twice in the same channel
+
+**What I tried:** after making host uploads publish the shared tile format, I counted what one upload leaves in the channel.
+
+**What happened:** three tile documents, one hints manifest, and one whole-package document. That last document is read only by the host node itself, from its local database. Every channel-mode node ignores it, so it was storage with no reader.
+
+**Why it hurts:** the same bytes cost twice, and the two shapes can drift when a host replaces a package: tiles are immutable, the package document is not.
+
+**Wizard fix:** the host now keeps its own package on local disk under the data directory and publishes only tiles plus hints to Telegram. Restarting the node still serves the same package (sha256 b0eb6a7d...). The channel holds no package document for new uploads.
+
+**Status:** fixed.
+

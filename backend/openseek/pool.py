@@ -13,6 +13,7 @@ import io
 import json
 import logging
 import math
+import os
 import re
 import secrets
 import socket
@@ -479,6 +480,8 @@ class PoolService:
         self.read_key, self.write_key = read_key, write_key
         self._lock = threading.RLock()
         self._package_cache = _PackageCache()
+        self.package_dir = Path(self.db.path).parent / "packages"
+        self.package_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
 
     def authorize(self, given: str | None, write: bool = False) -> bool:
         if not given:
@@ -515,6 +518,29 @@ class PoolService:
                       (fp, profile, k, pts_ms, duration_ms, n_tiles, len(data), digest, file_id, message_id, time.time()))
         return {"stored": True, "duplicate": False, "sha256": digest}
 
+
+    def _read_package(self, file_id: str) -> bytes:
+        if str(file_id).startswith("file:"):
+            try:
+                return (self.package_dir / str(file_id).split(":", 1)[1]).read_bytes()
+            except OSError as exc:
+                raise PoolError(502, "stored_package_corrupt") from exc
+        try:
+            return self.storage.get_document(file_id)
+        except AttributeError:
+            return self.storage.get(file_id, MAX_NVMT_BYTES)
+
+    def _store_package_file(self, fp: str, profile: str, data: bytes) -> tuple[str, int]:
+        """Keep the host's own package on local disk, never as a second Telegram copy."""
+        path = self.package_dir / f"{fp}.{profile}.nvmt"
+        tmp = path.with_suffix(".tmp")
+        try:
+            tmp.write_bytes(data)
+            os.chmod(tmp, 0o600)
+            tmp.replace(path)
+        except OSError as exc:
+            raise PoolError(503, "package_storage_unavailable") from exc
+        return f"file:{path.name}", 0
 
     def _publish_shared_tiles(self, fp: str, profile: str, duration_ms: int,
                               tiles: dict[int, tuple[int, bytes]], hints: dict, grid: int) -> None:
@@ -599,10 +625,7 @@ class PoolService:
         cache_key = (fp, profile, digest)
         data = self._package_cache.get(cache_key)
         if data is None:
-            try:
-                data = self.storage.get_document(file_id)
-            except AttributeError:
-                data = self.storage.get(file_id, MAX_NVMT_BYTES)
+            data = self._read_package(file_id)
             if len(data) != size or hashlib.sha256(data).hexdigest() != digest:
                 raise PoolError(502, "stored_package_corrupt")
             _grid, got_slots, tiles = decode_nvmt(fp, profile, duration_ms, data)
@@ -801,10 +824,7 @@ class PoolService:
                 old_duration, old_slots, old_count, old_size, old_digest, old_file, old_message = previous
                 if old_duration != duration_ms or old_slots != n_slots:
                     raise PoolError(409, "media_metadata_conflict", duration_ms=int(old_duration))
-                try:
-                    old_data = self.storage.get_document(old_file)
-                except AttributeError:
-                    old_data = self.storage.get(old_file, MAX_NVMT_BYTES)
+                old_data = self._read_package(old_file)
                 if len(old_data) != old_size or hashlib.sha256(old_data).hexdigest() != old_digest:
                     raise PoolError(502, "stored_package_corrupt")
                 _old_grid, _old_slots, old_tiles = decode_nvmt(fp, profile, duration_ms, old_data)
@@ -822,16 +842,11 @@ class PoolService:
                                              digest, previous[5], previous[6], episode_key, hints, grid)
                 return {"stored": False, "duplicate": True, "tiles": len(merged), "sha256": digest}
             self._publish_shared_tiles(fp, profile, duration_ms, merged, hints, grid)
-            caption = f"openseek:nvmt:v1:{fp}:{profile}:{digest}"
-            try:
-                file_id, message_id = self.storage.put_document(
-                    package, caption, f"{fp}.{profile}.nvmt", "application/octet-stream")
-            except AttributeError as exc:
-                raise PoolError(503, "package_storage_unavailable") from exc
+            file_id, message_id = self._store_package_file(fp, profile, package)
             self._store_package_metadata(fp, profile, duration_ms, n_slots, len(merged), len(package),
                                          digest, file_id, message_id, episode_key, hints, grid)
             self._package_cache.put((fp, profile, digest), package)
-            if previous:
+            if previous and not str(previous[5] or "").startswith("file:"):
                 try:
                     self.storage.delete_message(previous[6])
                 except (AttributeError, PoolError):

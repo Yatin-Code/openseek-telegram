@@ -492,7 +492,7 @@ def test_nvmt_package_validation_merge_and_asgi_download(tmp_path, monkeypatch):
         assert first.status == 201, first.read()
         second = put({0: (0, replacement), 1: (5_000, b)})
         assert second.status == 201, second.read()
-        assert sum(c.startswith("openseek:nvmt:v1:") for c in tg.captions) == 2
+        assert sum(c.startswith("openseek:nvmt:v1:") for c in tg.captions) == 0
 
         url = f"https://pool.test/v1/pool/{fp}/nvmt?profile=nvmt-v1-g5"
         got = api(url, None, {"Authorization": f"Bearer {READ_KEY}"}, 2)
@@ -773,9 +773,10 @@ def test_sparse_request_falls_back_to_the_merged_package_on_bad_tile_rows(tmp_pa
                      None, {"Authorization": f"Bearer {READ_KEY}"}, 2)
         assert sparse.status == 200
         assert decode_nvmt(fp, "nvmt-v1-g10", duration_ms, sparse.data)[2] == tiles
-        # Fallback path: one failed tile getFile + one merged-package fetch.
-        assert tg.get_file_calls - before_get == 2
-        assert tg.download_calls - before_download == 1
+        # Fallback path: the stale tile costs one failed getFile; the package itself
+        # now comes from the host's local file, not from a second Telegram copy.
+        assert tg.get_file_calls - before_get == 1
+        assert tg.download_calls - before_download == 0
     finally:
         core.stop()
 
