@@ -25,6 +25,9 @@ services:
       # - "8789:8789"
     environment:
       OPENSEEK_DATA_DIR: /data
+      # Inside the container the server must listen on all interfaces or the published
+      # port cannot reach it. The host-side restriction is the ports mapping below.
+      OPENSEEK_HOST: "0.0.0.0"
       OPENSEEK_PUBLISHED_ON: "${OPENSEEK_LAN_IP:-127.0.0.1}"
       # OPENSEEK_PUBLIC_PORT: "8789"
       # OPENSEEK_PUBLIC_HOST: "name.example.org:443"

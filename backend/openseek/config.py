@@ -117,7 +117,7 @@ class Settings:
     supabase_url: str = ""
     supabase_service_key: str = ""
     supabase_bucket: str = "openseek-staging"
-    host: str = "0.0.0.0"
+    host: str = "127.0.0.1"                # safe default; channel/host modes widen it
     port: int = 8787
     admin_port: int = 8788                 # always bound to 127.0.0.1 (contract)
     cache_max_bytes: int = 2 * GiB
@@ -314,6 +314,10 @@ class Settings:
                 accepted[key] = val
             kw = {**accepted, **kw}
         s = replace(s, **kw)
+        if "host" not in kw:
+            # Safe default: a local-only node is reachable from this computer only.
+            # A channel or host node exists to serve other devices on the LAN.
+            s = replace(s, host="127.0.0.1" if s.effective_pool_mode == "local" else "0.0.0.0")
         if s.allow_public_clients and env.get("OPENSEEK_ALLOW_PUBLIC_CLIENTS_ACK") != "owner-api-is-public":
             raise ConfigError("OPENSEEK_ALLOW_PUBLIC_CLIENTS=1 turns off the owner API's client-address check. Remote access is what the guest "
                               "listener is for; if you really mean it, also set OPENSEEK_ALLOW_PUBLIC_CLIENTS_ACK=owner-api-is-public")
@@ -345,6 +349,9 @@ class Settings:
     def validate(self) -> None:
         if self.profile not in ("local", "vercel"):
             raise ConfigError("OPENSEEK_PROFILE must be local or vercel")
+        for name, value in (("OPENSEEK_HOST", self.host), ("OPENSEEK_PUBLIC_BIND", self.public_bind)):
+            if not _lan_bind_ok(value):
+                raise ConfigError(f"{name} must be 0.0.0.0, a loopback address or a private LAN address")
         if self.profile == "vercel":
             from .tls import valid_spki_pin
             if self.public_tls_pin and not valid_spki_pin(self.public_tls_pin):

@@ -58,8 +58,9 @@ def test_private_bind_rule(tmp_path, key, val, ok):
     assert getattr(s, key) == (val if ok else default)
 
 
-def test_bind_in_env_is_not_restricted(tmp_path):
-    assert load(tmp_path, {}, {"OPENSEEK_HOST": "8.8.8.8"}).host == "8.8.8.8"
+def test_bind_in_env_is_restricted_too(tmp_path):
+    with pytest.raises(ConfigError, match="OPENSEEK_HOST"):
+        load(tmp_path, {}, {"OPENSEEK_HOST": "8.8.8.8"})
 
 
 @pytest.mark.parametrize("content", [b"", b"not json", b"[1,2]", b"\xff\xfe\x00garbage", b'"str"', b"null", b"{" * 10])
@@ -185,3 +186,28 @@ def test_vercel_profile_accepts_complete_settings():
 def test_local_profile_does_not_require_supabase():
     s = Settings.from_env({"OPENSEEK_PROFILE": "local", "OPENSEEK_SUPABASE_URL": "not-a-url"})
     assert s.profile == "local" and s.supabase_service_key == ""
+
+
+def test_local_only_defaults_to_loopback(tmp_path):
+    s = Settings.from_env({"OPENSEEK_DATA_DIR": str(tmp_path)})
+    assert s.host == "127.0.0.1"
+
+
+def test_channel_node_defaults_to_all_interfaces(tmp_path):
+    s = Settings.from_env({"OPENSEEK_DATA_DIR": str(tmp_path), "OPENSEEK_POOL_MODE": "channel",
+                           "OPENSEEK_TELEGRAM_API_ID": "123",
+                           "OPENSEEK_TELEGRAM_API_HASH": "a" * 32,
+                           "OPENSEEK_TELEGRAM_BOT_TOKEN": "123456:test",
+                           "OPENSEEK_TELEGRAM_CHANNEL_ID": "-100123"})
+    assert s.host == "0.0.0.0"
+
+
+def test_private_lan_bind_is_allowed(tmp_path):
+    s = Settings.from_env({"OPENSEEK_DATA_DIR": str(tmp_path), "OPENSEEK_HOST": "10.1.2.3"})
+    assert s.host == "10.1.2.3"
+
+
+def test_public_bind_address_is_refused_with_a_readable_error(tmp_path):
+    with pytest.raises(ConfigError, match="OPENSEEK_HOST"):
+        Settings.from_env({"OPENSEEK_DATA_DIR": str(tmp_path), "OPENSEEK_HOST": "203.0.113.10"})
+
