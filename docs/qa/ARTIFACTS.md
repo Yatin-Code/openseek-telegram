@@ -27,6 +27,24 @@ Rules:
 | Retired | broadcast channel -1003859844064, replaced by the supergroup above |
 | Extra | organisation "openseek-qa" (knmqhdqymbsmzebmebhv), created while diagnosing a 403; deletable |
 
+## Epic G mode 3 — host-mode node (G4)
+
+Running on the operator machine since 2026-11-07, separate env/data dir/ports so it coexists with the
+channel-mode deployment (which holds 8787/8788). Left running as the G4 daemon.
+
+| Artefact | Value |
+|---|---|
+| Wizard env file | /tmp/qa-g4/openseek.env (mode 0600, written by `.venv/bin/python -m openseek setup` choice 1) |
+| Data dir | /tmp/qa-g4/data (OPENSEEK_DATA_DIR, mode 0700) |
+| Base URL (LAN) | https://10.228.84.160:18787 (dedicated ports; the channel-mode deployment keeps 8787) |
+| Loopback admin | http://127.0.0.1:18788 |
+| TLS pin | sha256//LYLra4F2qPlvXTD98qkEPB6GvKKu7zHSGg3oavEI8Vg= (self-signed cert, CN=openseek) |
+| Read key | qa.env: OPENSEEK_G4_READ_KEY (also inside the wizard env file) |
+| Write key | qa.env: OPENSEEK_G4_WRITE_KEY (also inside the wizard env file) |
+| Pool channel | the shared supergroup from G2, -1004391668814; pool bot @openseeekbot |
+| Published package | fp 413bb6ee018f2dcc751ecd26ae3f3a50469dc76b486fba74f448b567ed6e3d3d, nvmt-v1-g10, 21121 bytes, Telegram message 11 |
+| Working evidence | /tmp/qa-g4/{report.json, telegram_receipt.json, serve.log, openapi.json} |
+
 ## Published QA package
 
 | Field | Value |
