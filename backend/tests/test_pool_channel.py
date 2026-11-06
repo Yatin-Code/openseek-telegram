@@ -1321,3 +1321,53 @@ def test_user_identity_still_refuses_to_start_when_history_is_unreadable(tmp_pat
             store.start()
     finally:
         store.close()
+
+
+def test_bot_node_starts_without_scanning_channel_history(tmp_path):
+    from openseek.app import Core
+
+    settings = Settings(data_dir=tmp_path / "bot-boot", pool_mode="channel",
+                        telegram_api_id=123, telegram_api_hash="a" * 32,
+                        telegram_bot_token="123456:test", telegram_channel_id="-100123")
+    core = Core(settings)
+
+    class FakeStore:
+        history_readable = False
+
+        def __init__(self):
+            self.started = False
+
+        def start(self):
+            self.started = True
+
+        def close(self):
+            pass
+
+    class FakeIndex:
+        def __init__(self):
+            self.calls = []
+
+        def status(self):
+            return {"scanned_at": 0}
+
+        def rebuild(self):
+            self.calls.append("rebuild")
+
+        def refresh(self, force=False):
+            self.calls.append("refresh")
+
+        def start(self):
+            self.calls.append("start")
+
+        def stop(self):
+            self.calls.append("stop")
+
+    store, index = FakeStore(), FakeIndex()
+    core.channel_store, core.channel_index = store, index
+    try:
+        core.start()
+        assert store.started is True
+        assert index.calls == []
+    finally:
+        core.stop()
+

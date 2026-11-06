@@ -191,12 +191,19 @@ class Core:
         self.proxy.start()
         if self.channel_store:
             self.channel_store.start()
-            state = self.channel_index.status()
-            if not state["scanned_at"]:
-                self.channel_index.rebuild()
+            if getattr(self.channel_store, "history_readable", True):
+                state = self.channel_index.status()
+                if not state["scanned_at"]:
+                    self.channel_index.rebuild()
+                else:
+                    self.channel_index.refresh(force=True)
+                self.channel_index.start()
             else:
-                self.channel_index.refresh(force=True)
-            self.channel_index.start()
+                # A bot identity cannot read channel history. The librarian writes and
+                # records what it posts; a channel scan can never succeed, so do not
+                # start one and do not fail the boot.
+                log.warning("channel history not readable (bot identity); "
+                            "starting without a channel scan")
         if self.pool_sync:
             self.pool_sync.start()
         self.jobs.start()
