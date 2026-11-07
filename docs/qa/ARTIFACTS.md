@@ -29,21 +29,25 @@ Rules:
 
 ## Epic G mode 3 — host-mode node (G4)
 
-Running on the operator machine since 2026-11-07, separate env/data dir/ports so it coexists with the
-channel-mode deployment (which holds 8787/8788). Left running as the G4 daemon.
+Running on the operator machine since 2026-11-07 (redeployed the same day after a host reboot wiped
+/tmp and destroyed the first deployment; rebuilt by hand from the runbook steps), separate env/data
+dir/ports so it coexists with the channel-mode deployment (which holds 8787/8788). Left running as
+the G4 daemon.
 
 | Artefact | Value |
 |---|---|
-| Wizard env file | /tmp/qa-g4/openseek.env (mode 0600, written by `.venv/bin/python -m openseek setup` choice 1) |
-| Data dir | /tmp/qa-g4/data (OPENSEEK_DATA_DIR, mode 0700) |
+| Env file | /tmp/qa-g4/openseek.env (mode 0600, recreated by hand from documented settings; host pool mode, ports 18787/18788) |
+| Data dir | /tmp/qa-g4/data (OPENSEEK_DATA_DIR, mode 0700; recreated with the redeploy) |
 | Base URL (LAN) | https://10.228.84.160:18787 (dedicated ports; the channel-mode deployment keeps 8787) |
 | Loopback admin | http://127.0.0.1:18788 |
-| TLS pin | sha256//LYLra4F2qPlvXTD98qkEPB6GvKKu7zHSGg3oavEI8Vg= (self-signed cert, CN=openseek) |
-| Read key | qa.env: OPENSEEK_G4_READ_KEY (also inside the wizard env file) |
-| Write key | qa.env: OPENSEEK_G4_WRITE_KEY (also inside the wizard env file) |
+| Admin token | qa.env: OPENSEEK_G4_ADMIN_KEY (recreated with the redeploy) |
+| TLS pin | sha256//thP//5QeO5imSIfpTl5TUC/WRRCZFNWiimHgvyVd7xk= (self-signed cert, CN=openseek; new cert with the redeploy) |
+| Read key | qa.env: OPENSEEK_G4_READ_KEY (same value as the first deployment, also inside the env file) |
+| Write key | qa.env: OPENSEEK_G4_WRITE_KEY (same value as the first deployment, also inside the env file) |
 | Pool channel | the shared supergroup from G2, -1004391668814; pool bot @openseeekbot |
-| Published package | fp 413bb6ee018f2dcc751ecd26ae3f3a50469dc76b486fba74f448b567ed6e3d3d, nvmt-v1-g10, 21121 bytes, Telegram message 11 |
-| Working evidence | /tmp/qa-g4/{report.json, telegram_receipt.json, serve.log, openapi.json} |
+| Published package | fp c379a695d15c7874a4709789916423960f1332d255d1df32b802a4e00270808a, nvmt-v1-g10, 26079 bytes, 3 slots, sha256 48beee159223146909bc8978e71d73c5dc3a829fbd81c459ea0ce45b97d43f02 (real ffmpeg frames; hints registered) |
+| Working evidence | /tmp/qa-g4/{serve.log, src/} |
+| First deployment | wiped 2026-11-07 by a host reboot (old pin sha256//LYLra4F2…, package fp 413bb6ee…, Telegram message 11); the old pin/fp rows are replaced by the values above |
 
 ## Published QA package
 
@@ -90,10 +94,10 @@ channel-mode deployment (which holds 8787/8788). Left running as the G4 daemon.
 | Base URL | https://127.0.0.1:18787 (loopback, self-signed) |
 | Admin listener | http://127.0.0.1:18788 |
 | Data directory | /tmp/qa-g4/data |
-| Configuration | /tmp/qa-g4/openseek.env (mode 0600, written by the setup wizard) |
+| Configuration | /tmp/qa-g4/openseek.env (mode 0600; rebuilt by hand from the documented settings after the 2026-11-07 /tmp wipe) |
 | Keys | in that file: OPENSEEK_POOL_READ_KEY, OPENSEEK_POOL_WRITE_KEY |
-| Package | fp 413bb6ee…, 21121 bytes, sha256 b0eb6a7d…f33d0 |
-| Package storage | local file under <data>/packages, one file per fp and profile |
+| Package | fp c379a695…, 26079 bytes, 3 slots, sha256 48beee15…f43f02 (redeploy 2026-11-07) |
+| Package storage | local file under <data>/packages, one file per fp and profile (c379a695….nvmt-v1-g10.nvmt on disk) |
 | Channel | tiles and hints only; the two pre-refactor package documents (messages 11, 16) were removed |
 | Note | the node was started at 01:21 by an earlier session; this run verified it independently |
 
