@@ -1,7 +1,5 @@
 # OpenSeek
 
-<p align="center"><img src="docs/images/banner.png" alt="OpenSeek thumbnail sharing" width="100%"></p>
-
 **OpenSeek lets Nuvio-compatible clients reuse preview thumbnails through a community-run pool.** Each TV still generates thumbnails locally. When a user opts in, the finished NVMT package can be shared so another client reuses it instead of decoding the same media again.
 
 There is **no central OpenSeek API and no project-paid hosting**: each participant runs their own node on their own Vercel + Supabase account (or a local/VPS server), and Telegram is the durable shared store. Every node keeps a rebuildable index. Free tiers are enough for a small pool; a node may pause or queue work when a quota runs out, and OpenSeek never silently upgrades a plan.
