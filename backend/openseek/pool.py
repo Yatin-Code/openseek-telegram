@@ -77,6 +77,31 @@ def validate_pool_hints(imdb: str | None, season: int, episode: int, duration_ms
             "size_bytes": size_bytes, "filename_norm": filename_norm}
 
 
+def _merge_absent_hint_fields(hints: dict, previous: tuple | None) -> dict:
+    """Preserve existing optional hints when a duplicate upload omits them.
+
+    The tuple matches ``store.get_hints``: imdb, season, episode, duration_ms,
+    size_bytes, filename_norm, n_tiles, grid. On an upload, NULL values and
+    season/episode zero are absence markers; a first upload still stores those
+    defaults as-is.
+    """
+    merged = dict(hints)
+    if previous is None:
+        return merged
+    old_imdb, old_season, old_episode, _duration_ms, old_size, old_filename, *_ = previous
+    if merged["imdb"] is None:
+        merged["imdb"] = old_imdb
+    if merged["season"] == 0:
+        merged["season"] = old_season
+    if merged["episode"] == 0:
+        merged["episode"] = old_episode
+    if merged["size_bytes"] is None:
+        merged["size_bytes"] = old_size
+    if merged["filename_norm"] is None:
+        merged["filename_norm"] = old_filename
+    return merged
+
+
 def _timing_relation(target_ms: int, source_ms: int) -> tuple[str, int, int] | None:
     delta = abs(target_ms - source_ms)
     if delta > max(90_000, int(target_ms * 0.15)):
@@ -819,6 +844,11 @@ class PoolService:
             rows = self.db.q("SELECT duration_ms,n_slots,n_tiles,size,sha256,file_id,message_id "
                              "FROM pool_packages WHERE fp=? AND profile=?", (fp, profile))
             previous = rows[0] if rows else None
+            if previous:
+                old_hint_rows = self.db.q(
+                    "SELECT imdb,season,episode,duration_ms,size_bytes,filename_norm,n_tiles,grid "
+                    "FROM pool_hints WHERE fp=? AND profile=?", (fp, profile))
+                hints = _merge_absent_hint_fields(hints, tuple(old_hint_rows[0]) if old_hint_rows else None)
             merged = dict(incoming)
             if previous:
                 old_duration, old_slots, old_count, old_size, old_digest, old_file, old_message = previous
@@ -856,7 +886,12 @@ class PoolService:
     def _store_package_metadata(self, fp: str, profile: str, duration_ms: int, n_slots: int, n_tiles: int,
                                 size: int, digest: str, file_id: str, message_id: int,
                                 episode_key: str | None, hints: dict, grid: int) -> None:
-        """Commit the exact-package row and its optional lookup rows atomically."""
+        """Commit the exact-package row and its optional lookup rows atomically.
+
+        On a duplicate package, hint columns are preserved when the upload arrives
+        without them (NULL imdb/size/filename, 0 season/episode): an absent hint must
+        never erase a stored hint (issue #68 decision). A present hint still updates.
+        """
         now = time.time()
         with self.db._lock:
             self.db.conn.execute("BEGIN IMMEDIATE")
@@ -876,9 +911,13 @@ class PoolService:
                 self.db.conn.execute(
                     "INSERT INTO pool_hints(fp,profile,imdb,season,episode,duration_ms,size_bytes,filename_norm,n_tiles,grid,created) "
                     "VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(fp,profile) DO UPDATE SET "
-                    "imdb=excluded.imdb,season=excluded.season,episode=excluded.episode,duration_ms=excluded.duration_ms,"
-                    "size_bytes=excluded.size_bytes,filename_norm=excluded.filename_norm,n_tiles=excluded.n_tiles,"
-                    "grid=excluded.grid,created=excluded.created",
+                    "imdb=CASE WHEN excluded.imdb IS NOT NULL THEN excluded.imdb ELSE pool_hints.imdb END,"
+                    "season=CASE WHEN excluded.season!=0 THEN excluded.season ELSE pool_hints.season END,"
+                    "episode=CASE WHEN excluded.episode!=0 THEN excluded.episode ELSE pool_hints.episode END,"
+                    "duration_ms=excluded.duration_ms,"
+                    "size_bytes=CASE WHEN excluded.size_bytes IS NOT NULL THEN excluded.size_bytes ELSE pool_hints.size_bytes END,"
+                    "filename_norm=CASE WHEN excluded.filename_norm IS NOT NULL THEN excluded.filename_norm ELSE pool_hints.filename_norm END,"
+                    "n_tiles=excluded.n_tiles,grid=excluded.grid,created=excluded.created",
                     (fp, profile, hints["imdb"], hints["season"], hints["episode"], duration_ms,
                      hints["size_bytes"], hints["filename_norm"], n_tiles, grid, now))
                 self.db.conn.execute("COMMIT")

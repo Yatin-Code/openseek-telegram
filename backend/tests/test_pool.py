@@ -601,6 +601,93 @@ def test_nvmt_hints_upload_and_ranked_candidate_route(tmp_path, monkeypatch):
         core.stop()
 
 
+def test_duplicate_nvmt_upload_with_absent_hints_keeps_stored_hints(tmp_path, monkeypatch):
+    """Omitted hints on a duplicate PUT mean 'leave unchanged' (issue #68 owner decision);
+    supplied hints still update, and a first upload stores absent hints as absent. Erasing
+    stored hints would remove the package from hint-based candidate lookup entirely."""
+    tg = FakeTelegramBotAPI()
+
+    class NoSourceProxy:
+        def stop(self):
+            pass
+
+    async def inline_to_thread(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(app_module.asyncio, "to_thread", inline_to_thread)
+    storage = TelegramBotStore("123456:test", "-100123", opener=tg.urlopen)
+    core = Core(Settings(data_dir=tmp_path / "pool-hints-preserve", pool_enabled=True,
+                         pool_read_key=READ_KEY, pool_write_key=WRITE_KEY,
+                         telegram_bot_token="123456:test", telegram_channel_id="-100123"),
+                pool_storage=storage, proxy=NoSourceProxy())
+    api = ASGIPoolAPI(create_api_app(core))
+    fp = hashlib.sha256(b"hint preserve film").hexdigest()
+    image = jpeg()
+    headers = {"Authorization": f"Bearer {WRITE_KEY}", "Content-Type": "application/vnd.openseek.nvmt"}
+    try:
+        first = api(
+            f"https://pool.test/v1/pool/{fp}/nvmt?profile=nvmt-v1-g5&duration_ms=20000"
+            "&imdb=tt1234567&season=2&episode=5&size_bytes=1000000&filename=Film.Name.2024.1080p.mkv",
+            nvmt_package(5_000, 20_000, {0: (0, image)}), headers, 2)
+        assert first.status == 201, first.read()
+
+        def stored():
+            return core.db.q("SELECT imdb,season,episode,size_bytes,filename_norm FROM pool_hints "
+                             "WHERE fp=? AND profile='nvmt-v1-g5'", (fp,))[0]
+
+        assert stored() == ("tt1234567", 2, 5, 1000000, "film.name.2024.1080p")
+
+        # a retry from an older client arrives without any hints: nothing is erased
+        retry = api(
+            f"https://pool.test/v1/pool/{fp}/nvmt?profile=nvmt-v1-g5&duration_ms=20000",
+            nvmt_package(5_000, 20_000, {0: (0, image)}), headers, 2)
+        assert retry.status == 200, retry.read()
+        assert stored() == ("tt1234567", 2, 5, 1000000, "film.name.2024.1080p")
+
+        # hint-based candidate lookup still finds the package after the hint-less retry
+        found = api("https://pool.test/v1/pool/candidates?imdb=tt1234567&season=2&episode=5"
+                    "&duration_ms=20000", None, {"Authorization": f"Bearer {READ_KEY}"}, 2)
+        assert [candidate["fp"] for candidate in json.loads(found.data)["candidates"]] == [fp]
+
+        # a coverage-extension retry (new slot, no hints) changes the digest, so the
+        # package is re-published to the shared channel: the published manifest must
+        # keep the stored hints too, not only the local row (the seam a DB-level
+        # guard cannot see)
+        extended = api(
+            f"https://pool.test/v1/pool/{fp}/nvmt?profile=nvmt-v1-g5&duration_ms=20000",
+            nvmt_package(5_000, 20_000, {0: (0, image), 1: (10_000, image)}), headers, 2)
+        assert extended.status == 201, extended.read()
+        assert stored() == ("tt1234567", 2, 5, 1000000, "film.name.2024.1080p")
+        manifests = [c for c in tg.captions if c.startswith("openseek:hints:v1:")]
+        assert manifests
+        payload_b64 = manifests[-1].split(":", 3)[3]
+        payload = json.loads(base64.urlsafe_b64decode(
+            payload_b64 + "=" * (-len(payload_b64) % 4)))
+        assert payload["imdb"] == "tt1234567" and payload["season"] == 2 and payload["episode"] == 5
+        assert payload["size_bytes"] == 1000000 and payload["filename_norm"] == "film.name.2024.1080p"
+
+        # supplied hints still update, while absent companions preserve their stored values
+        corrected = api(
+            f"https://pool.test/v1/pool/{fp}/nvmt?profile=nvmt-v1-g5&duration_ms=20000&imdb=tt7654321",
+            nvmt_package(5_000, 20_000, {0: (0, image)}), headers, 2)
+        assert corrected.status == 200, corrected.read()
+        imdb, season, episode, size_bytes, filename = stored()
+        assert imdb == "tt7654321" and season == 2 and episode == 5
+        assert size_bytes == 1000000 and filename == "film.name.2024.1080p"
+
+        # a first upload without hints simply has absent hints (never a fabricated value)
+        fresh = "b" * 64
+        bare = api(
+            f"https://pool.test/v1/pool/{fresh}/nvmt?profile=nvmt-v1-g5&duration_ms=20000",
+            nvmt_package(5_000, 20_000, {0: (0, image)}), headers, 2)
+        assert bare.status == 201, bare.read()
+        row = core.db.q("SELECT imdb,season,episode,size_bytes,filename_norm FROM pool_hints "
+                        "WHERE fp=? AND profile='nvmt-v1-g5'", (fresh,))[0]
+        assert row == (None, 0, 0, None, None)
+    finally:
+        core.stop()
+
+
 def test_episode_variant_index_and_sparse_sample_routes(tmp_path, monkeypatch):
     """Different encodes can be discovered by episode key and sampled before full reuse."""
     tg = FakeTelegramBotAPI()
