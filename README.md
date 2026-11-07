@@ -4,7 +4,7 @@
 
 There is **no central OpenSeek API and no project-paid hosting**: each participant runs their own node on their own Vercel + Supabase account (or a local/VPS server), and Telegram is the durable shared store. Every node keeps a rebuildable index. Free tiers are enough for a small pool; a node may pause or queue work when a quota runs out, and OpenSeek never silently upgrades a plan.
 
-OpenSeek never receives or stores video files, playback URLs, or source headers. The shared format is **NVMT**: a bounded package of generated JPEG preview tiles and timing metadata.
+OpenSeek-Telegram never receives or stores video files, playback URLs, or source headers. The shared format is **NVMT**: a bounded package of generated JPEG preview tiles and timing metadata.
 
 ---
 
