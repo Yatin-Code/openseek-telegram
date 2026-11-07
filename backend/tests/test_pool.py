@@ -358,8 +358,8 @@ def test_two_instances_through_real_asgi_pool_routes(tmp_path, monkeypatch):
         assert manifest_response.status == 200
         manifest = json.loads(manifest_response.read())
         assert [tile["k"] for tile in manifest["tiles"]] == [2]
-        forbidden = api(manifest_url, None, {"Authorization": "Bearer wrong"}, 2)
-        assert forbidden.status == 403
+        malformed = api(manifest_url, None, {"Authorization": "Bearer wrong"}, 2)
+        assert malformed.status == 400 and json.loads(malformed.data)["error"] == "bad_auth"
         assert "video" not in json.dumps(manifest).lower()
     finally:
         sync.stop()
@@ -412,13 +412,15 @@ def test_write_key_also_reads_and_read_key_cannot_write(tmp_path, monkeypatch):
         assert tile_denied.status == 403
         assert json.loads(tile_denied.data)["error"] == "forbidden"
 
-        # No key: refused before the body or content type is ever parsed.
+        # No key: refused before the body or content type is ever parsed (H6: missing
+        # credential is 401 unauthorized, distinct from malformed and revoked).
         no_key = api(url, b"junk-body-not-nvmt",
                      {"Authorization": "", "Content-Type": "text/plain"}, 2)
-        assert no_key.status in (401, 403)
-        assert json.loads(no_key.data)["error"] == "forbidden"
+        assert no_key.status == 401
+        assert json.loads(no_key.data)["error"] == "unauthorized"
         no_key_manifest = api(f"https://pool.test/v1/pool/{fp}/manifest", None, {}, 2)
-        assert no_key_manifest.status == 403
+        assert no_key_manifest.status == 401
+        assert json.loads(no_key_manifest.data)["error"] == "unauthorized"
     finally:
         core.stop()
 

@@ -15,6 +15,11 @@ from .ids import new_device_id
 _TOKEN = re.compile(r"[A-Za-z0-9_-]{43}")
 
 
+def token_shaped(token: str) -> bool:
+    """True when a bearer credential has the paired-device token format."""
+    return bool(_TOKEN.fullmatch(token))
+
+
 class DeviceAuth:
     """Bearer token -> device_id. Only SHA-256(token) is stored; comparisons are constant-time
     over every registered hash."""
@@ -72,6 +77,12 @@ class DeviceAuth:
                 if hmac.compare_digest(stored, h):
                     found = device_id
         return found if self.role_of(found) is not None else None          # an expired guest is no device at all
+
+    def is_revoked_token(self, token: str) -> bool:
+        """True when this well-formed token was revoked (tombstoned), as opposed to never valid."""
+        h = hashlib.sha256(token.encode()).hexdigest()
+        check = getattr(self.store, "is_token_revoked", None)
+        return bool(check(h)) if check is not None else False
 
     def devices(self) -> list[dict]:
         return self.store.devices()

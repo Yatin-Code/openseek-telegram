@@ -201,6 +201,14 @@ create table if not exists public.pool_devices (
 create index if not exists pool_devices_role_expires on public.pool_devices (role, expires);
 alter table public.pool_devices enable row level security;
 
+-- Revoked device tokens are tombstoned so "revoked" stays distinguishable
+-- from "never valid" after the device row is deleted.
+create table if not exists public.pool_revoked_tokens (
+  token_hash text primary key,
+  revoked double precision not null
+);
+alter table public.pool_revoked_tokens enable row level security;
+
 create table if not exists public.pool_invites (
   pair_id text primary key,
   label text not null default '',

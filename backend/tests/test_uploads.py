@@ -454,7 +454,8 @@ def test_create_requires_pool_write_credentials(tmp_path):
     fp = hashlib.sha256(b"no credentials").hexdigest()
     try:
         response = call(env, "POST", "/v1/pool/uploads", body=upload_body(fp), token=None)
-        assert response.status_code == 403
+        assert response.status_code == 401
+        assert response.json() == {"error": "unauthorized"}
         assert env.fake.rows("pool_uploads") == []
     finally:
         env.core.stop()
@@ -776,7 +777,8 @@ def test_status_requires_the_creating_device_or_a_write_key(tmp_path):
     created = create_upload(env)
     try:
         anonymous = call(env, "GET", f"/v1/pool/uploads/{created['upload_id']}", token=None)
-        assert anonymous.status_code == 403
+        assert anonymous.status_code == 401
+        assert anonymous.json() == {"error": "unauthorized"}
         by_key = call(env, "GET", f"/v1/pool/uploads/{created['upload_id']}")
         assert by_key.status_code == 200
     finally:
@@ -810,7 +812,8 @@ def test_vercel_pool_accepts_public_clients_but_keeps_pool_key_auth(tmp_path):
         denied = call(env, "POST", "/v1/pool/uploads",
                       body=upload_body(hashlib.sha256(b"no key").hexdigest()),
                       token=None, client_addr=external)
-        assert denied.status_code == 403
+        assert denied.status_code == 401
+        assert denied.json() == {"error": "unauthorized"}
     finally:
         env.core.stop()
 

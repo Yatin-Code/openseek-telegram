@@ -15,6 +15,10 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS devices (
   device_id TEXT PRIMARY KEY, name TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE,
   created REAL NOT NULL, last_seen REAL NOT NULL);
+-- Revoked device tokens are tombstoned so the API can answer "revoked"
+-- distinctly from "never valid" after the device row is deleted.
+CREATE TABLE IF NOT EXISTS revoked_tokens (
+  token_hash TEXT PRIMARY KEY, revoked REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS entries (
   fp TEXT PRIMARY KEY, duration_ms INTEGER, n_tiles INTEGER, version INTEGER NOT NULL DEFAULT 0,
   bytes INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL, last_used REAL NOT NULL);
@@ -324,7 +328,18 @@ class DB:
         return self.x("DELETE FROM invites WHERE expires<?", (older_than,))
 
     def remove_device(self, device_id: str) -> bool:
-        return self.x("DELETE FROM devices WHERE device_id=?", (device_id,)) > 0
+        """Revoke: tombstone the token hash, then delete the row. The tombstone keeps
+        "revoked" distinguishable from "never valid" for the API's refusal codes."""
+        with self._lock:
+            row = self.q("SELECT token_hash FROM devices WHERE device_id=?", (device_id,))
+            if not row:
+                return False
+            self.x("INSERT OR REPLACE INTO revoked_tokens(token_hash,revoked) VALUES(?,?)",
+                   (row[0][0], time.time()))
+            return self.x("DELETE FROM devices WHERE device_id=?", (device_id,)) > 0
+
+    def is_token_revoked(self, token_hash: str) -> bool:
+        return bool(self.q("SELECT 1 FROM revoked_tokens WHERE token_hash=?", (token_hash,)))
 
     def touch_device(self, device_id: str) -> None:
         self.x("UPDATE devices SET last_seen=? WHERE device_id=?", (time.time(), device_id))

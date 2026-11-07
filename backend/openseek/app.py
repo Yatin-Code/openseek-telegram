@@ -27,10 +27,11 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import (BaseModel, ConfigDict, Field, StrictBool, StrictInt,
                       StrictStr, ValidationError)
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.routing import compile_path
 
 from . import API_VERSION, __version__
 from .pairing import InviteManager
-from .auth import DeviceAuth, admin_token
+from .auth import DeviceAuth, admin_token, token_shaped
 from .cache import Cache, PROFILE, secure_mkdir
 from .config import Settings
 from .db import DB
@@ -41,7 +42,7 @@ from .jobs import JobManager
 from .logutil import plain, setup_logging
 from .netpolicy import DestinationPolicy, filter_forwarded_headers
 from .pairing import PairingClosed, PairingFailed, PairingManager, RateLimited
-from .public import PublicLimiter, classify
+from .public import PublicLimiter, classify, host_kind
 from .pool import (MAX_NVMT_BYTES, ChannelPoolClient,
                    ChannelPoolSync, PoolClient, PoolError, PoolService, PoolSync,
                    TelegramBotStore, decode_nvmt)
@@ -279,6 +280,39 @@ async def _send_json(send, status: int, obj: dict, extra: list | None = None) ->
     await send({"type": "http.response.body", "body": body})
 
 
+def _bearer_credential(authorization: str | None) -> tuple[str | None, bool]:
+    """(credential, malformed). No header — or an empty one — is a missing credential,
+    not a malformed one."""
+    if not authorization or not authorization.strip():
+        return None, False
+    scheme, _, rest = authorization.partition(" ")
+    credential = rest.strip()
+    if scheme.lower() != "bearer" or not credential or any(ch.isspace() for ch in credential):
+        return None, True
+    return credential, False
+
+
+def _rate_headers(limit: int, remaining: int, reset: int) -> list[tuple[bytes, bytes]]:
+    return [(b"x-ratelimit-limit", str(limit).encode()),
+            (b"x-ratelimit-remaining", str(remaining).encode()),
+            (b"x-ratelimit-reset", str(reset).encode())]
+
+
+def _with_rate_headers(send, limit: int, remaining: int, reset: int):
+    """Advertise the budget on every response that passed the limiter, including
+    refusals sent directly by the guard (auth, body limit, routing)."""
+    async def wrapped(message):
+        if message["type"] == "http.response.start":
+            headers = list(message.get("headers") or [])
+            names = {k.lower() for k, _ in headers}
+            for name, value in _rate_headers(limit, remaining, reset):
+                if name not in names:
+                    headers.append((name, value))
+            message = dict(message, headers=headers)
+        await send(message)
+    return wrapped
+
+
 class Guard:
     """Pure ASGI middleware: client-IP policy (SR-17), body limit (SR-11), bearer auth (SR-6),
     security headers (SR-19). X-Forwarded-For and friends are never consulted."""
@@ -288,6 +322,18 @@ class Guard:
         self.core = core
         self.admin = admin
         self.public = public
+        # The API app's own route table: with a real credential (or none at all), an
+        # undocumented path answers the documented 404 instead of leaking an auth
+        # answer for a route that does not exist (H6 criterion 1).
+        self._documented = []
+        if not admin and not public:
+            router = getattr(app, "router", None)
+            routes = getattr(router, "routes", None) or getattr(app, "routes", [])
+            for route in routes:
+                path = getattr(route, "path", None)
+                if not path or not getattr(route, "methods", None):
+                    continue          # mounts and other non-endpoint routes do not define the API surface
+                self._documented.append(compile_path(path)[0])
 
     async def _deny(self, send, client, status: int, obj: dict, extra: list | None = None):
         if self.public and client[0]:
@@ -310,30 +356,82 @@ class Guard:
             if kind is None:
                 lim.strike(ip)
                 return await _send_json(send, 404, {"error": "not_found"})
-            if not lim.allow(ip, kind):
-                return await _send_json(send, 429, {"error": "rate_limited"}, [(b"retry-after", b"60")])
+            allowed, limit, remaining, reset = lim.consume(ip, kind)
+            if not allowed:
+                return await _send_json(send, 429, {"error": "rate_limited"},
+                                        _rate_headers(limit, 0, reset) +
+                                        [(b"retry-after", str(reset).encode())])
+            scope["openseek.ratelimit"] = (limit, remaining, reset)
             scope["openseek.public"] = True
             ph = self.core.settings.public_host
             if ph:
                 scope["openseek.base"] = f"https://{ph}"
-        elif self.admin and self.core.settings.profile != "vercel":
-            if not client_ip_allowed(client[0], False) or not ipaddress.ip_address(
-                    (client[0] or "0.0.0.0").split("%")[0]).is_loopback:
+        elif self.admin:
+            if self.core.settings.profile != "vercel":
+                if not client_ip_allowed(client[0], False) or not ipaddress.ip_address(
+                        (client[0] or "0.0.0.0").split("%")[0]).is_loopback:
+                    return await _send_json(send, 403, {"error": "forbidden"})
+        else:
+            if self.core.settings.profile != "vercel" and not client_ip_allowed(
+                    client[0], self.core.settings.allow_public_clients):
                 return await _send_json(send, 403, {"error": "forbidden"})
-        elif self.core.settings.profile != "vercel" and not client_ip_allowed(
-                client[0], self.core.settings.allow_public_clients):
-            return await _send_json(send, 403, {"error": "forbidden"})
+            # Per-client budgets on the owner/LAN listener too (H6): the same classes
+            # and budgets as the public listener, advertised on every response. The
+            # Vercel profile is skipped: there the TCP peer is the platform proxy and
+            # the platform layer fronts the deployment.
+            if self.core.settings.profile != "vercel" and client[0]:
+                kind = host_kind(scope["method"], scope.get("path", ""), guest_route_allowed)
+                allowed, limit, remaining, reset = self.core.public_limiter.consume(client[0], kind)
+                if not allowed:
+                    return await _send_json(send, 429, {"error": "rate_limited"},
+                                            _rate_headers(limit, 0, reset) +
+                                            [(b"retry-after", str(reset).encode())])
+                scope["openseek.ratelimit"] = (limit, remaining, reset)
 
         headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
+        rl = scope.get("openseek.ratelimit")
+        if rl:
+            send = _with_rate_headers(send, *rl)
         # Vercel's platform proxy always adds forwarded headers; refusing them would make the
         # profile unusable. They are never consulted for auth, rate limits, or base URLs. The
         # loopback admin listener keeps the strict local-only rules (F2 owns its surface).
         forwarded_allowed = self.core.settings.profile == "vercel"
         if not self.public and not forwarded_allowed and any(h in headers for h in PROXY_HEADERS):
             return await _send_json(send, 403, {"error": "proxy_refused"})
+
+        path = scope.get("path", "")
+        if self._documented and not any(rx.fullmatch(path) for rx in self._documented):
+            return await _send_json(send, 404, {"error": "not_found"})
+
+        # Authenticate from the headers BEFORE the body is read: a missing, malformed or
+        # revoked credential is refused without touching the body at all (H6, SR-11).
+        is_pool_route = path.startswith("/v1/pool/")
+        device = None
+        role = None
+        if self.admin:
+            bad = self._admin_check(scope, headers)
+            if bad:
+                return await _send_json(send, 403, {"error": bad})
+        else:
+            state = scope.setdefault("state", {})
+            try:
+                device = self.core.auth.authenticate(headers.get("authorization"))
+            except Exception as exc:
+                log.warning("device authentication unavailable (%s)", type(exc).__name__)
+                return await _send_json(send, 503, {"error": "auth_unavailable"})
+            state["device_id"] = device
+            role = self.core.auth.role_of(device)
+            state["role"] = role
+            if await self._credential_refusal(
+                    send, client, scope["method"], path, is_pool_route,
+                    headers.get("authorization"), device):
+                return
+            if self.public and device is not None and role != "guest":
+                return await self._deny(send, client, 403, {"error": "forbidden_role"})     # owner tokens: LAN only
+
         clen = headers.get("content-length")
-        pool_upload = scope.get("path", "").startswith("/v1/pool/") and scope["method"] == "PUT"
-        package_upload = pool_upload and scope.get("path", "").endswith("/nvmt")
+        pool_upload = is_pool_route and scope["method"] == "PUT"
+        package_upload = pool_upload and path.endswith("/nvmt")
         body_limit = MAX_NVMT_BYTES if package_upload else (256 * 1024 if pool_upload else MAX_BODY)
         if clen is not None and (not clen.isdigit() or int(clen) > body_limit):
             return await _send_json(send, 413, {"error": "too_large"})
@@ -357,39 +455,19 @@ class Guard:
                 return {"type": "http.request", "body": body, "more_body": False}
             return await receive()
 
-        if self.admin:
-            bad = self._admin_check(scope, headers)
-            if bad:
-                return await _send_json(send, 403, {"error": bad})
-        else:
-            path = scope.get("path", "")
-            state = scope.setdefault("state", {})
-            try:
-                device = self.core.auth.authenticate(headers.get("authorization"))
-            except Exception as exc:
-                log.warning("device authentication unavailable (%s)", type(exc).__name__)
-                return await _send_json(send, 503, {"error": "auth_unavailable"})
-            state["device_id"] = device
-            is_pool_route = path.startswith("/v1/pool/")
-            if path not in PUBLIC_PATHS and not is_pool_route and device is None:
-                return await self._deny(send, client, 401, {"error": "unauthorized"})
-            role = self.core.auth.role_of(device)
-            state["role"] = role
-            if self.public:
-                if device is not None and role != "guest":
-                    return await self._deny(send, client, 403, {"error": "forbidden_role"})     # owner tokens: LAN only
-                if kind == "pair":
-                    try:
-                        j = json.loads(body or b"{}")
-                    except ValueError:
-                        j = None
-                    if not isinstance(j, dict):
-                        return await _send_json(send, 400, {"error": "bad_request"})
-                    if path.endswith("/start"):
-                        if not isinstance(j.get("invite"), str):                    # the owner's pairing window is never public
-                            return await self._deny(send, client, 409, {"error": "pairing_closed"})
-                    elif not (isinstance(j.get("pair_id"), str) and self.core.invites.knows(j["pair_id"])):
-                        return await self._deny(send, client, 403, {"error": "pairing_failed"})
+        if not self.admin:
+            if self.public and kind == "pair":
+                try:
+                    j = json.loads(body or b"{}")
+                except ValueError:
+                    j = None
+                if not isinstance(j, dict):
+                    return await _send_json(send, 400, {"error": "bad_request"})
+                if path.endswith("/start"):
+                    if not isinstance(j.get("invite"), str):                    # the owner's pairing window is never public
+                        return await self._deny(send, client, 409, {"error": "pairing_closed"})
+                elif not (isinstance(j.get("pair_id"), str) and self.core.invites.knows(j["pair_id"])):
+                    return await self._deny(send, client, 403, {"error": "pairing_failed"})
             if role == "guest" and not is_pool_route:
                 method = scope["method"]
                 if not self.core.sharing_enabled() and not guest_route_allowed(method, path, GUEST_WHEN_SHARING_OFF):
@@ -413,6 +491,57 @@ class Guard:
             await send(message)
 
         await self.app(scope, replay, send_wrapper)
+
+    async def _credential_refusal(self, send, client, method: str, path: str, is_pool_route: bool,
+                                  authorization: str | None, device: str | None) -> bool:
+        """H6: missing, malformed, and revoked credentials are distinct documented refusals,
+        and they arrive before the body is read. Checks a later handler owns (a guest's
+        contribution right, a read key trying to write) still reach that handler."""
+        if is_pool_route:
+            if self.core.pool is None:
+                return False                      # no pool surface: the uniform 404 stays the handler's answer
+            if self.public and method in ("GET", "HEAD"):
+                return False                      # anonymous public reads are part of the public contract
+            if device is not None:
+                return False
+            credential, malformed = _bearer_credential(authorization)
+            if malformed:
+                await self._deny(send, client, 400, {"error": "bad_auth"})
+                return True
+            if credential is None:
+                await self._deny(send, client, 401, {"error": "unauthorized"})
+                return True
+            if self._pool_key(credential):
+                return False                      # a pool key: the handler applies read/write rights
+            if token_shaped(credential):
+                if self.core.auth.is_revoked_token(credential):
+                    await self._deny(send, client, 403, {"error": "revoked_key"})
+                else:
+                    await self._deny(send, client, 403, {"error": "forbidden"})
+                return True
+            await self._deny(send, client, 400, {"error": "bad_auth"})
+            return True
+        if path in PUBLIC_PATHS or device is not None:
+            return False
+        credential, malformed = _bearer_credential(authorization)
+        if malformed:
+            await self._deny(send, client, 400, {"error": "bad_auth"})
+            return True
+        if credential is None:
+            await self._deny(send, client, 401, {"error": "unauthorized"})
+            return True
+        if token_shaped(credential) and self.core.auth.is_revoked_token(credential):
+            await self._deny(send, client, 403, {"error": "revoked_key"})
+            return True
+        await self._deny(send, client, 401, {"error": "unauthorized"})
+        return True
+
+    def _pool_key(self, credential: str) -> bool:
+        settings = self.core.settings
+        for key in (settings.pool_read_key, settings.pool_write_key):
+            if key and hmac.compare_digest(credential, key):
+                return True
+        return False
 
     def _admin_check(self, scope, headers) -> str | None:
         host = headers.get("host", "")

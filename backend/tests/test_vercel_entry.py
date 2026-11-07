@@ -158,7 +158,8 @@ def test_vercel_refresh_runs_only_after_a_valid_pool_or_cron_key(tmp_path):
     app = build_app(cfg, core=core)
     try:
         denied = request(app, "GET", "/v1/pool/candidates?imdb=tt1234567&duration_ms=20000")
-        assert denied.status_code == 403
+        assert denied.status_code == 401
+        assert denied.json() == {"error": "unauthorized"}
         assert index.refreshes == [] and store.starts == 0
 
         allowed = request(app, "GET", "/v1/pool/candidates?imdb=tt1234567&duration_ms=20000",

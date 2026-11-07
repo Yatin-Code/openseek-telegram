@@ -289,7 +289,21 @@ class RemotePairingStore:
         return bool(rows and rows[0].get("contribute"))
 
     def remove_device(self, device_id: str) -> bool:
+        """Revoke: tombstone the token hash before deleting the row, so the remote
+        profile answers "revoked" exactly like a self-hosted node."""
+        rows = self.client.select(
+            "pool_devices", [("select", "token_hash"), ("device_id", f"eq.{device_id}"), ("limit", "1")])
+        if not rows:
+            return False
+        self.client.upsert("pool_revoked_tokens",
+                           [{"token_hash": str(rows[0]["token_hash"]), "revoked": time.time()}],
+                           on_conflict="token_hash")
         return bool(self.client.delete("pool_devices", [("device_id", f"eq.{device_id}")]))
+
+    def is_token_revoked(self, token_hash: str) -> bool:
+        return bool(self.client.select(
+            "pool_revoked_tokens", [("select", "token_hash"), ("token_hash", f"eq.{token_hash}"),
+                                    ("limit", "1")]))
 
     def touch_device(self, device_id: str) -> None:
         self.client.patch("pool_devices", [("device_id", f"eq.{device_id}")],

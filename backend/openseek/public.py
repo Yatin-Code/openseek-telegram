@@ -6,6 +6,7 @@ forwarding header is ever consulted (uvicorn runs with proxy_headers=False), so 
 nothing. Rates, strikes and blocks are per client address."""
 from __future__ import annotations
 
+import math
 import re
 import threading
 import time
@@ -38,6 +39,13 @@ def classify(method: str, path: str, guest_allowed: Callable[[str, str], bool]) 
         if m == method and rx.fullmatch(path):
             return kind
     return "api" if guest_allowed(method, path) else None
+
+
+def host_kind(method: str, path: str, guest_allowed: Callable[[str, str], bool]) -> str:
+    """Limit class for the owner/LAN listener: the same per-class budgets as the
+    public listener, but an unlisted path keeps its normal routing (the documented
+    404 or auth answer) instead of the public listener's deny-by-default."""
+    return classify(method, path, guest_allowed) or "api"
 
 
 @dataclass
@@ -75,19 +83,28 @@ class PublicLimiter:
         with self._lock:
             return self._blocked.get(ip, 0) > self.clock()
 
-    def allow(self, ip: str, kind: str) -> bool:
-        """Count one request of `kind`; False = over the per-minute budget (HTTP 429)."""
+    def consume(self, ip: str, kind: str) -> tuple[bool, int, int, int]:
+        """Count one request of `kind`: (allowed, limit, remaining, reset_seconds).
+
+        `reset_seconds` is how long until the oldest counted request leaves the
+        sliding minute, i.e. when one unit of budget frees up again."""
         with self._lock:
             now = self.clock()
             self._prune(now)
+            limit = self.l.per_minute.get(kind, 30)
             d = self._hits.setdefault((ip, kind), deque())
             while d and now - d[0] > 60:
                 d.popleft()
-            if len(d) >= self.l.per_minute.get(kind, 30):
+            reset = max(1, int(math.ceil(d[0] + 60 - now))) if d else 60
+            if len(d) >= limit:
                 self.refused_total += 1
-                return False
+                return False, limit, 0, reset
             d.append(now)
-            return True
+            return True, limit, max(0, limit - len(d)), reset
+
+    def allow(self, ip: str, kind: str) -> bool:
+        """Count one request of `kind`; False = over the per-minute budget (HTTP 429)."""
+        return self.consume(ip, kind)[0]
 
     def strike(self, ip: str) -> None:
         with self._lock:
