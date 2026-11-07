@@ -1,6 +1,6 @@
 # Code of conduct
 
-We want OpenSeek to be a welcoming, harassment-free project for everyone who takes part in it.
+We want OpenSeek-Telegram to be a welcoming, harassment-free project for everyone who takes part in it.
 
 ## Expected behaviour
 
