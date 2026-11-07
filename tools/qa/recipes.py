@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 import sys
 import tempfile
@@ -187,9 +188,56 @@ def _run_contract_host(steps) -> bool:
     return ok
 
 
-def _rate_line(headers: dict[str, str]) -> str:
-    names = ("x-ratelimit-limit", "x-ratelimit-remaining", "x-ratelimit-reset")
-    return " ".join(f"{name}={headers[name]}" for name in names if name in headers)
+def _safe_response_body(body: bytes) -> str:
+    """Keep the response body in evidence without publishing pairing secrets."""
+    sensitive = ("token", "code", "proof", "authorization", "secret", "password",
+                 "credential", "session", "key")
+
+    def redact(value):
+        if isinstance(value, dict):
+            return {key: ("[REDACTED]" if any(word in key.lower() for word in sensitive)
+                          else redact(item))
+                    for key, item in value.items()}
+        if isinstance(value, list):
+            return [redact(item) for item in value]
+        if isinstance(value, str):
+            return re.sub(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])",
+                          "[REDACTED token]", value)
+        return value
+
+    if not body:
+        return "<empty>"
+    try:
+        parsed = json.loads(body)
+    except (UnicodeDecodeError, ValueError):
+        if any(byte < 9 or 13 < byte < 32 for byte in body):
+            return json.dumps({"binary_bytes": len(body), "sha256": hashlib.sha256(body).hexdigest()},
+                              sort_keys=True, separators=(",", ":"))
+        text = body[:512].decode("utf-8", "replace")
+        text = re.sub(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])",
+                      "[REDACTED token]", text)
+        return json.dumps(text, ensure_ascii=False)
+    return json.dumps(redact(parsed), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _safe_response_headers(headers: dict[str, str]) -> str:
+    """Include every response header, redacting any credential-shaped values."""
+    sensitive = ("authorization", "cookie", "token", "secret", "admin", "key", "session")
+    cleaned = {
+        name.lower(): ("[REDACTED]" if any(word in name.lower() for word in sensitive) else
+                       re.sub(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])",
+                              "[REDACTED token]", value))
+        for name, value in headers.items()
+    }
+    return json.dumps(cleaned, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _record_response(steps, case: str, method: str, path: str, code: int,
+                     headers: dict[str, str], body: bytes) -> None:
+    steps.evidence(
+        f"{case} | {method} {path} | {code} | {_safe_response_body(body)} | "
+        f"{_safe_response_headers(headers)}"
+    )
 
 
 def _run_host_protections(steps) -> bool:
@@ -215,12 +263,15 @@ def _run_host_protections(steps) -> bool:
     http = HTTP(base, pin)
     probe = "d" * 64
     steps.evidence(f"target={base} admin={admin_base} pin={pin} (pinned TLS)")
+    steps.evidence("case | request | status | response body | response headers")
     ok = True
 
     def matrix(name: str, method: str, path: str, *, headers: dict | None = None,
-               data: bytes = b"", status: int, error: str | None = None):
+               data: bytes = b"", status: int, error: str | None = None,
+               content_length: int | None = None, timeout: float | None = None):
         nonlocal ok
-        code, hdrs, body = http.request(method, path, headers=headers, data=data)
+        code, hdrs, body = http.request(method, path, headers=headers, data=data,
+                                        content_length=content_length, timeout=timeout)
         try:
             parsed = json.loads(body)
         except ValueError:
@@ -228,10 +279,7 @@ def _run_host_protections(steps) -> bool:
         passed = code == status
         if error is not None:
             passed = passed and isinstance(parsed, dict) and parsed.get("error") == error
-        line = f"{method} {path} -> {code} {body[:120].decode('utf-8', 'replace')}"
-        if _rate_line(hdrs):
-            line += f" | {_rate_line(hdrs)}"
-        steps.evidence(line)
+        _record_response(steps, name, method, path, code, hdrs, body)
         steps.check(name, passed)
         ok = ok and passed
         return code, hdrs, body
@@ -240,8 +288,8 @@ def _run_host_protections(steps) -> bool:
     parsed = json.loads(body) if code == 200 else {}
     passed = code == 200 and parsed.get("service") == "openseek" and \
         headers.get("x-ratelimit-limit") == "30"
-    steps.evidence(f"GET /v1/health (no auth) -> {code} {body[:90].decode('utf-8', 'replace')} | "
-                   f"{_rate_line(headers)}")
+    _record_response(steps, "health advertises its response shape and budget",
+                     "GET", "/v1/health", code, headers, body)
     steps.check("health advertises the documented shape and the health budget", passed)
     ok = ok and passed
 
@@ -255,11 +303,11 @@ def _run_host_protections(steps) -> bool:
            f"/v1/pool/{probe}/manifest?profile=nvmt-v1-g10",
            headers={"Authorization": f"Bearer {'z' * 43}"}, status=403, error="forbidden")
 
-    oversized = b"\0" * (16 * 1024 * 1024 + 1)
-    matrix("missing key on an oversized body: 401 before the body is read", "PUT",
+    oversized_length = 16 * 1024 * 1024 + 1
+    matrix(f"missing key on oversized body (Content-Length={oversized_length}; sends 1 KiB)", "PUT",
            f"/v1/pool/{probe}/nvmt?profile=nvmt-v1-g10&duration_ms=30000",
-           headers={"Content-Type": "application/vnd.openseek.nvmt"}, data=oversized,
-           status=401, error="unauthorized")
+           headers={"Content-Type": "application/vnd.openseek.nvmt"}, data=b"\0" * 1024,
+           content_length=oversized_length, timeout=3.0, status=401, error="unauthorized")
 
     matrix("read key cannot write: 403 forbidden", "PUT",
            f"/v1/pool/{probe}/nvmt?profile=nvmt-v1-g10&duration_ms=30000",
@@ -270,6 +318,8 @@ def _run_host_protections(steps) -> bool:
     name = "write key can write: duplicate package retry answers 200 duplicate"
     code, headers, body = http.get(f"/v1/pool/{package_fp}/nvmt?profile=nvmt-v1-g10",
                                    headers={"Authorization": f"Bearer {read_key}"})
+    _record_response(steps, "write-key prerequisite package read", "GET",
+                     f"/v1/pool/{package_fp}/nvmt?profile=nvmt-v1-g10", code, headers, body)
     package = body if code == 200 else b""
     duration = headers.get("x-openseek-duration-ms") or "30000"
     code, hdrs, body = http.put(
@@ -281,8 +331,9 @@ def _run_host_protections(steps) -> bool:
     except (ValueError, AttributeError):
         duplicate = False
     passed = code == 200 and duplicate and bool(package)
-    steps.evidence(f"read {len(package)} bytes, PUT same package with write key -> {code} "
-                   f"{body[:100].decode('utf-8', 'replace')}")
+    _record_response(steps, "write key accepts duplicate package retry", "PUT",
+                     f"/v1/pool/{package_fp}/nvmt?profile=nvmt-v1-g10&duration_ms={duration}",
+                     code, hdrs, body)
     steps.check(name, passed)
     ok = ok and passed
 
@@ -292,36 +343,56 @@ def _run_host_protections(steps) -> bool:
     with httpx.Client(base_url=admin_base, headers={"X-OpenSeek-Admin": admin_key},
                       timeout=30.0) as admin:
         opened = admin.post("/admin/pair")
-        window = opened.json() if opened.status_code == 200 else {}
+        _record_response(steps, "open pairing window", "POST", "/admin/pair",
+                         opened.status_code, dict(opened.headers), opened.content)
+        try:
+            window = opened.json() if opened.status_code == 200 else {}
+        except ValueError:
+            window = {}
         start_code, _h, start_body = http.post(
             "/v1/pair/start", headers={"Content-Type": "application/json"}, data=b"{}")
-        started = json.loads(start_body) if start_code == 200 else {}
+        _record_response(steps, "start a device pairing", "POST", "/v1/pair/start",
+                         start_code, _h, start_body)
+        try:
+            started = json.loads(start_body) if start_code == 200 else {}
+        except ValueError:
+            started = {}
         device_id = token = ""
         if opened.status_code == 200 and started:
-            k = derive_key(window["code"], started["pair_id"], started["salt"],
-                           started["spki_pin"], started["iterations"])
-            claim_code, _h, claim_body = http.post(
-                "/v1/pair/claim",
-                headers={"Content-Type": "application/json"},
-                data=json.dumps({"pair_id": started["pair_id"], "device_name": "QA H6 drill",
-                                 "client_proof": client_proof(k, started["pair_id"],
-                                                              "QA H6 drill")}).encode())
-            claimed = json.loads(claim_body) if claim_code == 200 else {}
-            device_id, token = claimed.get("device_id", ""), claimed.get("token", "")
+            try:
+                k = derive_key(window["code"], started["pair_id"], started["salt"],
+                               started["spki_pin"], started["iterations"])
+                claim_code, _h, claim_body = http.post(
+                    "/v1/pair/claim",
+                    headers={"Content-Type": "application/json"},
+                    data=json.dumps({"pair_id": started["pair_id"],
+                                     "device_name": "QA H6 drill",
+                                     "client_proof": client_proof(k, started["pair_id"],
+                                                                  "QA H6 drill")}).encode())
+                _record_response(steps, "claim the paired device", "POST", "/v1/pair/claim",
+                                 claim_code, _h, claim_body)
+                claimed = json.loads(claim_body) if claim_code == 200 else {}
+                device_id = claimed.get("device_id", "")
+                token = claimed.get("token", "")
+            except (KeyError, TypeError, ValueError):
+                claim_code = 0
             if device_id:
                 revoked = admin.delete(f"/admin/devices/{device_id}")
+                _record_response(steps, "revoke the paired device", "DELETE",
+                                 f"/admin/devices/{device_id}", revoked.status_code,
+                                 dict(revoked.headers), revoked.content)
                 if token and revoked.status_code == 204:
                     revoked_code, _h, revoked_body = http.get(
                         f"/v1/pool/{probe}/manifest?profile=nvmt-v1-g10",
                         headers={"Authorization": f"Bearer {token}"})
+                    _record_response(steps, "read with the revoked device token", "GET",
+                                     f"/v1/pool/{probe}/manifest?profile=nvmt-v1-g10",
+                                     revoked_code, _h, revoked_body)
                     try:
                         revoked_error = json.loads(revoked_body).get("error")
                     except (ValueError, AttributeError):
                         revoked_error = None
     passed = revoked_code == 403 and revoked_error == "revoked_key"
-    steps.evidence(f"pair window HTTP {opened.status_code}, start HTTP {start_code}, "
-                   f"revoke HTTP {revoked.status_code if device_id else 0}, "
-                   f"pool read with revoked token -> {revoked_code}")
     steps.check(name, passed)
     ok = ok and passed
 
@@ -333,9 +404,11 @@ def _run_host_protections(steps) -> bool:
     name = "rate limit is enforced under a burst: 429 + Retry-After + advertised budget"
     statuses: list[int] = []
     burst_headers: dict[str, str] = {}
-    for _ in range(40):
+    for index in range(40):
         code, hdrs, body = http.get("/v1/health")
         statuses.append(code)
+        _record_response(steps, f"health burst request {index + 1}", "GET",
+                         "/v1/health", code, hdrs, body)
         if code == 429:
             burst_headers = hdrs
             break
@@ -343,9 +416,8 @@ def _run_host_protections(steps) -> bool:
               burst_headers.get("retry-after", "").isdigit() and
               burst_headers.get("x-ratelimit-limit") == "30" and
               burst_headers.get("x-ratelimit-remaining") == "0")
-    steps.evidence(f"{len(statuses)} rapid GET /v1/health: {statuses[0]}..{statuses[-1]}; "
-                   f"429 headers {_rate_line(burst_headers)} retry-after="
-                   f"{burst_headers.get('retry-after')}")
+    steps.evidence(f"burst summary | {len(statuses)} rapid GET /v1/health requests | "
+                   f"statuses {statuses[0]}..{statuses[-1]}")
     steps.check(name, passed)
     ok = ok and passed
     return ok

@@ -53,20 +53,35 @@ class HTTP:
         self.timeout = timeout
 
     def request(self, method: str, path: str, *, headers: dict | None = None,
-                data: bytes = b"") -> tuple[int, dict[str, str], bytes]:
+                data: bytes = b"", content_length: int | None = None,
+                timeout: float | None = None) -> tuple[int, dict[str, str], bytes]:
         s = self.cached_base
         host, port = s.hostname, s.port or 443
-        conn = open_connection(host, port, self.pin, timeout=self.timeout)
+        request_timeout = self.timeout if timeout is None else timeout
+        declared_length = len(data) if content_length is None else content_length
+        if declared_length < len(data):
+            raise ValueError("Content-Length cannot be smaller than the request body")
+        conn = open_connection(host, port, self.pin, timeout=request_timeout)
         try:
-            request = bytearray()
-            request += f"{method} {s.path.rstrip('/')}{path} HTTP/1.1\r\n".encode()
-            request += f"Host: {host}\r\n".encode()
-            request += b"Connection: close\r\n"
+            head = bytearray()
+            head += f"{method} {s.path.rstrip('/')}{path} HTTP/1.1\r\n".encode()
+            head += f"Host: {host}\r\n".encode()
+            head += b"Connection: close\r\n"
             for name, value in (headers or {}).items():
-                request += f"{name}: {value}\r\n".encode()
-            request += f"Content-Length: {len(data)}\r\n\r\n".encode()
-            request += data
-            conn.sendall(bytes(request))
+                if name.lower() == "content-length":
+                    continue
+                head += f"{name}: {value}\r\n".encode()
+            head += f"Content-Length: {declared_length}\r\n\r\n".encode()
+            # Send headers and body separately. A server that rejects from headers
+            # can reply while an upload is in progress; keep that early response
+            # available to callers instead of turning it into a sendall reset.
+            try:
+                conn.sendall(bytes(head))
+                if data:
+                    conn.sendall(data)
+            except (BrokenPipeError, ConnectionResetError, ssl.SSLEOFError,
+                    ssl.SSLZeroReturnError):
+                pass
             response = b""
             while True:
                 try:

@@ -24,6 +24,7 @@ From the repository root, with the project venv:
 ```sh
 .venv/bin/python tools/qa/run.py list                     # campaign tickets from the tracker
 .venv/bin/python tools/qa/run.py run contract-host        # live target: the registered G4 host node
+.venv/bin/python tools/qa/run.py run host-protections     # H6: live auth, body-order, and rate-limit matrix
 .venv/bin/python tools/qa/run.py run contract-local       # local target: cold-start live-server harness
 .venv/bin/python tools/qa/run.py run secret-leak-drill --expect-leak
 ```
@@ -73,6 +74,7 @@ value into the evidence stream.
 |---|---|---|---|
 | `contract-host` | G4 | `live` | The published API contract surface of the registered host node: health shape, forbidden reads/writes without a key, body validation only after auth, retired routes gone, NVMT v1 package read byte-for-byte (header validated client-side) with both keys. |
 | `contract-local` | H1 | `local` | The same contract on a cold-start local node: health, `pair/start` serving the pin the client independently derived, a full OSP1 pairing round-trip (admin opens the window, the client derives K and claims, proofs verify), unlisted routes refused. |
+| `host-protections` | H6 | `live` | A pinned-TLS response matrix for health, missing/malformed/never-issued/revoked credentials, oversized-body precedence, read/write separation, documented 404/405 responses, and the advertised burst limit. Each response records its status, safe body representation, and headers. |
 | `secret-leak-drill` | P1 | `drill` | The guard drill (above). |
 
 ## Adding a recipe for a ticket

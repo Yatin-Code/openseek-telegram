@@ -4,6 +4,7 @@ Usage (from the repository root, with the project venv):
 
     .venv/bin/python tools/qa/run.py list                     # campaign tickets + state from the tracker
     .venv/bin/python tools/qa/run.py run contract-host        # live target (registry + operator's qa.env)
+    .venv/bin/python tools/qa/run.py run host-protections     # H6 live host protections + response matrix
     .venv/bin/python tools/qa/run.py run contract-local       # local target (live-server harness, ephemeral)
     .venv/bin/python tools/qa/run.py run secret-leak-drill --expect-leak
                                                               # negative drill: redact + fail IS the pass
