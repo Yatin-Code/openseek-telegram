@@ -121,8 +121,14 @@ Content-Type: application/vnd.openseek.nvmt
 - `duration_ms` is required; it is the package duration and must pass the existing NVMT validation.
 - `episode_key` remains accepted for legacy clients. When both are present, the raw hints are authoritative
   for the hint index; `episode_key` is stored only as the legacy association.
-- The server writes the hint index in the same transaction as the package. A duplicate package may update its
-  hints; a conflicting package never replaces the first accepted tile.
+- On a first upload, omitted hints are stored as absent (`NULL` for IMDb, size, and normalized filename;
+  `0` for season and episode).
+- On a duplicate `(fp, profile)` upload, hint fields update independently when their supplied values are
+  non-absent. `NULL` for IMDb, size, or normalized filename and `0` for season or episode mean “not supplied”
+  and preserve the stored value. This makes a hint-less retry safe for metadata from newer clients.
+- Omission never clears a stored hint. Clearing metadata requires a separate explicit operation; this PUT has
+  no clear flag. A correction supplies a replacement value. A conflicting package never replaces the first
+  accepted tile.
 - On a read-only channel node, the write is refused with `403 read_only_channel` and an optional
   `contribute_url`; see below.
 
