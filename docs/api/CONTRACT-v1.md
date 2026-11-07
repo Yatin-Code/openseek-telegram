@@ -16,8 +16,57 @@ The HTTP API for pairing and the shared NVMT pool. See `docs/SECURITY-MODEL.md` 
 - JSON bodies ≤ 16 KiB, `Content-Type: application/json`; shared NVMT packages are binary and capped at 16 MiB.
   Errors: `{"error": "<code>"}` — stable snake_case
   codes, never echoing input.
-- Auth: `Authorization: Bearer <token>` (43-char base64url of 32 random bytes).
+- Auth: `Authorization: Bearer <credential>`. A paired-device token is 43 base64url characters; a shared-pool
+  read/write key is deployment-defined (at least 24 characters). Missing, malformed, and revoked credentials are
+  distinct refusals; see “Authentication and refusals” below.
 - Optional shared-pool PUTs use raw `image/jpeg` bodies up to 256 KiB, not JSON.
+- Rate limits are advertised on every response and enforced per client address; see “Rate limits” below.
+
+## Authentication and refusals
+
+The credential is checked before any request body is read. An empty header is a missing credential; a non-Bearer
+scheme, an empty credential, embedded whitespace, or a credential that matches neither a configured pool key nor the
+device-token format is malformed.
+
+| Case | Device routes (`/v1/pair/...`) | Pool routes (`/v1/pool/...`) |
+|---|---|---|
+| Missing credential | `401 {"error":"unauthorized"}` | `401 {"error":"unauthorized"}` |
+| Malformed credential | `400 {"error":"bad_auth"}` | `400 {"error":"bad_auth"}` |
+| Well-formed, never issued | `401 {"error":"unauthorized"}` | `403 {"error":"forbidden"}` |
+| Revoked device token | `403 {"error":"revoked_key"}` | `403 {"error":"revoked_key"}` |
+| Read key on a write | — | `403 {"error":"forbidden"}` |
+
+- Auth runs before body parsing: a missing, malformed, or revoked credential on an oversized body receives the auth
+  refusal, never `413 {"error":"too_large"}`. An authorized oversized body still receives the documented boundary
+  refusal.
+- On the public listener, `/v1/health` and the pairing routes are anonymous, and anonymous pool reads are allowed
+  under the `pool_read` budget; owner tokens are refused `403 {"error":"forbidden_role"}`.
+- Only documented routes answer. An unknown path returns `404 {"error":"not_found"}`; a documented path with an
+  unsupported method returns `405 {"error":"method_not_allowed"}`.
+- `403 {"error":"read_only_channel"}` remains a write-permission refusal on a channel node after a valid credential.
+
+## Rate limits
+
+Budgets are per client address (the TCP peer; forwarding headers are never consulted) over a sliding one-minute
+window, split by route class:
+
+| Class | Routes | Requests/minute |
+|---|---|---:|
+| `health` | `/v1/health` | 30 |
+| `pair` | `/v1/pair/start`, `/v1/pair/claim` | 12 |
+| `api` | all other documented routes | 300 |
+| `pool_read` | pool GET routes | 900 |
+| `pool_write` | pool PUT/POST/DELETE routes | 120 |
+
+Every response that passes the limiter carries `X-RateLimit-Limit`, `X-RateLimit-Remaining` (requests left in the
+current window), and `X-RateLimit-Reset` (seconds until at least one request leaves the window). Over budget:
+
+`429 {"error":"rate_limited"}` with `Retry-After` and the three `X-RateLimit-*` headers.
+
+The host/LAN listener uses these budgets with the same advertised headers and no strikes or blocks. The `vercel`
+profile does not apply the limiter: there the TCP peer is the platform proxy and the platform layer fronts the
+deployment. The optional public listener uses the same budgets plus per-address strikes and temporary blocks; a
+blocked address receives `429 {"error":"rate_limited"}` with `Retry-After: 900`.
 
 ## Endpoints
 ### `GET /v1/health` (no auth)
@@ -156,3 +205,7 @@ have different fingerprints and separate pool entries.
 - 2026-11-07: documented the NVMT package manifest route, the staged-upload routes with their non-Vercel
   refusals, `/v1/internal/tick`, and `/v1/setup/pairing` (G4 surface audit, #68); duplicate-PUT hint
   semantics are now explicit — omitted hints preserve the stored record.
+- 2026-11-08: documented the host API's protections (H6, #57): distinct missing/malformed/revoked refusals,
+  auth-before-body including oversized bodies, the documented 404/405 shapes, and the advertised per-class
+  rate limit with `X-RateLimit-*` headers and `429`/`Retry-After`. Missing pool credentials are now
+  `401 unauthorized` (previously `403 forbidden`); malformed credentials are `400 bad_auth`.

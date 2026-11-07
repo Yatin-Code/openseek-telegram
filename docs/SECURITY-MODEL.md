@@ -25,7 +25,7 @@ The package hint index stores only the normalized fields described in docs/api/H
 
 Outbound source access is limited to supported HTTP(S) destinations and configured ports. DNS results are checked before connections. Redirect destinations are checked again. Proxy headers do not change the source client address or authorization.
 
-The owner API is private by default. The optional public listener uses exact route allowlists, per-address limits, and temporary blocks. Admin routes are not public.
+The owner API is private by default and checks a credential before reading a request body. Missing, malformed, and revoked credentials are distinct refusals. The owner/LAN listener applies the same per-class, per-address request budgets as the public listener and advertises them in `X-RateLimit-*` headers; it does not apply strikes or temporary blocks. The optional public listener uses exact route allowlists, per-address limits, and temporary blocks. Admin routes are not public.
 
 ## Data
 
