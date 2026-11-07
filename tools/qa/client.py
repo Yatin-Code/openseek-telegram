@@ -91,6 +91,9 @@ class HTTP:
     def get(self, path: str, headers: dict | None = None):
         return self.request("GET", path, headers=headers)
 
+    def post(self, path: str, headers: dict | None = None, data: bytes = b""):
+        return self.request("POST", path, headers=headers, data=data)
+
     def put(self, path: str, headers: dict | None = None, data: bytes = b""):
         return self.request("PUT", path, headers=headers, data=data)
 

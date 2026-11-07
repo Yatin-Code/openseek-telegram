@@ -97,9 +97,9 @@ def _run_contract_local(steps) -> bool:
             steps.check(name, passed)
             ok = ok and passed
 
-            name = "an anonymous request to an unlisted route is refused (401 unauthorized)"
+            name = "an anonymous request to an unlisted route is the documented 404 not_found"
             r = anon.get("/v1/unknown-gone")
-            passed = r.status_code == 401 and r.json()["error"] == "unauthorized"
+            passed = r.status_code == 404 and r.json()["error"] == "not_found"
             steps.evidence(f"HTTP {r.status_code} {r.text[:80]}")
             steps.check(name, passed)
             ok = ok and passed
@@ -132,18 +132,18 @@ def _run_contract_host(steps) -> bool:
     ok = ok and passed
 
     probe = "d" * 64
-    name = "a pool read with no key is refused (403 forbidden)"
+    name = "a pool read with no key is refused (401 unauthorized)"
     code, headers, body = http.get(f"/v1/pool/{probe}/manifest?profile=nvmt-v1-g10")
-    passed = code == 403 and json.loads(body)["error"] == "forbidden"
+    passed = code == 401 and json.loads(body)["error"] == "unauthorized"
     steps.evidence(f"HTTP {code} {body.decode()[:80]}")
     steps.check(name, passed)
     ok = ok and passed
 
     junk_headers = {"Content-Type": "text/plain"}
-    name = "no key: refused before the request body is parsed (denial, not 400)"
+    name = "no key: refused before the request body is parsed (401 unauthorized, not 400)"
     code, headers, body = http.put(f"/v1/pool/{probe}/nvmt?profile=nvmt-v1-g10&duration_ms=30000",
                                    headers=junk_headers, data=b"junk-body-not-nvmt")
-    passed = code == 403 and json.loads(body)["error"] == "forbidden"
+    passed = code == 401 and json.loads(body)["error"] == "unauthorized"
     steps.evidence(f"PUT (no key), invalid content-type + non-NVMT bytes: HTTP {code}")
     steps.check(name, passed)
     ok = ok and passed
@@ -157,9 +157,9 @@ def _run_contract_host(steps) -> bool:
     steps.check(name, passed)
     ok = ok and passed
 
-    name = "retired legacy routes never reach a handler (401 unauthorized)"
+    name = "retired legacy routes never reach a handler (404 not_found)"
     code, headers, body = http.get("/v1/previews/" + "b" * 32 + "/thumbs.vtt")
-    passed = code == 401 and json.loads(body)["error"] == "unauthorized"
+    passed = code == 404 and json.loads(body)["error"] == "not_found"
     steps.evidence(f"HTTP {code}")
     steps.check(name, passed)
     ok = ok and passed
@@ -182,6 +182,170 @@ def _run_contract_host(steps) -> bool:
     write_sha = hashlib.sha256(body).hexdigest() if code == 200 else ""
     passed = code == 200 and read_sha != "" and read_sha == write_sha
     steps.evidence(f"HTTP {code}, sha256 equal={read_sha == write_sha and read_sha != ''}")
+    steps.check(name, passed)
+    ok = ok and passed
+    return ok
+
+
+def _rate_line(headers: dict[str, str]) -> str:
+    names = ("x-ratelimit-limit", "x-ratelimit-remaining", "x-ratelimit-reset")
+    return " ".join(f"{name}={headers[name]}" for name in names if name in headers)
+
+
+def _run_host_protections(steps) -> bool:
+    """H6 (#57): the host API's documented contract and protections, live.
+
+    Drives the registered G4 host node black-box over pinned TLS: the auth
+    refusal matrix, auth-before-body precedence, read/write separation, the
+    revoked-key lifecycle (real pairing + admin revoke), the documented
+    404/405 shapes, and the advertised/enforced per-class rate limit.
+    """
+    import httpx
+
+    from openseek.pairing import client_proof, derive_key
+
+    env = qa_env_values()
+    base = public_of("OPENSEEK_G4_BASE_URL", env)
+    pin = public_of("OPENSEEK_G4_TLS_PIN", env)
+    read_key = key_of("OPENSEEK_G4_READ_KEY", env)
+    write_key = key_of("OPENSEEK_G4_WRITE_KEY", env)
+    package_fp = public_of("OPENSEEK_G4_PACKAGE_FP", env)
+    admin_key = key_of("OPENSEEK_G4_ADMIN_KEY", env)
+    admin_base = env.get("OPENSEEK_G4_ADMIN_URL") or "http://127.0.0.1:18788"
+    http = HTTP(base, pin)
+    probe = "d" * 64
+    steps.evidence(f"target={base} admin={admin_base} pin={pin} (pinned TLS)")
+    ok = True
+
+    def matrix(name: str, method: str, path: str, *, headers: dict | None = None,
+               data: bytes = b"", status: int, error: str | None = None):
+        nonlocal ok
+        code, hdrs, body = http.request(method, path, headers=headers, data=data)
+        try:
+            parsed = json.loads(body)
+        except ValueError:
+            parsed = None
+        passed = code == status
+        if error is not None:
+            passed = passed and isinstance(parsed, dict) and parsed.get("error") == error
+        line = f"{method} {path} -> {code} {body[:120].decode('utf-8', 'replace')}"
+        if _rate_line(hdrs):
+            line += f" | {_rate_line(hdrs)}"
+        steps.evidence(line)
+        steps.check(name, passed)
+        ok = ok and passed
+        return code, hdrs, body
+
+    code, headers, body = http.get("/v1/health")
+    parsed = json.loads(body) if code == 200 else {}
+    passed = code == 200 and parsed.get("service") == "openseek" and \
+        headers.get("x-ratelimit-limit") == "30"
+    steps.evidence(f"GET /v1/health (no auth) -> {code} {body[:90].decode('utf-8', 'replace')} | "
+                   f"{_rate_line(headers)}")
+    steps.check("health advertises the documented shape and the health budget", passed)
+    ok = ok and passed
+
+    matrix("missing key on a pool route: 401 unauthorized", "GET",
+           f"/v1/pool/{probe}/manifest?profile=nvmt-v1-g10",
+           status=401, error="unauthorized")
+    matrix("malformed key: 400 bad_auth", "GET",
+           f"/v1/pool/{probe}/manifest?profile=nvmt-v1-g10",
+           headers={"Authorization": "Token not-a-bearer"}, status=400, error="bad_auth")
+    matrix("well-formed key that was never issued: 403 forbidden", "GET",
+           f"/v1/pool/{probe}/manifest?profile=nvmt-v1-g10",
+           headers={"Authorization": f"Bearer {'z' * 43}"}, status=403, error="forbidden")
+
+    oversized = b"\0" * (16 * 1024 * 1024 + 1)
+    matrix("missing key on an oversized body: 401 before the body is read", "PUT",
+           f"/v1/pool/{probe}/nvmt?profile=nvmt-v1-g10&duration_ms=30000",
+           headers={"Content-Type": "application/vnd.openseek.nvmt"}, data=oversized,
+           status=401, error="unauthorized")
+
+    matrix("read key cannot write: 403 forbidden", "PUT",
+           f"/v1/pool/{probe}/nvmt?profile=nvmt-v1-g10&duration_ms=30000",
+           headers={"Authorization": f"Bearer {read_key}",
+                    "Content-Type": "application/vnd.openseek.nvmt"},
+           data=b"not-an-nvmt-package", status=403, error="forbidden")
+
+    name = "write key can write: duplicate package retry answers 200 duplicate"
+    code, headers, body = http.get(f"/v1/pool/{package_fp}/nvmt?profile=nvmt-v1-g10",
+                                   headers={"Authorization": f"Bearer {read_key}"})
+    package = body if code == 200 else b""
+    duration = headers.get("x-openseek-duration-ms") or "30000"
+    code, hdrs, body = http.put(
+        f"/v1/pool/{package_fp}/nvmt?profile=nvmt-v1-g10&duration_ms={duration}",
+        headers={"Authorization": f"Bearer {write_key}",
+                 "Content-Type": "application/vnd.openseek.nvmt"}, data=package)
+    try:
+        duplicate = json.loads(body).get("duplicate") is True
+    except (ValueError, AttributeError):
+        duplicate = False
+    passed = code == 200 and duplicate and bool(package)
+    steps.evidence(f"read {len(package)} bytes, PUT same package with write key -> {code} "
+                   f"{body[:100].decode('utf-8', 'replace')}")
+    steps.check(name, passed)
+    ok = ok and passed
+
+    name = "revoked key: 403 revoked_key (real pair, then admin revoke)"
+    revoked_code = 0
+    revoked_error = None
+    with httpx.Client(base_url=admin_base, headers={"X-OpenSeek-Admin": admin_key},
+                      timeout=30.0) as admin:
+        opened = admin.post("/admin/pair")
+        window = opened.json() if opened.status_code == 200 else {}
+        start_code, _h, start_body = http.post(
+            "/v1/pair/start", headers={"Content-Type": "application/json"}, data=b"{}")
+        started = json.loads(start_body) if start_code == 200 else {}
+        device_id = token = ""
+        if opened.status_code == 200 and started:
+            k = derive_key(window["code"], started["pair_id"], started["salt"],
+                           started["spki_pin"], started["iterations"])
+            claim_code, _h, claim_body = http.post(
+                "/v1/pair/claim",
+                headers={"Content-Type": "application/json"},
+                data=json.dumps({"pair_id": started["pair_id"], "device_name": "QA H6 drill",
+                                 "client_proof": client_proof(k, started["pair_id"],
+                                                              "QA H6 drill")}).encode())
+            claimed = json.loads(claim_body) if claim_code == 200 else {}
+            device_id, token = claimed.get("device_id", ""), claimed.get("token", "")
+            if device_id:
+                revoked = admin.delete(f"/admin/devices/{device_id}")
+                if token and revoked.status_code == 204:
+                    revoked_code, _h, revoked_body = http.get(
+                        f"/v1/pool/{probe}/manifest?profile=nvmt-v1-g10",
+                        headers={"Authorization": f"Bearer {token}"})
+                    try:
+                        revoked_error = json.loads(revoked_body).get("error")
+                    except (ValueError, AttributeError):
+                        revoked_error = None
+    passed = revoked_code == 403 and revoked_error == "revoked_key"
+    steps.evidence(f"pair window HTTP {opened.status_code}, start HTTP {start_code}, "
+                   f"revoke HTTP {revoked.status_code if device_id else 0}, "
+                   f"pool read with revoked token -> {revoked_code}")
+    steps.check(name, passed)
+    ok = ok and passed
+
+    matrix("undocumented path: documented 404 not_found", "GET", "/v1/never-documented",
+           status=404, error="not_found")
+    matrix("documented path, unsupported method: 405 method_not_allowed", "POST", "/v1/health",
+           status=405, error="method_not_allowed")
+
+    name = "rate limit is enforced under a burst: 429 + Retry-After + advertised budget"
+    statuses: list[int] = []
+    burst_headers: dict[str, str] = {}
+    for _ in range(40):
+        code, hdrs, body = http.get("/v1/health")
+        statuses.append(code)
+        if code == 429:
+            burst_headers = hdrs
+            break
+    passed = (bool(statuses) and 200 in statuses and statuses[-1] == 429 and
+              burst_headers.get("retry-after", "").isdigit() and
+              burst_headers.get("x-ratelimit-limit") == "30" and
+              burst_headers.get("x-ratelimit-remaining") == "0")
+    steps.evidence(f"{len(statuses)} rapid GET /v1/health: {statuses[0]}..{statuses[-1]}; "
+                   f"429 headers {_rate_line(burst_headers)} retry-after="
+                   f"{burst_headers.get('retry-after')}")
     steps.check(name, passed)
     ok = ok and passed
     return ok
@@ -215,6 +379,12 @@ RECIPES = {
         "targets": ("local",),
         "ticket": "H1",
         "runner": _run_contract_local,
+    },
+    "host-protections": {
+        "title": "Host API protections: auth matrix, body precedence, read/write, rate limit",
+        "targets": ("live",),
+        "ticket": "H6",
+        "runner": _run_host_protections,
     },
     "secret-leak-drill": {
         "title": "Negative drill: the runner refuses to publish a known secret value",
