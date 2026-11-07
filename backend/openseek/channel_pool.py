@@ -13,7 +13,7 @@ from .channel_index import ChannelIndex
 from .ids import is_fingerprint
 from .pool import (MAX_DURATION_MS, MAX_NVMT_BYTES, NVMT_PROFILES, PoolError,
                    TILE_INTERVAL_MS, _EPISODE_KEY, _tile_filename, decode_nvmt, encode_nvmt,
-                   validate_pool_hints, validate_tile)
+                   _merge_absent_hint_fields, validate_pool_hints, validate_tile)
 from .scheduler import tile_count
 
 
@@ -236,12 +236,13 @@ class ChannelPoolService:
         for message in pending_messages:
             self.index.record_message(message)
         created = int(time.time())
+        old_hints = self.index.store.get_hints(fp, profile)
+        hints = _merge_absent_hint_fields(hints, old_hints)
         manifest = {"v": 1, "fp": fp, "profile": profile, "imdb": hints["imdb"],
                     "season": hints["season"], "episode": hints["episode"],
                     "duration_ms": duration_ms, "size_bytes": hints["size_bytes"],
                     "filename_norm": hints["filename_norm"], "n_tiles": len(source_tiles),
                     "grid": grid, "created": created}
-        old_hints = self.index.store.get_hints(fp, profile)
         same_hints = bool(old_hints and old_hints == (
             hints["imdb"], hints["season"], hints["episode"], duration_ms,
             hints["size_bytes"], hints["filename_norm"], len(source_tiles), grid))

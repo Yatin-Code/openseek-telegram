@@ -277,6 +277,65 @@ def test_channel_mode_uploads_nvmt_tiles_and_retry_keeps_first_writer(tmp_path):
         core.stop()
 
 
+def test_channel_duplicate_upload_with_absent_hints_keeps_stored_hints(tmp_path):
+    """Same owner decision as the host-mode pool (#68) on the channel wire: a hint-less
+    duplicate retry preserves stored hints in both the index row and any republished
+    channel manifest, and omission never republishes erasure."""
+    store = MemoryChannel()
+    settings = Settings(data_dir=tmp_path, pool_mode="channel", contribution=True,
+                        pool_write_key="w" * 40, telegram_api_id=123,
+                        telegram_api_hash="a" * 32, telegram_bot_token="123456:test",
+                        telegram_channel_id=store.channel_id)
+    core = Core(settings, pool_storage=store)
+    fp = hashlib.sha256(b"channel hints preserve source").hexdigest()
+    app = create_api_app(core)
+
+    async def put(hints_query: str, package):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                     base_url="https://openseek.test") as client:
+            return await client.put(
+                f"/v1/pool/{fp}/nvmt?profile=nvmt-v1-g5&duration_ms=20000{hints_query}",
+                content=package,
+                headers={"Authorization": f"Bearer {'w' * 40}",
+                         "Content-Type": "application/vnd.openseek.nvmt"})
+
+    def manifests():
+        return [message for message in store.messages
+                if message.caption and message.caption.startswith("openseek:hints:v1:")]
+
+    full = "&imdb=tt1234567&season=2&episode=5&size_bytes=1000000&filename=Film.Name.2024.mkv"
+
+    try:
+        first = asyncio.run(put(full, encode_nvmt(5_000, 4, {0: (0, jpeg((11, 22, 33)))})))
+        assert first.status_code == 201, first.text
+        assert len(manifests()) == 1
+
+        # a hint-less duplicate retry stores no erasure: identical hints are not
+        # republished at all, and the local row keeps its supplied values
+        duplicate = asyncio.run(put("", encode_nvmt(5_000, 4, {0: (0, jpeg((11, 22, 33)))})))
+        assert duplicate.status_code == 200 and duplicate.json()["duplicate"] is True
+        assert len(manifests()) == 1, "identical hints must not republish a manifest"
+        hint = core.db.q("SELECT imdb,season,episode,size_bytes,filename_norm "
+                         "FROM pool_hints WHERE fp=?", (fp,))[0]
+        assert hint == ("tt1234567", 2, 5, 1000000, "film.name.2024")
+
+        # a coverage-extension retry without hints adds a tile, so the manifest goes
+        # to the channel again; the published manifest must keep the stored hints too
+        newer = encode_nvmt(5_000, 4, {0: (0, jpeg((11, 22, 33))), 2: (10_000, jpeg((33, 22, 11)))})
+        response = asyncio.run(put("", newer))
+        assert response.status_code == 201, response.text
+        assert len(manifests()) == 2, "a new tile republishes the manifest once more"
+        payload = manifests()[-1].caption.split(":", 3)[3]
+        manifest = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        assert manifest["imdb"] == "tt1234567" and manifest["season"] == 2 and manifest["episode"] == 5
+        assert manifest["size_bytes"] == 1000000 and manifest["filename_norm"] == "film.name.2024"
+        assert core.db.q("SELECT imdb,season,episode,size_bytes,filename_norm "
+                         "FROM pool_hints WHERE fp=?", (fp,))[0] == \
+            ("tt1234567", 2, 5, 1000000, "film.name.2024")
+    finally:
+        core.stop()
+
+
 @pytest.mark.parametrize(
     ("pool_contributions_enabled", "sharing_enabled", "device_enabled", "expected_status"),
     [(True, True, True, 201), (False, True, True, 403),
