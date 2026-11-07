@@ -96,6 +96,12 @@ dimensions. It stores the merged package as one Telegram document. The first acc
 later uploads add only missing slots. New coverage: 201; unchanged retry: 200; duration conflict for the same
 fingerprint/profile: 409; malformed data: 400.
 
+On a duplicate PUT, non-absent hint values update their fields independently. `NULL` for `imdb`, `size_bytes`,
+or normalized `filename`, and `0` for `season` or `episode`, mean “not supplied” and preserve the stored value.
+This follows the package body's preserve-on-retry rule for tile slots. A first upload stores omitted hints as
+absent (`NULL`/`0`). Omission never clears stored hints; clearing requires a separate explicit operation, and
+this PUT has no clear flag. A correction supplies a replacement value.
+
 On a channel node without post rights the write is refused with
 `403 {"error":"read_only_channel","contribute_url":"https://…"}`; `contribute_url` is optional. Hints, ranking,
 and the Telegram manifest are specified in `docs/api/HINTS-v2.md`.
@@ -108,8 +114,45 @@ New clients use `GET /v1/pool/candidates` with raw hints: `imdb`, `season`, `epi
 `size_bytes`, and `filename`. The server ranks by those hints and the client accepts the best candidate without
 decoding sample frames. Either index is optional; exact fingerprint lookup continues to work without it.
 
+`GET /v1/pool/{fp}/nvmt/manifest?profile=nvmt-v1-g5|nvmt-v1-g10` (read key) answers
+`200 {"fp":"…","profile":"…","duration_ms":…,"n_slots":…,"n_tiles":…,"tile_slots":[0,1,…]}` — the slots the
+stored package covers — so a client can plan a partial `slots=` fetch before downloading the package. An
+optional `episode_key` records the hash-to-package association exactly like the package GET. Unknown profile
+`400 {"error":"bad_profile"}`; a mismatched `duration_ms` or a miss `404 {"error":"not_found"}`;
+`403 {"error":"forbidden"}` without read access.
+
+### Staged uploads and setup routes (every node; only a Vercel deployment serves them)
+
+Large uploads on Vercel go through staged uploads in the private Supabase bucket rather than a direct wire
+body. The routes exist on every node so clients keep one code path:
+
+- `POST /v1/pool/uploads` (write key) creates the staged upload: `201` with the upload id and presigned
+  parameters. Fingerprint, profile, duration, and contribution rules are the same as a direct PUT.
+- `POST /v1/pool/uploads/{id}/finalize` (write key) hands the staged object to the pool: `202` while the node
+  drains it.
+- `GET /v1/pool/uploads/{id}` (write key) polls the upload state; polling also triggers a retry of paused
+  work on deployments without a separate worker.
+
+On any non-staged deployment (local, VPS, or a host node without staging) these answer
+`400 {"error":"staging_unavailable"}` on `POST /v1/pool/uploads` and `404 {"error":"unknown_upload"}` on the
+per-upload routes, and a client falls back to the direct `PUT /v1/pool/{fp}/nvmt` body path. On a node
+without any pool surface at all they answer the uniform `404 {"error":"not_found"}`.
+
+`GET` and `POST /v1/internal/tick` drive the staged-upload worker on serverless schedules and answer
+`401 {"error":"unauthorized"}` without the tick secret. They are operational plumbing, not part of the
+client surface.
+
+`POST /v1/setup/pairing` is the participant wizard's invite-minting route. It answers
+`404 {"error":"not_found"}` unless the profile is `vercel` AND the request carries
+`Authorization: Bearer $OPENSEEK_SETUP_KEY`, so the route's existence is not observable elsewhere; the key
+is short-lived and the wizard removes it after setup. With the key it creates one 24 h guest invite
+(`503 {"error":"pairing_setup_unavailable"}` if invite creation fails).
+
 Profiles map `nvmt-v1-g5` to a 5-second grid and `nvmt-v1-g10` to a 10-second grid. Different file versions
 have different fingerprints and separate pool entries.
 
 ## Changelog
 - v1: initial version.
+- 2026-11-07: documented the NVMT package manifest route, the staged-upload routes with their non-Vercel
+  refusals, `/v1/internal/tick`, and `/v1/setup/pairing` (G4 surface audit, #68); duplicate-PUT hint
+  semantics are now explicit — omitted hints preserve the stored record.
