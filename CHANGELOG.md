@@ -28,6 +28,11 @@ All notable changes are documented here. The format follows [Keep a Changelog](h
 * On-demand sheet composition and the old title-library lookup and remapping code. Dashboard NVMT generation keeps the shared extraction worker.
 * The native Windows admin application and its build, release, installer and licensing paths. The server's browser dashboard at `http://127.0.0.1:8788` is the admin interface.
 
+### Fixed
+* Dashboard: a rejected admin secret renders an "Admin access denied" notice instead of a broken page, and phone and TV widths wrap pairing and invitation text instead of overflowing (#75).
+* Generation: a blocked source answers `400 source_forbidden` instead of surfacing an unhandled 500 (#79).
+* G7 participant-setup repairs (#50, not accepted yet): resuming an interrupted `openseek setup` skips completed provisioning; a Nuvio guest can claim an invite only after an explicit per-invite consent that enables sharing and leaves contributions off; and a serialized Telethon StringSession no longer raises ENAMETOOLONG when it is probed as a file path on Python ≤ 3.12, which had surfaced as `503 telegram_unavailable` package reads.
+
 ## [0.2.0] - 2026-10-19
 
 ### Added
