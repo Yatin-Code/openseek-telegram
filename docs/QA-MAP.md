@@ -1,6 +1,6 @@
 # QA campaign map
 
-Generated: 2026-11-09 23:49 IST
+Generated: 2026-11-10 00:02 IST
 
 Regenerate from the repository root: `python tools/qa/map.py`.
 
@@ -24,8 +24,8 @@ Regenerate from the repository root: `python tools/qa/map.py`.
 | [#55 H4: Librarian contribution matrix](https://github.com/Yatin-Code/openseek-telegram/issues/55) | Epic H | closed | qa:agent-pass, qa:user-pass | [latest comment](https://github.com/Yatin-Code/openseek-telegram/issues/55#issuecomment-6712184832) | 0 |
 | [#56 H5: Channel consistency and rebuild](https://github.com/Yatin-Code/openseek-telegram/issues/56) | Epic H | open | qa:agent-pass | [latest comment](https://github.com/Yatin-Code/openseek-telegram/issues/56#issuecomment-6713767250) | 0 |
 | [#57 H6: Host API contract and protections](https://github.com/Yatin-Code/openseek-telegram/issues/57) | Epic H | closed | qa:agent-pass, qa:user-pass | [latest comment](https://github.com/Yatin-Code/openseek-telegram/issues/57#issuecomment-6711785905) | 0 |
-| [#58 H7: Supabase boundaries](https://github.com/Yatin-Code/openseek-telegram/issues/58) | Epic H | open | qa:blocked | [latest comment](https://github.com/Yatin-Code/openseek-telegram/issues/58#issuecomment-6730821005) | 1 |
-| [#59 H8: Vercel delivery under real conditions](https://github.com/Yatin-Code/openseek-telegram/issues/59) | Epic H | open | qa:blocked | [latest comment](https://github.com/Yatin-Code/openseek-telegram/issues/59#issuecomment-6730693699) | 1 |
+| [#58 H7: Supabase boundaries](https://github.com/Yatin-Code/openseek-telegram/issues/58) | Epic H | open | qa:blocked | [latest comment](https://github.com/Yatin-Code/openseek-telegram/issues/58#issuecomment-6748136193) | 1 |
+| [#59 H8: Vercel delivery under real conditions](https://github.com/Yatin-Code/openseek-telegram/issues/59) | Epic H | open | qa:blocked | [latest comment](https://github.com/Yatin-Code/openseek-telegram/issues/59#issuecomment-6748080163) | 1 |
 | [#60 H9: Client on screen: grid, settings, and corrections](https://github.com/Yatin-Code/openseek-telegram/issues/60) | Epic H | open | qa:blocked | [latest comment](https://github.com/Yatin-Code/openseek-telegram/issues/60#issuecomment-6713670829) | 1 |
 | [#61 H10: Client languages](https://github.com/Yatin-Code/openseek-telegram/issues/61) | Epic H | open | qa:failed | [latest comment](https://github.com/Yatin-Code/openseek-telegram/issues/61#issuecomment-6713670971) | 2 |
 | [#62 H11: Client uploads](https://github.com/Yatin-Code/openseek-telegram/issues/62) | Epic H | open | qa:blocked | [latest comment](https://github.com/Yatin-Code/openseek-telegram/issues/62#issuecomment-6713670942) | 1 |
