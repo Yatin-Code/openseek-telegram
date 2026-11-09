@@ -33,7 +33,19 @@ The REST backend performs the same steps: create or select the Supabase project,
 the schema, create the private staging bucket, deploy, check health, connect Telegram,
 and print the Nuvio pairing bundle. The tokens are held in memory for the run and are
 never written to the resume file. With both variables set the REST backend is selected
-automatically; `--provider cli` always forces the CLI flow.
+automatically; `--provider cli` always forces the CLI flow. When linking the project,
+the wizard also keeps that project reachable: production deployment URLs are made
+public once (a required single change if the project sits behind Vercel SSO for them)
+while preview authentication stays enabled; your dashboard owner secret and paired
+Nuvio devices are unaffected.
+
+Before it creates a Nuvio invite, the wizard asks once per invite: "Enable Nuvio
+guest-device access?" — answering yes turns the node's sharing switch on (stored on
+the node) so the device can pair and read the shared pool; your existing choices are
+never reset. Answering no creates nothing: no invite is created and nothing on the
+node changes. Guests need the opt-in on both sides to contribute: the node's
+pool-contribution setting from your dashboard and the permission granted in Nuvio.
+Every replacement invite asks again; your answer is never carried over silently.
 
 The wizard lets you select an existing Supabase project or create one in an
 organization you can access. For a new project it asks for a name and database region.
@@ -48,6 +60,32 @@ before it asks you to authorize Telegram. Once a stage completes, the local resu
 contains only provider resource IDs, the deployment URL, and a progress marker. It is
 stored under `~/.config/openseek/participant-setup.json` with owner-only permissions.
 Rerun `python -m openseek setup` to resume.
+
+Resuming with the token backend needs the account tokens again: they are supplied
+in memory through the environment on every invocation and never stored, so set the
+two variables above again in the new shell. Then run, passing the same `--state`
+path only if you used one initially (the resume file otherwise stays the default):
+
+```sh
+python -m openseek setup --provider rest
+```
+
+A resumed invocation re-authenticates with the tokens supplied for that run and
+skips everything already finished: the applied SQL schema, the private staging
+bucket, the Vercel environment keys that were already set, and a deployment that
+already exists. It retries only the interrupted step and continues from there.
+When the deployment finished and only the health check failed, it re-checks
+health without redeploying.
+
+When your node is already paired and you need another Nuvio bundle, one rerun
+prints a replacement one-time invitation:
+
+```sh
+python -m openseek setup --provider rest --new-pairing
+```
+
+The replacement does not revoke an invitation you lost or already shared; revoke
+it from the browser dashboard.
 
 After the node is healthy, rerun the same wizard to connect Telegram. It asks for the
 Telegram application ID and hidden API hash, then authorizes your Telegram user account

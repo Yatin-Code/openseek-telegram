@@ -239,6 +239,12 @@ Observed on a restored channel node: `HTTP 500`, the device still listed, and
 node log. This is the defect tracked as #69; it must be fixed before the
 device-token part of teardown can run.
 
+**2026-11-08 follow-up:** #69 was subsequently fixed. Fresh current-code
+verification in [#52](https://github.com/Yatin-Code/openseek-telegram/issues/52)
+observed revoke `204` followed by `403` on the next request. The historical G9
+device records have not been retroactively revoked; the HTTP 500 above remains
+the result from that original run.
+
 ### 5.3 Telegram bot token (human step, not executed)
 
 BotFather: `/mybots` -> `@openseeekbot` -> **API Token** -> **Revoke current

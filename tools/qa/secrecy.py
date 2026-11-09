@@ -2,9 +2,10 @@
 anywhere in its output (P1 acceptance, issue #42).
 
 Known secret values are read from secret stores OUTSIDE the repository:
-`~/.config/openseek/qa.env` (the artifact registry's canonical secrets file) and
-any `*.env` files under the operator's OpenSeek config directory. Values are held
-in memory only; the runner never echoes them and CI never reads them.
+`~/.config/openseek/qa.env` (the artifact registry's canonical secrets file), any
+`*.env` files under the operator's OpenSeek config directory, and secret-shaped
+process environment variables. Values are held in memory only; the runner never
+echoes them and CI never reads secret stores.
 
 Only keys whose NAME is secret-shaped are collected (the naming rule documented
 in docs/qa/ARTIFACTS.md: "Secret: write the location only" applies to values
@@ -14,8 +15,10 @@ stay redact-proof precisely because printing them is allowed.
 """
 from __future__ import annotations
 
+import os
 import pathlib
 import sys
+from collections.abc import Mapping
 
 _MIN_LENGTH = 24          # shorter assignments are not load-bearing URLs or keys
 _SECRET_WORDS = ("TOKEN", "KEY", "HASH", "PASSWORD", "SESSION", "SECRET")
@@ -28,9 +31,10 @@ def _secret_files() -> list[pathlib.Path]:
     return [f for f in files if f.is_file()]
 
 
-def collect_known_secrets(paths: list[pathlib.Path] | None = None) -> list[str]:
+def collect_known_secrets(paths: list[pathlib.Path] | None = None, *,
+                         environ: Mapping[str, str] | None = None) -> list[str]:
     """Every value assigned under a secret-shaped key in the operator's secret
-    stores, in memory only. Public identifiers are deliberately excluded."""
+    stores or process environment, in memory only. Public identifiers are deliberately excluded."""
     values: list[str] = []
     for path in (paths if paths is not None else _secret_files()):
         for line in path.read_text(errors="replace").splitlines():
@@ -44,6 +48,12 @@ def collect_known_secrets(paths: list[pathlib.Path] | None = None) -> list[str]:
             value = value.strip().strip('"\'')
             if value and len(value) >= _MIN_LENGTH and value not in values:
                 values.append(value)
+    for name, value in (os.environ if environ is None else environ).items():
+        if not any(w in name.upper() for w in _SECRET_WORDS):
+            continue
+        value = value.strip()
+        if value and len(value) >= _MIN_LENGTH and value not in values:
+            values.append(value)
     return values
 
 

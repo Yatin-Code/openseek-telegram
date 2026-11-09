@@ -141,9 +141,12 @@ the full package.
 `PUT /v1/pool/{fp}/nvmt?profile=nvmt-v1-g5|nvmt-v1-g10&duration_ms=…&imdb=…&season=…&episode=…&size_bytes=…&filename=…&episode_key=…` accepts raw NVMT v1 bytes with
 `Content-Type: application/vnd.openseek.nvmt` (or `application/octet-stream`), up to 16 MiB. The server checks
 the profile, grid, duration, slot count, duplicate/out-of-range slots, and decodes each JPEG to verify 320×180
-dimensions. It stores the merged package as one Telegram document. The first accepted JPEG for each slot stays;
-later uploads add only missing slots. New coverage: 201; unchanged retry: 200; duration conflict for the same
-fingerprint/profile: 409; malformed data: 400.
+dimensions. Channel-mode nodes store the merged package as one Telegram document. Host/VPS nodes retain the exact
+merged package locally and publish the shared ten-second tile representation to Telegram. For a host-mode g5
+package, that representation samples g5 slots nearest each ten-second point and cannot rebuild every exact g5
+slot; this is the accepted trade-off in [ADR-0001](../adr/0001-telegram-is-the-canonical-pool-store.md). The first
+accepted JPEG for each slot stays; later uploads add only missing slots. New coverage: 201; unchanged retry: 200;
+duration conflict for the same fingerprint/profile: 409; malformed data: 400.
 
 On a duplicate PUT, non-absent hint values update their fields independently. `NULL` for `imdb`, `size_bytes`,
 or normalized `filename`, and `0` for `season` or `episode`, mean “not supplied” and preserve the stored value.
@@ -187,15 +190,20 @@ On any non-staged deployment (local, VPS, or a host node without staging) these 
 per-upload routes, and a client falls back to the direct `PUT /v1/pool/{fp}/nvmt` body path. On a node
 without any pool surface at all they answer the uniform `404 {"error":"not_found"}`.
 
-`GET` and `POST /v1/internal/tick` drive the staged-upload worker on serverless schedules and answer
-`401 {"error":"unauthorized"}` without the tick secret. They are operational plumbing, not part of the
-client surface.
+`GET` and `POST /v1/internal/tick` drive the staged-upload worker on serverless schedules. They accept
+`Authorization: Bearer <OPENSEEK_CRON_SECRET>` or the owner admin token. Missing, malformed, or incorrect
+credentials answer `401 {"error":"unauthorized"}` when a credential is configured; if neither credential is
+configured, or staged uploads are unsupported, the answer is `503 {"error":"tick_unconfigured"}`. The guest-only
+public listener hides this route with `404`. Tick is operational plumbing, not part of the client surface.
 
-`POST /v1/setup/pairing` is the participant wizard's invite-minting route. It answers
-`404 {"error":"not_found"}` unless the profile is `vercel` AND the request carries
-`Authorization: Bearer $OPENSEEK_SETUP_KEY`, so the route's existence is not observable elsewhere; the key
-is short-lived and the wizard removes it after setup. With the key it creates one 24 h guest invite
-(`503 {"error":"pairing_setup_unavailable"}` if invite creation fails).
+`POST /v1/setup/pairing` is the participant wizard's invite-minting route. It is available only on the `vercel`
+profile with a valid `Authorization: Bearer $OPENSEEK_SETUP_KEY`; a missing or invalid key, or another profile,
+answers `404 {"error":"not_found"}` so the route's existence is not observable elsewhere. The key is short-lived
+and the wizard removes it after setup. `enable_sharing` is a strict boolean and defaults to `false`. Explicit `true`
+records durable sharing consent before invite creation and preserves existing contribution choices. If sharing is
+already enabled, omitted or `false` consent still allows the invite. Otherwise, omitted or `false` consent answers
+`409 {"error":"sharing_disabled"}` without creating an invite. Invite creation failure answers
+`503 {"error":"pairing_setup_unavailable"}`; explicit sharing consent may already have been recorded.
 
 Profiles map `nvmt-v1-g5` to a 5-second grid and `nvmt-v1-g10` to a 10-second grid. Different file versions
 have different fingerprints and separate pool entries.
@@ -209,3 +217,5 @@ have different fingerprints and separate pool entries.
   auth-before-body including oversized bodies, the documented 404/405 shapes, and the advertised per-class
   rate limit with `X-RateLimit-*` headers and `429`/`Retry-After`. Missing pool credentials are now
   `401 unauthorized` (previously `403 forbidden`); malformed credentials are `400 bad_auth`.
+- 2026-11-09: reconciled tick authentication and setup-pairing consent, refusal, and invite-failure behavior with
+  the current handlers.
