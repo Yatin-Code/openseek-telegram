@@ -1,6 +1,6 @@
 # QA campaign map
 
-Generated: 2026-11-09 08:01 IST
+Generated: 2026-11-09 23:47 IST
 
 Regenerate from the repository root: `python tools/qa/map.py`.
 
@@ -29,10 +29,10 @@ Regenerate from the repository root: `python tools/qa/map.py`.
 | [#60 H9: Client on screen: grid, settings, and corrections](https://github.com/Yatin-Code/openseek-telegram/issues/60) | Epic H | open | qa:blocked | [latest comment](https://github.com/Yatin-Code/openseek-telegram/issues/60#issuecomment-6713670829) | 1 |
 | [#61 H10: Client languages](https://github.com/Yatin-Code/openseek-telegram/issues/61) | Epic H | open | qa:failed | [latest comment](https://github.com/Yatin-Code/openseek-telegram/issues/61#issuecomment-6713670971) | 2 |
 | [#62 H11: Client uploads](https://github.com/Yatin-Code/openseek-telegram/issues/62) | Epic H | open | qa:blocked | [latest comment](https://github.com/Yatin-Code/openseek-telegram/issues/62#issuecomment-6713670942) | 1 |
-| [#63 H12: Server failure drills](https://github.com/Yatin-Code/openseek-telegram/issues/63) | Epic H | open | qa:blocked | [latest comment](https://github.com/Yatin-Code/openseek-telegram/issues/63#issuecomment-6713916082) | 1 |
+| [#63 H12: Server failure drills](https://github.com/Yatin-Code/openseek-telegram/issues/63) | Epic H | open | qa:blocked | [latest comment](https://github.com/Yatin-Code/openseek-telegram/issues/63#issuecomment-6747863274) | 1 |
 | [#64 H13: Client failure drills](https://github.com/Yatin-Code/openseek-telegram/issues/64) | Epic H | open | qa:blocked | [latest comment](https://github.com/Yatin-Code/openseek-telegram/issues/64#issuecomment-6713671548) | 1 |
-| [#65 H14: Documentation accuracy](https://github.com/Yatin-Code/openseek-telegram/issues/65) | Epic H | open | qa:blocked | [latest comment](https://github.com/Yatin-Code/openseek-telegram/issues/65#issuecomment-6729297023) | 2 |
-| [#66 H15: Security pass](https://github.com/Yatin-Code/openseek-telegram/issues/66) | Epic H | open | qa:blocked | [latest comment](https://github.com/Yatin-Code/openseek-telegram/issues/66#issuecomment-6730821717) | 1 |
+| [#65 H14: Documentation accuracy](https://github.com/Yatin-Code/openseek-telegram/issues/65) | Epic H | open | qa:blocked | [latest comment](https://github.com/Yatin-Code/openseek-telegram/issues/65#issuecomment-6747846435) | 2 |
+| [#66 H15: Security pass](https://github.com/Yatin-Code/openseek-telegram/issues/66) | Epic H | open | qa:blocked | [latest comment](https://github.com/Yatin-Code/openseek-telegram/issues/66#issuecomment-6747863321) | 1 |
 | [#67 H16: Release rehearsal with a stranger](https://github.com/Yatin-Code/openseek-telegram/issues/67) | Epic H | open | qa:blocked | [latest comment](https://github.com/Yatin-Code/openseek-telegram/issues/67#issuecomment-6714365214) | 14 |
 
 ## Open bug followups
