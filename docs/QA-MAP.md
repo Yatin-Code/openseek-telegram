@@ -1,6 +1,6 @@
 # QA campaign map
 
-Generated: 2026-11-09 23:47 IST
+Generated: 2026-11-09 23:49 IST
 
 Regenerate from the repository root: `python tools/qa/map.py`.
 
@@ -19,7 +19,7 @@ Regenerate from the repository root: `python tools/qa/map.py`.
 | [#50 G7: Participant node from the CLI wizard with account tokens](https://github.com/Yatin-Code/openseek-telegram/issues/50) | Epic G | open | qa:blocked | [latest comment](https://github.com/Yatin-Code/openseek-telegram/issues/50#issuecomment-6723275458) | 1 |
 | [#51 G9: Backup, restore, upgrade, and teardown](https://github.com/Yatin-Code/openseek-telegram/issues/51) | Epic G | open | qa:blocked | [latest comment](https://github.com/Yatin-Code/openseek-telegram/issues/51#issuecomment-6713669658) | 0 |
 | [#52 H1: Pairing and device lifecycle](https://github.com/Yatin-Code/openseek-telegram/issues/52) | Epic H | open | qa:blocked | [latest comment](https://github.com/Yatin-Code/openseek-telegram/issues/52#issuecomment-6713670276) | 0 |
-| [#53 H2: Dashboard behaviour](https://github.com/Yatin-Code/openseek-telegram/issues/53) | Epic H | open | qa:blocked | [latest comment](https://github.com/Yatin-Code/openseek-telegram/issues/53#issuecomment-6730819468) | 0 |
+| [#53 H2: Dashboard behaviour](https://github.com/Yatin-Code/openseek-telegram/issues/53) | Epic H | open | qa:blocked | [latest comment](https://github.com/Yatin-Code/openseek-telegram/issues/53#issuecomment-6747902758) | 0 |
 | [#54 H3: Ranking and fetch correctness](https://github.com/Yatin-Code/openseek-telegram/issues/54) | Epic H | open | qa:blocked | [latest comment](https://github.com/Yatin-Code/openseek-telegram/issues/54#issuecomment-6713670383) | 1 |
 | [#55 H4: Librarian contribution matrix](https://github.com/Yatin-Code/openseek-telegram/issues/55) | Epic H | closed | qa:agent-pass, qa:user-pass | [latest comment](https://github.com/Yatin-Code/openseek-telegram/issues/55#issuecomment-6712184832) | 0 |
 | [#56 H5: Channel consistency and rebuild](https://github.com/Yatin-Code/openseek-telegram/issues/56) | Epic H | open | qa:agent-pass | [latest comment](https://github.com/Yatin-Code/openseek-telegram/issues/56#issuecomment-6713767250) | 0 |
