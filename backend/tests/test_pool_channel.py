@@ -277,6 +277,90 @@ def test_channel_mode_uploads_nvmt_tiles_and_retry_keeps_first_writer(tmp_path):
         core.stop()
 
 
+def test_restart_after_interrupted_publish_keeps_orphan_out_of_candidates_until_retry(tmp_path):
+    """An interrupted publish stays undiscoverable until a retry completes it.
+
+    A failing PUT (503) posts one tile with no hints manifest; after an admin
+    scan the orphan is not a hint candidate and the exact manifest shows one
+    tile of n_tiles=2; the retry PUT posts only the missing tile, then one
+    hints manifest, and the package becomes a candidate.
+    """
+    store = MemoryChannel()
+    settings = Settings(data_dir=tmp_path, pool_mode="channel", contribution=True,
+                        pool_read_key="r" * 40, pool_write_key="w" * 40,
+                        admin_token="owner-secret-long-enough",
+                        telegram_api_id=123, telegram_api_hash="a" * 32,
+                        telegram_bot_token="123456:test",
+                        telegram_channel_id=store.channel_id)
+    core = Core(settings, pool_storage=store)
+    fp = hashlib.sha256(b"h12 restart orphan source").hexdigest()
+    package = encode_nvmt(5_000, 4, {0: (0, jpeg((11, 22, 33))), 2: (10_000, jpeg((33, 22, 11)))})
+
+    def tile_docs(channel):
+        return sum(bool(message.document_size) for message in channel.messages)
+
+    def hints_posts(channel):
+        return sum(message.caption.startswith("openseek:hints:v1:") for message in channel.messages)
+
+    async def put(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                     base_url="https://openseek.test") as client:
+            return await client.put(
+                f"/v1/pool/{fp}/nvmt?profile=nvmt-v1-g5&duration_ms=20000&imdb=tt1234567"
+                "&season=0&episode=0&size_bytes=1000000&filename=Film.Name.2024.mkv",
+                content=package, headers={"Authorization": f"Bearer {'w' * 40}",
+                                          "Content-Type": "application/vnd.openseek.nvmt"})
+
+    try:
+        store.fail_after_uploads = 1
+        failed = asyncio.run(put(create_api_app(core)))
+        assert failed.status_code == 503 and failed.json()["error"] == "telegram_unavailable"
+        assert tile_docs(store) == 1 and hints_posts(store) == 0
+    finally:
+        core.stop()
+
+    # Restart: a fresh node over the same Telegram history scans via the admin
+    # surface, then retries the PUT (first tile already present, not duplicated).
+    store2 = MemoryChannel()
+    store2.messages, store2.data, store2.next_id = store.messages, store.data, store.next_id
+    core2 = Core(settings, pool_storage=store2)
+    app2, admin2 = create_api_app(core2), create_admin_app(core2)
+
+    async def reads():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app2),
+                                     base_url="https://openseek.test") as client:
+            headers = {"Authorization": f"Bearer {'r' * 40}"}
+            manifest = await client.get(f"/v1/pool/{fp}/manifest?profile={PROFILE}", headers=headers)
+            candidates = await client.get(
+                "/v1/pool/candidates?imdb=tt1234567&season=0&episode=0"
+                "&duration_ms=20000&filename=Film.Name.2024.mkv", headers=headers)
+            return manifest, candidates
+
+    async def scan():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=admin2),
+                                     base_url="http://127.0.0.1:8788",
+                                     headers={"X-OpenSeek-Admin": settings.admin_token}) as client:
+            return await client.post("/admin/pool/scan")
+
+    try:
+        scanned = asyncio.run(scan())
+        assert scanned.status_code == 200 and scanned.json()["indexed"] == 1
+        manifest, candidates = asyncio.run(reads())
+        assert manifest.status_code == 200
+        assert manifest.json()["n_tiles"] == 2 and [t["k"] for t in manifest.json()["tiles"]] == [0]
+        assert candidates.status_code == 200 and candidates.json()["candidates"] == []
+
+        retried = asyncio.run(put(app2))
+        assert retried.status_code == 201, retried.text
+        assert tile_docs(store2) == 2 and hints_posts(store2) == 1
+        manifest2, candidates2 = asyncio.run(reads())
+        assert manifest2.json()["n_tiles"] == 2
+        assert [t["k"] for t in manifest2.json()["tiles"]] == [0, 1]
+        assert [c["fp"] for c in candidates2.json()["candidates"]] == [fp]
+    finally:
+        core2.stop()
+
+
 def test_channel_duplicate_upload_with_absent_hints_keeps_stored_hints(tmp_path):
     """Same owner decision as the host-mode pool (#68) on the channel wire: a hint-less
     duplicate retry preserves stored hints in both the index row and any republished
