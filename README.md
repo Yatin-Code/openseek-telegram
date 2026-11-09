@@ -96,7 +96,7 @@ python -m openseek doctor          # local/VPS
 python -m openseek pool status     # local/VPS
 ```
 
-Expected health: `{"service": "openseek", "api": 1, ...}`. While the node is still setup-pending it answers `503` with `{"error": "setup_required", ...}` — finish the Telegram step.
+Expected health: `{"service": "openseek", "api": 1, ...}`. While the node is still setup-pending only `GET /v1/health` is available and it answers `200` with `{"service": "openseek", "setup_pending": true, ...}` — continue the wizard (Telegram step). A `503` with `{"error": "setup_required", ...}` means required environment variables are missing — finish the wizard or copy-path steps and redeploy.
 
 ---
 
