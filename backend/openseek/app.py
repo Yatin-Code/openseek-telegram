@@ -35,6 +35,8 @@ from .auth import DeviceAuth, admin_token, token_shaped
 from .cache import Cache, PROFILE, secure_mkdir
 from .config import Settings
 from .db import DB
+from .dashboard import ADMIN_HTML as _ADMIN_HTML
+from .admin_catalog import install_admin_catalog
 from .envfile import write_env_file
 from .fetch import RangeProxy
 from .ids import is_device_id, is_fingerprint, is_invite_id, parse_index
@@ -1365,137 +1367,6 @@ def api_openapi(core: Core) -> dict:
 
 
 # ===================================================================== admin app
-_ADMIN_HTML = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>OpenSeek admin</title>
-<style>*{box-sizing:border-box}body{font:15px system-ui,sans-serif;margin:2em auto;width:calc(100% - 2em);max-width:52em;color:#222}
-code{font-size:1.1em;overflow-wrap:anywhere;word-break:break-word}table{border-collapse:collapse;width:100%;table-layout:fixed}
-.pairing-details,.invite-details{overflow-wrap:anywhere;word-break:break-word}
-td,th{border:1px solid #ccc;padding:.3em .6em;overflow-wrap:anywhere}.code{font-size:2.4em;letter-spacing:.15em;
-font-family:monospace;overflow-wrap:anywhere}button{font:inherit;min-height:2.5rem;margin:.2em;padding:.35em .7em;white-space:normal}
-input,select{font:inherit;max-width:100%;min-width:0;min-height:2.5rem}input[type=url]{width:100%}form{max-width:100%}
-@media(max-width:600px){body{margin:1em auto}.code{font-size:clamp(1.5em,9vw,2.4em);letter-spacing:.1em}
-.setup-form label,.generation-form label{display:block;margin:.35em 0}.setup-form input,.generation-form input,.generation-form select{display:block;width:100%}
-.device-table thead{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap;border:0}
-.device-table tbody,.device-table tbody tr{display:block;width:100%}.device-table tbody tr{border:1px solid #ccc;margin:.6em 0;padding:.2em .6em}
-.device-table td{display:grid;grid-template-columns:7rem minmax(0,1fr);align-items:center;gap:.5rem;border:0;padding:.3em 0}
-.device-table td::before{font-weight:600}.device-table td:nth-child(1)::before{content:"Device ID"}.device-table td:nth-child(2)::before{content:"Name"}
-.device-table td:nth-child(3)::before{content:"NVMT uploads"}.device-table td:nth-child(4)::before{content:"Actions"}
-.device-table .empty-row td{display:block}.device-table .empty-row td::before{content:none}}</style></head><body>
-<h1>OpenSeek</h1><div id=s>loading…</div>
-<script>
-const PROFILE='__PROFILE__';
-let T=(location.hash||'').slice(1)||sessionStorage.getItem('osk')||'';if(T)sessionStorage.setItem('osk',T);history.replaceState(null,'',location.pathname);
-const H={'X-OpenSeek-Admin':T};
-const PAIR_KEY='oskPairing';
-let authFailed=false;
-let loadFailureVisible=false;
-function esc(t){return String(t).replace(/[&<>"']/g,c=>'&#'+c.charCodeAt(0)+';')}
-function isRecord(value){return value!==null&&typeof value==='object'&&!Array.isArray(value)}
-function failure(kind){const e=new Error(kind);e.kind=kind;return e}
-async function adminRequest(url,options){let response;try{response=await fetch(url,options)}catch(_){throw failure('network')}
-if(response.status===204)return {response,data:null};let data=null;
-try{data=await response.json()}catch(_){if(response.ok)throw failure('malformed')}
-if(response.status===403&&isRecord(data)&&data.error==='admin_auth')throw failure('auth');
-if(response.ok&&!isRecord(data))throw failure('malformed');return {response,data}}
-function showFailure(kind){const root=document.getElementById('s');if(kind==='auth'){
-authFailed=true;try{sessionStorage.removeItem('osk');sessionStorage.removeItem(PAIR_KEY)}catch(_){}
-window.lastPairing='';window.lastInvite='';window.setupMessage='';window.generationMessage='';T='';delete H['X-OpenSeek-Admin'];
-const next=PROFILE==='vercel'?'Reopen the dashboard with the correct admin link from your deployment.':
-'On the server, run python -m openseek dashboard to get a fresh link, then reopen it.';
-root.innerHTML='<section role="alert" aria-live="assertive" tabindex="-1"><h2>Admin access denied</h2><p>The admin secret was not accepted. '+esc(next)+'</p></section>';
-return}
-if(loadFailureVisible)return;loadFailureVisible=true;
-root.innerHTML='<section role="alert" aria-live="assertive" tabindex="-1"><h2>Dashboard status unavailable</h2><p>OpenSeek could not load a valid dashboard response. Check that the server is reachable, then retry.</p><button type="button" onclick="load()">Retry</button></section>';
-}
-async function safely(action){try{return await action()}catch(e){showFailure(e&&e.kind==='auth'?'auth':'load');return null}}
-function setupErrorText(code){const messages={telegram_access_denied:'OpenSeek cannot read this channel. Add the bot or account to the channel and grant access to its message history.',telegram_login_required:'Telegram rejected these credentials. Check the bot token or StringSession and Telegram API ID/hash.',telegram_unavailable:'Telegram could not be reached. Check the network and try again.',telegram_error:'Telegram could not verify this channel. Check the channel ID and account permissions.'};return messages[code]||('Setup failed ('+code+'). Check the channel ID, Telegram credentials, and channel permissions.')}
-async function act(m,u){return safely(async()=>{await adminRequest(u,{method:m,headers:H});if(m==='DELETE'&&u==='/admin/pair'){sessionStorage.removeItem(PAIR_KEY);window.lastPairing=''}await load()})}
-async function openPair(){return safely(async()=>{const x=await adminRequest('/admin/pair',{method:'POST',headers:H}),r=x.response,j=x.data;
-if(r.ok&&(typeof j.code!=='string'||typeof j.spki_pin!=='string'))throw failure('malformed');
-window.lastPairing=r.ok?('Nuvio code: '+j.code+' | TLS pin: '+j.spki_pin+(j.join?' | Join link: '+j.join:'')):'Could not open pairing: '+((j&&j.error)||'request_failed');
-if(r.ok)sessionStorage.setItem(PAIR_KEY,window.lastPairing);else sessionStorage.removeItem(PAIR_KEY);await load()})}
-async function sharing(on){return safely(async()=>{await adminRequest('/admin/sharing',{method:'PUT',headers:Object.assign({'Content-Type':'application/json'},H),body:JSON.stringify({enabled:on})});await load()})}
-async function poolContributions(on){return safely(async()=>{await adminRequest('/admin/pool/contributions',{method:'PUT',headers:Object.assign({'Content-Type':'application/json'},H),body:JSON.stringify({enabled:on})});await load()})}
-async function deviceContribution(id,on){return safely(async()=>{await adminRequest('/admin/devices/'+encodeURIComponent(id)+'/permissions',{method:'PUT',headers:Object.assign({'Content-Type':'application/json'},H),body:JSON.stringify({contribute:on})});await load()})}
-async function mkinvite(){return safely(async()=>{const x=await adminRequest('/admin/invites',{method:'POST',headers:Object.assign({'Content-Type':'application/json'},H),body:JSON.stringify({public:!!window.pubOn})}),r=x.response,j=x.data;
-if(r.ok&&(typeof j.address!=='string'||typeof j.code!=='string'||typeof j.join!=='string'||!Number.isFinite(j.expires_in_s)))throw failure('malformed');
-window.lastInvite=r.ok?('Server '+j.address+' - code '+j.code+' (valid '+Math.round(j.expires_in_s/3600)+' h, one use). Join string: '+j.join):'Could not create: '+((j&&j.error)||'request_failed');await load()})}
-async function generate(event){event.preventDefault();return safely(async()=>{const d=Object.fromEntries(new FormData(event.currentTarget));d.season=Number(d.season||0);d.episode=Number(d.episode||0);
-const x=await adminRequest('/admin/generations',{method:'POST',headers:Object.assign({'Content-Type':'application/json'},H),body:JSON.stringify(d)}),r=x.response,j=x.data;
-if(r.ok&&typeof j.generation_id!=='string')throw failure('malformed');window.generationMessage=r.ok?'Generation started: '+j.generation_id:'Could not start generation: '+((j&&j.error)||'request_failed');await load()})}
-window.setupScreen=false;
-async function setupSubmit(event){event.preventDefault();return safely(async()=>{const f=event.currentTarget;const d=Object.fromEntries(new FormData(f));d.telegram_api_id=Number(d.telegram_api_id);
-const x=await adminRequest('/admin/setup',{method:'POST',headers:Object.assign({'Content-Type':'application/json'},H),body:JSON.stringify(d)}),r=x.response,j=x.data;
-if(!r.ok){document.getElementById('setupError').textContent=setupErrorText((j&&j.error)||'setup_failed');return}
-if(!isRecord(j.initial_scan)||!Number.isFinite(j.initial_scan.indexed)||typeof j.channel_writable!=='boolean')throw failure('malformed');
-window.setupMessage='Telegram history is readable. Initial scan indexed '+j.initial_scan.indexed+' tiles; '+(j.channel_writable?'channel posting is available.':'this channel is read-only, so uploads are disabled. Grant the bot Post Messages permission to enable uploads.');window.setupScreen=false;await load()})}
-async function load(){if(authFailed)return;if(!T){document.getElementById('s').textContent=PROFILE==='vercel'?'Open this page with the admin secret in the URL fragment: https://'+location.host+'/#<OPENSEEK_ADMIN_TOKEN>':'Open this page with: python -m openseek dashboard';return}
-return safely(async()=>{
-const cx=await adminRequest('/admin/setup',{headers:H});if(!cx.response.ok)throw failure('load');const cfg=cx.data;
-if(typeof cfg.setup_required!=='boolean')throw failure('malformed');let setupHtml='';if(cfg.setup_required){setupHtml=
-'<h2>Connect the Telegram pool</h2><p>OpenSeek stores packages in Telegram. Enter the channel and Telegram API details. Provide one identity: a bot token or a StringSession. The channel must allow history access; posting permission enables uploads.</p>'+
-'<form class="setup-form" onsubmit="setupSubmit(event)"><p><label>Channel ID or username<br><input name="telegram_channel_id" required maxlength="128"></label></p>'+
-'<p><label>Telegram API ID<br><input name="telegram_api_id" type="number" min="1" required></label></p>'+
-'<p><label>Telegram API hash<br><input name="telegram_api_hash" type="password" autocomplete="off" required></label></p>'+
-'<p><label>Bot token (leave blank when using a StringSession)<br><input name="telegram_bot_token" type="password" autocomplete="off"></label></p>'+
-'<p><label>StringSession (leave blank when using a bot token)<br><input name="telegram_session" type="password" autocomplete="off"></label></p>'+
-'<p>Credentials are saved in the per-install private .env file. They are never shown in logs or returned by the server.</p>'+
-'<button type="submit">Verify channel and start scan</button> <span id="setupError" role="alert"></span></form>';}
-window.setupScreen=false;const rx=await adminRequest('/admin/status',{headers:H});if(!rx.response.ok)throw failure('load');const r=rx.data;
-if(!isRecord(r.pairing)||typeof r.pairing.open!=='boolean'||!isRecord(r.server)||!Array.isArray(r.server.addresses)||
-!Array.isArray(r.devices)||!r.devices.every(isRecord)||!isRecord(r.cache)||
-!['entries','tiles','bytes','max_bytes'].every(k=>Number.isFinite(r.cache[k])))throw failure('malformed');
-if(!r.pairing.open){sessionStorage.removeItem(PAIR_KEY);window.lastPairing=''}else if(!window.lastPairing){window.lastPairing=sessionStorage.getItem(PAIR_KEY)||''}
-let h=setupHtml;
-if(window.setupMessage){h+='<p>'+esc(window.setupMessage)+'</p>';window.setupMessage=''}
-h+='<h2>Server</h2><p>'+(r.server.profile==='vercel'?'Dashboard host <code>'+esc(location.host)+'</code>':'API port <code>'+esc(r.server.port)+'</code>, addresses: <code>'+esc(r.server.addresses.join(', '))+'</code>')+
-'<br>Pin: <code>'+esc(r.server.spki_pin)+'</code></p><h2>Pairing</h2>';
-if(window.lastPairing)h+='<p class=pairing-details>'+esc(window.lastPairing)+'</p>';
-if(r.pairing.open){h+=(r.pairing.code?'<p class=code>'+esc(r.pairing.code)+'</p>':'')+'<p>expires in '+esc(r.pairing.expires_in_s)+
-' s, attempts left '+esc(r.pairing.attempts_left)+'</p><button onclick="act(\\'DELETE\\',\\'/admin/pair\\')">Close</button>'}
-else{h+=(r.pairing.burned?'<p><b>Last window burned after too many wrong codes.</b></p>':'')+
-'<button onclick="openPair()">Open pairing window</button>'}
-h+='<h2>Devices</h2><table class="device-table"><thead><tr><th scope="col">id</th><th scope="col">name</th><th scope="col">NVMT uploads</th><th scope="col">Actions</th></tr></thead><tbody>';
-if(!r.devices.length)h+='<tr class="empty-row"><td colspan="4">No paired devices</td></tr>';
-for(const d of r.devices){h+='<tr><td><code>'+esc(d.device_id)+'</code></td><td>'+esc(d.name)+'</td><td>'+
-(d.role==='guest'?'<button onclick="deviceContribution(\\''+esc(d.device_id)+'\\','+(!d.contribute)+')">'+(d.contribute?'Disable':'Enable')+'</button>': 'Owner')+
-'</td><td><button onclick="act(\\'DELETE\\',\\'/admin/devices/'+esc(d.device_id)+'\\')">Revoke</button></td></tr>'}
-h+='</tbody></table>';
-const sx=await adminRequest('/admin/sharing',{headers:H});if(!sx.response.ok)throw failure('load');const sh=sx.data;
-if(typeof sh.enabled!=='boolean'||!Array.isArray(sh.invites)||!sh.invites.every(i=>isRecord(i)&&typeof i.invite_id==='string'))throw failure('malformed');
-h+='<h2>Sharing</h2><p>Sharing is <b>'+(sh.enabled?'ON':'OFF')+'</b> <button onclick="sharing('+(sh.enabled?'false':'true')+')">Turn '+(sh.enabled?'off':'on')+'</button></p>';
-if(sh.enabled){h+='<p>Guest NVMT contributions are <b>'+(sh.pool_contributions_enabled?'ON':'OFF')+'</b> <button onclick="poolContributions('+(sh.pool_contributions_enabled?'false':'true')+')">Turn guest uploads '+(sh.pool_contributions_enabled?'off':'on')+'</button></p>'}
-window.pubOn=!!(sh.public&&sh.public.listening&&sh.public.host);if(sh.enabled){h+='<button onclick="mkinvite()">Create invitation'+(window.pubOn?' (public: '+esc(sh.public.host)+')':' (LAN)')+'</button> <span class="invite-details" id=inv>'+esc(window.lastInvite||'')+'</span><table><tr><th>invitation</th><th>state</th><th>expires in</th><th></th></tr>';
-for(const i of sh.invites){h+='<tr><td>'+esc(i.label||i.invite_id.slice(0,8))+'</td><td>'+esc(i.state)+'</td><td>'+esc(i.expires_in_s)+' s</td><td>'+
-(i.state=='open'?'<button onclick="act(\\'DELETE\\',\\'/admin/invites/'+esc(i.invite_id)+'\\')">Revoke</button>':'')+'</td></tr>'}
-h+='</table>'}
-h+='<h2>Pool</h2>';
-const gx=await adminRequest('/admin/generations',{headers:H});if(!gx.response.ok)throw failure('load');const gj=gx.data;
-if(!Array.isArray(gj.jobs)||!gj.jobs.every(isRecord))throw failure('malformed');
-const jobsHtml=gj.jobs.map(j=>'<p><code>'+esc(j.generation_id)+'</code> '+esc(j.state)+' · '+esc(j.tiles_done||0)+'/'+esc(j.tiles_total||'?')+' tiles'+(j.error?' · '+esc(j.error):'')+'</p>').join('');
- h+='<h2>Generate NVMT package</h2><p>This runs only when you start it here. It reads the media URL and publishes the generated package to Telegram.</p><form class="generation-form" onsubmit="generate(event)">'+
-'<p><label>Media URL<br><input name="source_url" type="url" required maxlength="4096" style="width:100%"></label></p><p><label>Profile <select name="profile"><option>nvmt-v1-g10</option><option>nvmt-v1-g5</option></select></label> '+
-'<label>IMDb ID <input name="imdb" placeholder="tt1234567"></label> <label>Season <input name="season" type="number" min="0" value="0"></label> <label>Episode <input name="episode" type="number" min="0" value="0"></label></p>'+
-'<p><label>Filename hint <input name="filename" maxlength="1024"></label> <button type="submit">Generate and publish</button></p></form>'+
-(window.generationMessage?'<p role="status">'+esc(window.generationMessage)+'</p>':'')+'<div id="generationJobs">'+jobsHtml+'</div>';
-const px=await adminRequest('/admin/pool/status',{headers:H}),pr=px.response,p=isRecord(px.data)?px.data:{error:'request_failed'};
-if(!pr.ok)h+='<p role="alert">Pool setup check failed: '+esc(setupErrorText(p.reason||p.error||'setup_failed'))+'</p>';
-h+='<p>Mode <b>'+esc(p.mode)+'</b>';
-if(p.mode==='channel'){h+='; channel <code>'+esc(p.channel_id)+'</code>; '+esc(p.tiles)+' tiles; history '+
-(p.history_readable?'readable':'unavailable (bot identity: publishing only)')+'; posting '+(p.channel_writable?'available':'read-only')+(p.channel_writable?'':'; grant the bot Post Messages permission to enable uploads')+'; last message '+
-esc(p.last_message_id)+'; pending uploads '+esc(p.outbox)+(p.last_error?'; last error '+esc(setupErrorText(p.last_error)):'')+' <button onclick="act(\\'POST\\',\\'/admin/pool/scan\\')">Scan</button> '+
-'<button onclick="act(\\'POST\\',\\'/admin/pool/rebuild\\')">Rebuild index</button>'}
-else if(p.mode==='host'){h+='; API '+(p.api_enabled?'enabled':'disabled')+(p.api_url?'; URL <code>'+esc(p.api_url)+'</code>':'')+
-'; '+esc(p.tiles)+' tiles; '+
-esc(p.packages)+' packages; pending uploads '+esc(p.outbox)}
-else{h+='; no shared pool connections'}
-h+='</p>';
-h+='<h2>Cache</h2><p>'+esc(r.cache.entries)+' titles, '+esc(r.cache.tiles)+' tiles, '+
-esc((r.cache.bytes/1048576).toFixed(1))+' MiB of '+esc((r.cache.max_bytes/1048576).toFixed(0))+' MiB; '+
-esc(r.active_sources)+' active source(s)</p>';loadFailureVisible=false;document.getElementById('s').innerHTML=h})}
-load();setInterval(load,3000);
-</script></body></html>"""
-
-
 def lan_addresses() -> list[str]:
     out = []
     try:
@@ -1520,7 +1391,7 @@ def create_admin_app(core: Core) -> FastAPI:
         return HTMLResponse(_ADMIN_HTML.replace("const PROFILE='__PROFILE__';",
                                                f"const PROFILE='{core.settings.profile}';"), headers={
             "Content-Security-Policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
-                                       "connect-src 'self'; frame-ancestors 'none'"})
+                                       "connect-src 'self'; img-src data: blob:; frame-ancestors 'none'"})
 
     @app.get("/admin/setup")
     async def setup_status():
@@ -1793,6 +1664,7 @@ def create_admin_app(core: Core) -> FastAPI:
             return err(404, "not_found")
         return Response(status_code=204)
 
+    install_admin_catalog(app, core)
     return Guard(app, core, admin=True)  # type: ignore[return-value]
 
 

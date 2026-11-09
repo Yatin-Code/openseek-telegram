@@ -1,0 +1,78 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-11-09T20:29:32.771360+00:00",
+  "title": "Design System: OpenSeek",
+  "extensions": {
+    "breakpoints": [
+      {
+        "name": "navigation-and-forms",
+        "value": "900px"
+      },
+      {
+        "name": "stacked-metrics",
+        "value": "520px"
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary button",
+      "kind": "button",
+      "description": "Primary button from the shared dashboard.",
+      "html": "<button class=\"ds-primary\">Generate package</button>",
+      "css": ".ds-primary{font:600 14px \"Segoe UI\",system-ui,sans-serif;min-height:44px;padding:10px 16px;border:0;border-radius:9px;background:var(--accent,#8b7bff);color:var(--bg,#0d0e12);cursor:pointer}.ds-primary:hover{background:#9d8fff}.ds-primary:focus-visible{outline:2px solid #8b7bff;outline-offset:3px}.ds-primary:disabled{background:#2b2846;color:#8b91a1}",
+      "refersTo": "button-primary"
+    },
+    {
+      "name": "Secondary button",
+      "kind": "button",
+      "description": "Secondary button from the shared dashboard.",
+      "html": "<button class=\"ds-secondary\">Refresh</button>",
+      "css": ".ds-secondary{font:14px \"Segoe UI\",system-ui,sans-serif;min-height:44px;padding:10px 16px;border:1px solid #252a36;border-radius:9px;background:#1f2330;color:#e9eaf0;cursor:pointer}.ds-secondary:hover{background:#232838;border-color:#3a4155}.ds-secondary:focus-visible{outline:2px solid #8b7bff;outline-offset:2px}"
+    },
+    {
+      "name": "Text input",
+      "kind": "input",
+      "description": "Text input from the shared dashboard.",
+      "html": "<label class=\"ds-label\" for=\"ds-media\">Media URL</label><input class=\"ds-input\" id=\"ds-media\" placeholder=\"https://media.example.com/video.mkv\">",
+      "css": ".ds-label{display:block;font:13px \"Segoe UI\",system-ui,sans-serif;color:#8b91a1;margin-bottom:5px}.ds-input{font:14px \"Segoe UI\",system-ui,sans-serif;min-height:44px;width:100%;padding:7px 10px;border:1px solid #252a36;border-radius:9px;background:#13151b;color:#e9eaf0;caret-color:#8b7bff}.ds-input::placeholder{color:#8b91a1}.ds-input:focus-visible{outline:2px solid #8b7bff;outline-offset:2px}"
+    },
+    {
+      "name": "Navigation",
+      "kind": "nav",
+      "description": "Navigation from the shared dashboard.",
+      "html": "<nav class=\"ds-nav\"><button aria-current=\"page\">Dashboard</button><button>Library</button></nav>",
+      "css": ".ds-nav{display:flex;flex-direction:column;gap:4px;background:#13151b;padding:14px;width:220px}.ds-nav button{font:13px \"Segoe UI\",system-ui,sans-serif;min-height:44px;text-align:left;padding:9px 14px;border:0;border-radius:9px;background:transparent;color:#8b91a1;cursor:pointer}.ds-nav button:hover{background:#181b23;color:#e9eaf0}.ds-nav button[aria-current]{background:#1f2330;color:#e9eaf0}.ds-nav button:focus-visible{outline:2px solid #8b7bff;outline-offset:2px}"
+    },
+    {
+      "name": "Status pill",
+      "kind": "chip",
+      "description": "Status pill from the shared dashboard.",
+      "html": "<span class=\"ds-status\">Online</span>",
+      "css": ".ds-status{display:inline-flex;gap:6px;align-items:center;padding:3px 10px;border-radius:10px;background:rgba(79,214,138,.14);color:#4fd68a;font:600 12px \"Segoe UI\",system-ui,sans-serif}.ds-status:before{content:\"\";width:7px;height:7px;border-radius:50%;background:currentColor}"
+    },
+    {
+      "name": "Panel",
+      "kind": "card",
+      "description": "Panel from the shared dashboard.",
+      "html": "<section class=\"ds-card\"><h2>Recent activity</h2><p>Generation outcomes from this server.</p></section>",
+      "css": ".ds-card{background:#181b23;border:1px solid #252a36;border-radius:14px;padding:20px 18px;color:#e9eaf0;font:14px/1.45 \"Segoe UI\",system-ui,sans-serif}.ds-card h2{font-size:14px;font-weight:600;margin:0 0 10px}.ds-card p{color:#8b91a1;margin:0}",
+      "refersTo": "panel"
+    }
+  ],
+  "narrative": {
+    "northStar": "Original OpenSeek desktop visual system",
+    "overview": "The browser preserves the original dark sidebar, violet actions, teal highlights, restrained metrics, and bordered panels while displaying the current NVMT pool features.",
+    "keyCharacteristics": [
+      "Persistent navigation",
+      "Readable status with real backend data",
+      "Shared controls across deployment profiles"
+    ],
+    "dos": [
+      "Integrate owner actions into the shared dashboard using existing services."
+    ],
+    "donts": [
+      "Do not create a separate unstyled admin page for a new feature."
+    ]
+  }
+}

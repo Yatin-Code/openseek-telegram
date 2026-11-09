@@ -742,6 +742,43 @@ class RemoteChannelStore:
                 "hints": self.client.count("pool_hints"),
                 "episode_packages": self.client.count("pool_episode_packages")}
 
+    def catalog_page(self, limit: int, offset: int) -> tuple[list[dict], bool]:
+        """One bounded page of hints-committed catalog packages via PostgREST.
+
+        Queries pool_hints ordered deterministically with limit+1/offset, then
+        resolves thumbnail availability from the existing pool_packages view
+        (channel_tiles>0) for just the returned fingerprints. Bounded reads only;
+        RemoteStoreError propagates for sanitized handling at the HTTP boundary.
+        """
+        limit = max(1, min(int(limit), 100))
+        offset = max(0, min(int(offset), 100000))
+        hint_rows = self.client.select(
+            "pool_hints",
+            [("select", "fp,profile,imdb,season,episode,duration_ms,filename_norm,n_tiles,created"),
+             ("order", "created.desc,fp.asc,profile.asc"),
+             ("limit", str(limit + 1)), ("offset", str(offset))])
+        has_more = len(hint_rows) > limit
+        if has_more:
+            hint_rows = hint_rows[:limit]
+        if not hint_rows:
+            return [], False
+        fps = sorted({str(row["fp"]) for row in hint_rows})
+        package_rows = self.client.select(
+            "pool_packages",
+            [("select", "fp,profile,channel_tiles"),
+             ("fp", f"in.({','.join(fps)})")])
+        thumbs = {str(row["fp"]) for row in package_rows
+                  if row.get("profile") == PROFILE and int(row.get("channel_tiles") or 0) > 0}
+        items = [{
+            "fp": str(row["fp"]), "profile": str(row["profile"]),
+            "filename": row.get("filename_norm"), "imdb": row.get("imdb"),
+            "season": int(row.get("season") or 0), "episode": int(row.get("episode") or 0),
+            "duration_ms": int(row["duration_ms"]), "n_tiles": int(row["n_tiles"]),
+            "created": float(row["created"]),
+            "thumbnail_available": str(row["fp"]) in thumbs,
+        } for row in hint_rows]
+        return items, has_more
+
     # ---------------------------------------------------------------- row mapping
     @staticmethod
     def _row(tile: dict) -> dict:

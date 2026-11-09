@@ -42,7 +42,9 @@ Outbound media access uses the destination policy, DNS checks, bounded HTTP rang
 
 ## Main modules
 
-- app.py: API, dashboard, pairing, deployment wiring.
+- app.py: API, pairing, admin routes and deployment wiring.
+- dashboard.py: shared browser UI using the original OpenSeek visual system.
+- admin_catalog.py: thin owner catalogue, preview and moderation adapters over existing stores.
 - generation.py: dashboard generation state, package assembly, and publication.
 - fetch.py and netpolicy.py: validated, bounded media access.
 - worker.py and engine.py: media probing and frame extraction.

@@ -31,6 +31,7 @@ The benchmark harness has its own tests in `bench/tests` (`bench/requirements.tx
 * Any change to the outbound policy, authentication, listeners or shared-pool write permissions needs tests, including negative tests.
 * Do not add an environment switch that weakens the destination policy.
 * Keep dependencies minimal and pinned; new dependencies need a licence check.
+* Integrate owner-facing features into the shared [dashboard](docs/DASHBOARD.md), using [DESIGN.md](DESIGN.md) and the existing backend services. Verify the control and its states in the browser; an isolated API implementation is not the complete owner experience.
 
 ## Pull requests
 

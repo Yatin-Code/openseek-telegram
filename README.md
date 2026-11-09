@@ -474,7 +474,7 @@ Generated JPEG tiles, their timing and NVMT profile, the media fingerprint, and 
 
 ## Manage your node
 
-The browser dashboard is the owner interface.
+The browser dashboard is the owner interface, using the original OpenSeek sidebar and visual style. See the [dashboard guide](docs/DASHBOARD.md) for its integrated screens.
 
 - **Vercel:** `https://<node>/#<OPENSEEK_ADMIN_TOKEN>`
 - **Local/VPS:** the URL printed by `python -m openseek dashboard`

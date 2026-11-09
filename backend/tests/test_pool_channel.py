@@ -491,7 +491,7 @@ def test_dashboard_controls_guest_pool_contributions(tmp_path):
 
     try:
         page = asyncio.run(dashboard())
-        assert page.status_code == 200 and "NVMT uploads" in page.text
+        assert page.status_code == 200 and "Allow guest contributions" in page.text
         permission = asyncio.run(set_device_permission(True))
         assert permission.status_code == 200 and permission.json()["contribute"] is True
         assert core.auth.can_contribute(device_id)

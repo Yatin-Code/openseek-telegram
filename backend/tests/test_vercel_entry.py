@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib
 import json
 from pathlib import Path
@@ -12,13 +13,16 @@ from fastapi import FastAPI
 
 from openseek.app import Core, create_api_app
 from openseek.auth import DeviceAuth
+from openseek.cache import PROFILE
 from openseek.config import Settings
 from openseek.pairing import InviteManager, PairingManager, client_proof, derive_key
 from openseek.pool import PoolError
-from openseek.remote import (RemotePairingStore, RemoteTelegramSessionLease,
-                             RemoteUploadQueueStore, SupabaseClient)
+from openseek.remote import (RemoteChannelStore, RemotePairingStore,
+                             RemoteTelegramSessionLease, RemoteUploadQueueStore,
+                             SupabaseClient)
 from openseek.remote_admin import RemoteAdminStore
 from openseek.tls import valid_spki_pin
+from test_admin_catalog import MemoryChannel, jpeg
 from test_uploads import FakeSupabase
 
 
@@ -96,6 +100,85 @@ class SessionLease:
     def release(self, owner):
         self.released_by.append(owner)
         return True
+
+
+class CountingMemoryChannel(MemoryChannel):
+    """MemoryChannel external transport that records cold-start lifecycle."""
+
+    def __init__(self):
+        super().__init__()
+        self.starts = 0
+        self.closes = 0
+        self.scan_calls = []
+
+    def start(self):
+        self.starts += 1
+
+    def close(self):
+        self.closes += 1
+
+    def scan(self, min_id=0, limit=2000):
+        self.scan_calls.append((min_id, limit))
+        return super().scan(min_id, limit)
+
+
+def library_core(tmp_path, *, acquired=True):
+    """Real Core + real ChannelIndex/ChannelPoolService/RemoteChannelStore.
+
+    Fakes only the external boundaries: MemoryChannel for Telegram,
+    SupabaseClient transport (MockTransport) for PostgREST, and the
+    SessionLease boundary. No production hooks added for tests.
+    """
+    from openseek.channel_index import ChannelIndex as RealChannelIndex
+    from openseek.channel_pool import ChannelPoolService
+
+    cfg = settings(tmp_path)
+    memory = CountingMemoryChannel()
+    # pool_storage wires Core's channel pool to the fake Telegram transport;
+    # profile=vercel makes Core build the real RemoteChannelStore path.
+    core = Core(cfg, proxy=NoSourceProxy(), pool_storage=memory)
+
+    fp = "a" * 64
+    data = jpeg()
+    digest = hashlib.sha256(data).hexdigest()
+    memory.data[1] = data
+    hint = {"fp": fp, "profile": "nvmt-v1-g10", "imdb": "tt1234567",
+            "season": 1, "episode": 2, "duration_ms": 20_000,
+            "size_bytes": 1_000_000, "filename_norm": "film.2024",
+            "n_tiles": 2, "grid": 10_000, "created": 10.0}
+    package = {"fp": fp, "profile": PROFILE, "duration_ms": 20_000,
+               "channel_tiles": 2}
+    tile = {"fp": fp, "profile": PROFILE, "k": 0, "pts_ms": 0,
+            "duration_ms": 20_000, "n_tiles": 2, "size": len(data),
+            "sha256": digest, "message_id": 1, "created": 10.0}
+    payloads = {"/rest/v1/pool_hints": [hint],
+                "/rest/v1/pool_packages": [package],
+                "/rest/v1/pool_channel_tiles": [tile]}
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        rows = payloads.get(request.url.path, [])
+        return httpx.Response(200, json=rows, request=request)
+
+    client = SupabaseClient(cfg.supabase_url, cfg.supabase_service_key,
+                            transport=httpx.MockTransport(transport))
+    core.supabase.close()
+    core.supabase = client
+    remote_store = RemoteChannelStore(client)
+    # Real ChannelIndex + ChannelPoolService over the real RemoteChannelStore.
+    core.channel_index = RealChannelIndex(remote_store, memory, db=None,
+                                          channel_id=cfg.telegram_channel_id)
+    core.pool = ChannelPoolService(core.channel_index, cfg.pool_read_key,
+                                   cfg.pool_write_key)
+    # Keep other Supabase-backed stores on the same mocked transport so no
+    # real network is touched if touched.
+    core.state_store = RemoteAdminStore(client)
+    if core.uploads is not None and hasattr(core.uploads, "store"):
+        try:
+            core.uploads.store = RemoteUploadQueueStore(client)
+        except Exception:
+            pass
+    core.telegram_session_lease = SessionLease(acquired=acquired)
+    return cfg, core, fp, memory, data
 
 
 def settings(tmp_path):
@@ -366,3 +449,192 @@ def test_vercel_dashboard_reports_telegram_permission_failures(tmp_path, monkeyp
         assert response.json() == {"error": "pool_index_unavailable", "reason": "telegram_access_denied"}
     finally:
         core.stop()
+
+
+def test_vercel_library_list_refreshes_under_lease_and_requires_owner(tmp_path, monkeypatch):
+    monkeypatch.setenv("VERCEL", "1")
+    from openseek.vercel import build_app
+
+    cfg, core, fp, memory, _data = library_core(tmp_path)
+    app = build_app(cfg, core=core)
+    try:
+        denied = request(app, "GET", "/admin/library?limit=24&offset=0")
+        assert denied.status_code == 403, denied.text
+        assert memory.starts == 0
+        assert memory.scan_calls == []
+        assert core.telegram_session_lease.acquired_by == []
+
+        wrong = request(app, "GET", "/admin/library?limit=24&offset=0", owner="wrong-owner-secret")
+        assert wrong.status_code == 403
+        assert memory.starts == 0
+        assert memory.scan_calls == []
+        assert core.telegram_session_lease.acquired_by == []
+
+        allowed = request(app, "GET", "/admin/library?limit=24&offset=0", owner=ADMIN_TOKEN)
+        assert allowed.status_code == 200, allowed.text
+        body = allowed.json()
+        assert body["supported"] is True
+        assert body["has_more"] is False
+        assert body["items"] == [{"fp": fp, "profile": "nvmt-v1-g10", "filename": "film.2024",
+                                  "imdb": "tt1234567", "season": 1, "episode": 2,
+                                  "duration_ms": 20_000, "n_tiles": 2, "created": 10.0,
+                                  "thumbnail_available": True}]
+        # Cold-start lease: connect, bounded refresh scan, disconnect, release.
+        assert memory.starts == 1
+        assert len(memory.scan_calls) == 1
+        assert memory.closes == 1
+        assert len(core.telegram_session_lease.acquired_by) == 1
+        assert core.telegram_session_lease.acquired_by == core.telegram_session_lease.released_by
+
+        # A second authorized request cold-starts again after the disconnect.
+        again = request(app, "GET", "/admin/library?limit=24&offset=0", owner=ADMIN_TOKEN)
+        assert again.status_code == 200, again.text
+        assert memory.starts == 2
+        assert len(memory.scan_calls) == 2
+        assert len(core.telegram_session_lease.acquired_by) == 2
+        assert core.telegram_session_lease.acquired_by == core.telegram_session_lease.released_by
+    finally:
+        core.stop()
+
+
+def test_vercel_library_thumbnail_refreshes_under_lease_and_requires_owner(tmp_path, monkeypatch):
+    monkeypatch.setenv("VERCEL", "1")
+    from openseek.vercel import build_app
+
+    cfg, core, fp, memory, data = library_core(tmp_path)
+    app = build_app(cfg, core=core)
+    thumb_path = f"/admin/library/{fp}/thumbnail?profile=nvmt-v1-g10"
+    try:
+        denied = request(app, "GET", thumb_path)
+        assert denied.status_code == 403, denied.text
+        assert memory.starts == 0
+        assert memory.scan_calls == []
+        assert core.telegram_session_lease.acquired_by == []
+
+        allowed = request(app, "GET", thumb_path, owner=ADMIN_TOKEN)
+        assert allowed.status_code == 200, allowed.text
+        assert allowed.content == data
+        assert allowed.headers["content-type"] == "image/jpeg"
+        assert "private" in allowed.headers["cache-control"]
+        assert "no-store" in allowed.headers["cache-control"]
+        assert memory.starts == 1
+        assert len(memory.scan_calls) == 1
+        assert memory.closes == 1
+        assert len(core.telegram_session_lease.acquired_by) == 1
+        assert core.telegram_session_lease.acquired_by == core.telegram_session_lease.released_by
+    finally:
+        core.stop()
+
+
+def test_vercel_library_lease_contention_returns_existing_503(tmp_path, monkeypatch):
+    monkeypatch.setenv("VERCEL", "1")
+    from openseek.vercel import build_app
+
+    cfg, core, fp, memory, _data = library_core(tmp_path, acquired=False)
+    app = build_app(cfg, core=core)
+    try:
+        listed = request(app, "GET", "/admin/library?limit=24&offset=0", owner=ADMIN_TOKEN)
+        assert listed.status_code == 503, listed.text
+        assert listed.json() == {"error": "telegram_session_busy"}
+        assert memory.starts == 0
+        assert memory.scan_calls == []
+
+        thumb = request(app, "GET", f"/admin/library/{fp}/thumbnail?profile=nvmt-v1-g10",
+                        owner=ADMIN_TOKEN)
+        assert thumb.status_code == 503, thumb.text
+        assert thumb.json() == {"error": "telegram_session_busy"}
+        assert memory.starts == 0
+        assert memory.scan_calls == []
+        assert core.telegram_session_lease.released_by == []
+    finally:
+        core.stop()
+
+
+def test_vercel_library_classification_stays_narrow(tmp_path, monkeypatch):
+    monkeypatch.setenv("VERCEL", "1")
+    from openseek.vercel import build_app
+
+    cfg, core, fp, memory, _data = library_core(tmp_path)
+    app = build_app(cfg, core=core)
+    try:
+        setup = request(app, "GET", "/admin/setup", owner=ADMIN_TOKEN)
+        assert setup.status_code == 200, setup.text
+        assert setup.json()["profile"] == "vercel"
+        assert memory.starts == 0
+        assert memory.scan_calls == []
+        assert core.telegram_session_lease.acquired_by == []
+
+        # Contributor moderation reuses local SQLite and must not touch Telegram
+        # on the Vercel profile (honestly unsupported, not lease-gated).
+        contributors = request(app, "GET", "/admin/contributors", owner=ADMIN_TOKEN)
+        assert contributors.status_code == 200, contributors.text
+        assert contributors.json()["supported"] is False
+        assert memory.starts == 0
+        assert memory.scan_calls == []
+
+        # A near-miss prefix without the slash boundary is not a library route.
+        near_miss = request(app, "GET", "/admin/libraryfoo", owner=ADMIN_TOKEN)
+        assert near_miss.status_code == 404, near_miss.text
+        assert memory.starts == 0
+        assert memory.scan_calls == []
+        assert core.telegram_session_lease.acquired_by == []
+    finally:
+        core.stop()
+
+
+def test_vercel_setup_only_page_uses_dashboard_theme_and_preserves_guidance(tmp_path, monkeypatch):
+    monkeypatch.setenv("VERCEL", "1")
+    from openseek.vercel import _setup_only_app
+
+    message = 'config <script>alert("x")</script> & "bad"'
+    app = _setup_only_app(message)
+    try:
+        page = request(app, "GET", "/")
+        assert page.status_code == 200, page.text
+        assert page.headers["cache-control"] == "no-store"
+        assert page.headers["content-security-policy"] == (
+            "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'")
+        text = page.text
+        # Original dark palette tokens, one value each.
+        for token in ("#0d0e12", "#13151b", "#181b23", "#252a36",
+                      "#e9eaf0", "#8b91a1", "#8b7bff", "#5ad1c1"):
+            assert token in text, token
+        assert "width=device-width" in text
+        # Long env names / SPKI pin must not overflow at 390px.
+        assert "overflow-wrap:anywhere" in text
+        assert "Set up OpenSeek on Vercel" in text
+        assert "Set these Production environment variables, then redeploy:" in text
+        for guidance in ("OPENSEEK_PROFILE=vercel", "OPENSEEK_POOL_MODE=channel",
+                         "OPENSEEK_ADMIN_TOKEN (generated by the setup wizard)",
+                         "OPENSEEK_PUBLIC_TLS_PIN (optional deployed HTTPS certificate SPKI pin)",
+                         "Telegram user-session, channel, and API settings",
+                         "OPENSEEK_SUPABASE_URL and OPENSEEK_SUPABASE_SERVICE_KEY",
+                         "Configuration check:",
+                         "After redeploying, reopen this page to reach the OpenSeek dashboard."):
+            assert guidance in text, guidance
+        # Escaped config error, never raw markup.
+        assert "<script>alert" not in text
+        assert "&lt;script&gt;" in text
+        # Setup page is guidance only: no credentials fields or runtime controls
+        # and no external assets.
+        lowered = text.lower()
+        assert "<input" not in lowered
+        assert "<form" not in lowered
+        assert "<button" not in lowered
+        assert "<link" not in lowered
+        assert "src=" not in lowered
+        assert "href=" not in lowered
+        assert "https://" not in lowered
+        assert "http://" not in lowered
+        assert "cdn" not in lowered
+
+        status = request(app, "GET", "/admin/setup")
+        assert status.status_code == 200, status.text
+        assert status.json() == {"setup_required": True, "error": message}
+
+        unavailable = request(app, "GET", "/admin/library")
+        assert unavailable.status_code == 503, unavailable.text
+        assert unavailable.json() == {"error": "setup_required"}
+        assert unavailable.headers["cache-control"] == "no-store"
+    finally:
+        pass

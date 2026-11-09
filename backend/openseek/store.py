@@ -443,3 +443,32 @@ class ChannelStore:
             rows = self.db.q(f"SELECT COUNT(*) FROM {table}")
             out[key] = int(rows[0][0]) if rows else 0
         return out
+
+    def catalog_page(self, limit: int, offset: int) -> tuple[list[dict], bool]:
+        """One bounded page of hints-committed catalog packages (Telegram canonical).
+
+        Read via a single locked query with LIMIT/OFFSET (limit clamped to 1..100,
+        offset to 0..100000). Rows are deduplicated by the (fp,profile) primary key
+        and ordered deterministically. Tile-only rows without hints are never
+        catalog packages; hint-only rows remain visible with
+        thumbnail_available=False. Returns (items, has_more) where has_more is
+        derived from a limit+1 probe row, never an unbounded COUNT scan.
+        """
+        limit = max(1, min(int(limit), 100))
+        offset = max(0, min(int(offset), 100000))
+        rows = self.db.q(
+            "SELECT h.fp,h.profile,h.filename_norm,h.imdb,h.season,h.episode,"
+            "h.duration_ms,h.n_tiles,h.created,"
+            "EXISTS (SELECT 1 FROM pool_channel_tiles c WHERE c.fp=h.fp AND c.profile=?) "
+            "FROM pool_hints h ORDER BY h.created DESC, h.fp ASC, h.profile ASC "
+            "LIMIT ? OFFSET ?",
+            (PROFILE, limit + 1, offset))
+        has_more = len(rows) > limit
+        if has_more:
+            rows = rows[:limit]
+        items = [{
+            "fp": row[0], "profile": row[1], "filename": row[2], "imdb": row[3],
+            "season": int(row[4]), "episode": int(row[5]), "duration_ms": int(row[6]),
+            "n_tiles": int(row[7]), "created": float(row[8]), "thumbnail_available": bool(row[9]),
+        } for row in rows]
+        return items, has_more
