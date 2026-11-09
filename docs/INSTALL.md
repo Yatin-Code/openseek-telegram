@@ -1,6 +1,6 @@
 # Installing OpenSeek
 
-OpenSeek needs Python 3.12 or newer (pins in `backend/requirements.txt`). The ffmpeg libraries are bundled in the `av` wheel.
+OpenSeek needs Python 3.12 or newer with `venv` support (verify the version with `python3 --version`; pins in `backend/requirements.txt`) and `git` for the `git clone` checkout steps. The ffmpeg libraries are bundled in the `av` wheel.
 Pick a data directory outside the source tree and back it up if you want to keep your pairings and cache: it holds the
 database, the TLS identity (`tls/`), the admin token and the local extraction cache.
 

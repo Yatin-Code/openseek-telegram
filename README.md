@@ -17,7 +17,7 @@ OpenSeek-Telegram never receives or stores video files, playback URLs, or source
 | Run one pool API for other people | **Host API** | the host's bot | SQLite on the host | [Mode 3](#mode-3--host-api) |
 | Each person hosts their own node | **Vercel participant** | each participant's user session | Supabase Postgres | [Mode 4](#mode-4--vercel-participant-node) |
 
-> **Recommended:** the [setup wizard](https://github.com/Yatin-Code/openseek-telegram#recommended-the-setup-wizard-cli)2 — `python -m openseek setup`. It creates or links the Vercel and Supabase projects, applies the schema, makes the private staging bucket, deploys, signs in to Telegram, joins the invite, and prints the Nuvio pairing bundle. It is resumable.
+> **Recommended:** the [setup wizard](https://github.com/Yatin-Code/openseek-telegram#recommended-the-setup-wizard-cli) — `python -m openseek setup`. It creates or links the Vercel and Supabase projects, applies the schema, makes the private staging bucket, deploys, signs in to Telegram, joins the invite, and prints the Nuvio pairing bundle. It is resumable.
 >
 > **No terminal?** Use the [manual Vercel + Supabase copy path](#manual-vercel--supabase-the-copy-path). Everything except the Telegram session can be done in provider dashboards; the session itself still needs one wizard run (or an existing StringSession).
 
@@ -27,7 +27,7 @@ OpenSeek-Telegram never receives or stores video files, playback URLs, or source
 
 ### Requirements
 
-- Python 3.12 or later.
+- Python 3.12 or later with `venv` support (verify the version with `python3 --version`), and `git`.
 - For a Vercel node: a Vercel account and a Supabase account, plus the Vercel and Supabase CLIs on `PATH` ([Vercel CLI](https://vercel.com/docs/cli), [Supabase CLI](https://supabase.com/docs/guides/cli)). The wizard uses their normal browser sign-in.
 - Or, instead of the CLIs: a Vercel token and a Supabase personal access token (`sbp_...`) for `--provider rest`.
 - For a pool: a Telegram account, an API ID and API hash from [my.telegram.org](https://my.telegram.org), and the shared-group invite.
