@@ -1195,6 +1195,153 @@ def test_librarian_accepts_nvmt_package_and_reposts_tiles(tmp_path):
         db.close()
 
 
+def test_librarian_publishes_only_canonical_bounded_manifest_and_rebuilds_hints(tmp_path):
+    fp = "a" * 64
+    duration_ms = 20_000
+    pkg_data = encode_nvmt(10_000, 2, {0: (0, jpeg()), 1: (10_000, jpeg((60, 70, 80)))})
+    manifest = {
+        "v": 1, "fp": fp, "profile": "nvmt-v1-g10", "imdb": "tt1234567",
+        "season": 1, "episode": 2, "duration_ms": duration_ms,
+        "size_bytes": 100_000, "filename": "/private/releases/Some.Release.Name.mkv",
+        "extra_field": "x" * 3000,
+    }
+    raw_b64 = base64.urlsafe_b64encode(json.dumps(manifest).encode()).decode().rstrip("=")
+    caption = f"openseek:hints:v1:{raw_b64}"
+    store = FakeLibrarianStore(pkg_data)
+    db, _ = make_db_cache(tmp_path / "librarian_canonical_manifest")
+    try:
+        index = ChannelIndex(ChannelStore(db), MemoryChannel())
+        librarian = TelegramLibrarian(store, index)
+        event = FakeEvent(caption, pkg_data, "package.nvmt",
+                          mime_type="application/vnd.openseek.nvmt")
+        asyncio.run(librarian.handle_message(event, store))
+        assert event.deleted
+
+        manifests = [message.message for message in store._client.messages.values()
+                     if not getattr(message, "document", None)
+                     and getattr(message, "entity", None) == "channel"
+                     and str(getattr(message, "message", "")).startswith("openseek:hints:v1:")]
+        assert len(manifests) == 1
+        published = manifests[0]
+        assert len(published.encode("utf-8")) <= 900
+        encoded = published.removeprefix("openseek:hints:v1:")
+        decoded = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
+        assert decoded["filename"] == "some.release.name"
+        assert "extra_field" not in decoded
+        assert not any("/" in value for value in decoded.values() if isinstance(value, str))
+
+        class TelegramSnapshot:
+            def scan(self, min_id=0, limit=2000):
+                rows = []
+                for mid, message in sorted(store._client.messages.items()):
+                    if mid <= min_id:
+                        continue
+                    document = getattr(message, "document", None)
+                    attrs = getattr(document, "attributes", ()) if document else ()
+                    name = next((getattr(attr, "file_name", "") for attr in attrs), "")
+                    rows.append(ChannelMessage(mid, getattr(message, "message", ""),
+                                               getattr(document, "size", 0), name))
+                return rows[:limit]
+
+            def get_tile(self, message_id):
+                return store._client.messages[message_id].document.data
+
+        rebuilt = ChannelIndex(ChannelStore(db), TelegramSnapshot())
+        rebuilt.rebuild()
+        row = db.q("SELECT imdb,filename_norm FROM pool_hints WHERE fp=?", (fp,))[0]
+        assert row == ("tt1234567", "some.release.name")
+    finally:
+        db.close()
+
+
+def test_librarian_rejects_unsupported_manifest_version_before_posting(tmp_path):
+    fp = "b" * 64
+    pkg_data = encode_nvmt(10_000, 2, {0: (0, jpeg())})
+    manifest = {"v": 2, "fp": fp, "profile": "nvmt-v1-g10", "duration_ms": 20_000}
+    raw_b64 = base64.urlsafe_b64encode(json.dumps(manifest).encode()).decode().rstrip("=")
+    store = FakeLibrarianStore(pkg_data)
+    db, _ = make_db_cache(tmp_path / "librarian_manifest_version")
+    try:
+        index = ChannelIndex(ChannelStore(db), MemoryChannel())
+        librarian = TelegramLibrarian(store, index)
+        event = FakeEvent(f"openseek:hints:v1:{raw_b64}", pkg_data, "package.nvmt",
+                          mime_type="application/vnd.openseek.nvmt")
+        asyncio.run(librarian.handle_message(event, store))
+        assert event.deleted
+        assert not any(getattr(message, "document", None)
+                       for message in store._client.messages.values())
+        assert not any(str(getattr(message, "message", "")).startswith("openseek:hints:v1:")
+                       for message in store._client.messages.values())
+        assert any("Rejected: malformed_hints" in getattr(message, "message", "")
+                   for message in store._client.messages.values())
+    finally:
+        db.close()
+
+
+def test_librarian_accepts_valid_g5_package_using_profile_slot_limit(tmp_path):
+    fp = "c" * 64
+    duration_ms = 20_000
+    pkg_data = encode_nvmt(5_000, 4, {slot: (slot * 5_000, jpeg((slot * 20, 40, 60)))
+                                      for slot in range(4)})
+    manifest = {"v": 1, "fp": fp, "profile": "nvmt-v1-g5", "duration_ms": duration_ms}
+    raw_b64 = base64.urlsafe_b64encode(json.dumps(manifest).encode()).decode().rstrip("=")
+    store = FakeLibrarianStore(pkg_data)
+    db, _ = make_db_cache(tmp_path / "librarian_g5")
+    try:
+        index = ChannelIndex(ChannelStore(db), MemoryChannel())
+        librarian = TelegramLibrarian(store, index)
+        event = FakeEvent(f"openseek:hints:v1:{raw_b64}", pkg_data, "package.nvmt",
+                          mime_type="application/vnd.openseek.nvmt")
+        asyncio.run(librarian.handle_message(event, store))
+        assert event.deleted
+        assert index.lookup(fp, PROFILE, 0) is not None
+        assert index.lookup(fp, PROFILE, 1) is not None
+        assert any("Accepted package" in getattr(message, "message", "")
+                   for message in store._client.messages.values())
+        hints = db.q("SELECT grid,n_tiles FROM pool_hints WHERE fp=?", (fp,))[0]
+        assert hints == (5_000, 4)
+    finally:
+        db.close()
+
+
+def test_concurrent_librarian_resends_publish_one_tile_document(tmp_path):
+    fp = "d" * 64
+    pkg_data = encode_nvmt(10_000, 1, {0: (0, jpeg())})
+    # The legacy g10 alias is accepted too and must share the canonical package lock.
+    manifest = {"v": 1, "fp": fp, "profile": PROFILE, "duration_ms": 10_000}
+    raw_b64 = base64.urlsafe_b64encode(json.dumps(manifest).encode()).decode().rstrip("=")
+    store = FakeLibrarianStore(pkg_data)
+    send_file = store._client.send_file
+
+    async def delayed_send_file(*args, **kwargs):
+        await asyncio.sleep(0.02)
+        return await send_file(*args, **kwargs)
+
+    store._client.send_file = delayed_send_file
+    db, _ = make_db_cache(tmp_path / "librarian_concurrent")
+    try:
+        index = ChannelIndex(ChannelStore(db), MemoryChannel())
+        librarian = TelegramLibrarian(store, index, per_sender_s=0)
+        events = [FakeEvent(f"openseek:hints:v1:{raw_b64}", pkg_data, "package.nvmt",
+                            mime_type="application/vnd.openseek.nvmt") for _ in range(2)]
+
+        async def run_both():
+            await asyncio.gather(*(librarian.handle_message(event, store) for event in events))
+
+        asyncio.run(run_both())
+        tile_documents = [message for message in store._client.messages.values()
+                          if getattr(message, "document", None)]
+        assert len(tile_documents) == 1
+        assert all(event.deleted for event in events)
+        assert index.lookup(fp, PROFILE, 0) is not None
+        # H4 accepted sequential resends, which may add another complete manifest.
+        manifest_messages = [message for message in store._client.messages.values()
+                             if str(getattr(message, "message", "")).startswith("openseek:hints:v1:")]
+        assert len(manifest_messages) == 2
+    finally:
+        db.close()
+
+
 def test_latest_manifest_wins_and_updated_hints_survive_rebuild(tmp_path):
     db, _ = make_db_cache(tmp_path / "latest_manifest")
     store = MemoryChannel()
@@ -1299,7 +1446,8 @@ def test_librarian_rejects_partial_tile_failure_atomically(tmp_path):
     grid = 10_000
     tiles = {0: (0, jpeg((1, 2, 3))), 1: (10_000, jpeg((4, 5, 6)))}
     pkg_data = encode_nvmt(grid, 2, tiles)
-    manifest = {"v": 1, "fp": fp, "profile": PROFILE, "duration_ms": duration_ms}
+    manifest = {"v": 1, "fp": fp, "profile": "nvmt-v1-g10", "duration_ms": duration_ms,
+                "imdb": "tt7654321", "season": 2, "episode": 3}
     raw_b64 = base64.urlsafe_b64encode(json.dumps(manifest).encode()).decode().rstrip("=")
     caption = f"openseek:hints:v1:{raw_b64}"
     store = FakeLibrarianStore(pkg_data)
@@ -1314,7 +1462,7 @@ def test_librarian_rejects_partial_tile_failure_atomically(tmp_path):
 
     db, _ = make_db_cache(tmp_path / "librarian_partial_fail")
     try:
-        index = ChannelIndex(ChannelStore(db), MemoryChannel())
+        index = ChannelIndex(ChannelStore(db), MemoryChannel(), db=db)
         librarian = TelegramLibrarian(store, index)
         event = FakeEvent(caption, pkg_data, "package.nvmt", mime_type="application/vnd.openseek.nvmt")
         asyncio.run(librarian.handle_message(event, store))
@@ -1323,6 +1471,82 @@ def test_librarian_rejects_partial_tile_failure_atomically(tmp_path):
         assert 1 not in store._client.messages
         assert index.lookup(fp, PROFILE, 0) is None
         assert index.lookup(fp, PROFILE, 1) is None
+        work_key = TelegramLibrarian._compute_work_key("tt7654321", 2, 3)
+        today = time.strftime("%Y-%m-%d", time.gmtime())
+        assert db.sender_quota_count(event.sender_id, work_key, today) == 0
+    finally:
+        db.close()
+
+
+def test_librarian_rolls_back_partial_index_publication_and_preserves_existing_rows(tmp_path):
+    fp = "9" * 64
+    other_fp = "8" * 64
+    duration_ms = 30_000
+    package_tiles = {
+        0: (0, jpeg((10, 20, 30))),
+        1: (10_000, jpeg((40, 50, 60))),
+        2: (20_000, jpeg((70, 80, 90))),
+    }
+    pkg_data = encode_nvmt(10_000, 3, package_tiles)
+    manifest = {"v": 1, "fp": fp, "profile": "nvmt-v1-g10", "duration_ms": duration_ms,
+                "imdb": "tt7654321", "season": 2, "episode": 3}
+    raw_b64 = base64.urlsafe_b64encode(json.dumps(manifest).encode()).decode().rstrip("=")
+    store = FakeLibrarianStore(pkg_data)
+    db, _ = make_db_cache(tmp_path / "librarian_index_partial_fail")
+    try:
+        index = ChannelIndex(ChannelStore(db), MemoryChannel(), db=db)
+        old_hints = {"v": 1, "fp": fp, "profile": "nvmt-v1-g10", "imdb": "tt1234567",
+                     "season": 1, "episode": 1, "duration_ms": duration_ms,
+                     "size_bytes": 111_000, "filename": "old.package.name",
+                     "n_tiles": 3, "grid": 10_000, "created": 5}
+        other_hints = {"v": 1, "fp": other_fp, "profile": "nvmt-v1-g10", "imdb": "tt1111111",
+                       "season": 1, "episode": 2, "duration_ms": duration_ms,
+                       "size_bytes": 222_000, "filename": "unrelated.package",
+                       "n_tiles": 3, "grid": 10_000, "created": 6}
+        assert index.record_manifest(old_hints)
+        assert index.record_manifest(other_hints)
+        seeded_tiles = [
+            ChannelMessage(900, f"openseek:v1:{fp}:{PROFILE}:0:{hashlib.sha256(package_tiles[0][1]).hexdigest()}",
+                           len(package_tiles[0][1]), _tile_filename(0, duration_ms, 3)),
+            ChannelMessage(901, f"openseek:v1:{other_fp}:{PROFILE}:9:{hashlib.sha256(jpeg((1, 2, 3))).hexdigest()}",
+                           len(jpeg((1, 2, 3))), _tile_filename(90_000, 120_000, 12)),
+        ]
+        for row in seeded_tiles:
+            assert index.record_message(row)
+
+        previous_tile = index.lookup(fp, PROFILE, 0)
+        previous_other_tile = index.lookup(other_fp, PROFILE, 9)
+        previous_hints = index.store.get_hints(fp, "nvmt-v1-g10")
+        previous_other_hints = index.store.get_hints(other_fp, "nvmt-v1-g10")
+        work_key = TelegramLibrarian._compute_work_key("tt7654321", 2, 3)
+        today = time.strftime("%Y-%m-%d", time.gmtime())
+        assert db.sender_quota_inc(456, work_key, today) == 1
+
+        record_message = index.record_message
+        calls = 0
+
+        def fail_after_first_indexed_tile(message):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("simulated index write failure")
+            return record_message(message)
+
+        index.record_message = fail_after_first_indexed_tile
+        event = FakeEvent(f"openseek:hints:v1:{raw_b64}", pkg_data, "package.nvmt",
+                          mime_type="application/vnd.openseek.nvmt")
+        asyncio.run(TelegramLibrarian(store, index).handle_message(event, store))
+
+        assert event.deleted
+        assert not any(getattr(message, "document", None)
+                       for message in store._client.messages.values())
+        assert index.lookup(fp, PROFILE, 0) == previous_tile
+        assert index.lookup(fp, PROFILE, 1) is None
+        assert index.lookup(fp, PROFILE, 2) is None
+        assert index.lookup(other_fp, PROFILE, 9) == previous_other_tile
+        assert index.store.get_hints(fp, "nvmt-v1-g10") == previous_hints
+        assert index.store.get_hints(other_fp, "nvmt-v1-g10") == previous_other_hints
+        assert db.sender_quota_count(456, work_key, today) == 1
     finally:
         db.close()
 
@@ -1435,16 +1659,16 @@ def test_bot_node_starts_without_scanning_channel_history(tmp_path):
 
 def test_librarian_rejected_package_does_not_consume_quota(tmp_path):
     fp = "d" * 64
-    manifest = {"v": 1, "fp": fp, "profile": PROFILE, "imdb": "tt1234567",
+    manifest = {"v": 1, "fp": fp, "profile": "nvmt-v1-g10", "imdb": "tt1234567",
                 "season": 1, "episode": 1, "duration_ms": 20_000,
                 "size_bytes": 100_000, "filename": "quota.s01e01.mkv"}
     raw_b64 = base64.urlsafe_b64encode(json.dumps(manifest).encode()).decode().rstrip("=")
     caption = f"openseek:hints:v1:{raw_b64}"
-    bad = b"NVMT-not-a-package"
+    bad = b"NVMT-not-a-valid-package!!"
     store = FakeLibrarianStore(bad)
     db, _ = make_db_cache(tmp_path / "librarian_quota_reject")
     try:
-        index = ChannelIndex(ChannelStore(db), MemoryChannel())
+        index = ChannelIndex(ChannelStore(db), MemoryChannel(), db=db)
         librarian = TelegramLibrarian(store, index)
         event = FakeEvent(caption, bad, "package.nvmt",
                           mime_type="application/vnd.openseek.nvmt")

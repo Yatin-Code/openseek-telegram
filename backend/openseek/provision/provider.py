@@ -203,6 +203,11 @@ class RestSetupProvider:
         name = _project_name(project)
         if not name:
             raise SetupFailure("Vercel project link", "project_name_unavailable")
+        try:
+            self._vercel().ensure_production_access(name)
+        except ProviderError as exc:
+            raise SetupFailure("Vercel production access",
+                               _REASONS.get(exc.code, "provider_error")) from None
         self._project = name
 
     def set_vercel_secret(self, source_dir: Path, name: str, value: str, *, secret: bool) -> None:
@@ -253,14 +258,14 @@ class RestSetupProvider:
         return url if url.startswith("http") else f"https://{url}"
 
     # ---------------------------------------------------------------- node
-    def create_pairing_invite(self, url: str, setup_key: str) -> dict:
+    def create_pairing_invite(self, url: str, setup_key: str, *, enable_sharing: bool = False) -> dict:
         try:
             with self._httpx_client_factory(timeout=20, follow_redirects=False,
                                             trust_env=False) as client:
                 response = client.post(
                     f"{url.rstrip('/')}/v1/setup/pairing",
                     headers={"authorization": f"Bearer {setup_key}"},
-                    json={"label": "Nuvio TV"})
+                    json={"label": "Nuvio TV", "enable_sharing": enable_sharing})
         except httpx.HTTPError:
             raise SetupFailure("Nuvio pairing invite", "provider_unavailable") from None
         if response.status_code >= 400:

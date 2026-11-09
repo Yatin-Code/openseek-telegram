@@ -59,11 +59,15 @@ create index if not exists pool_episode_lookup on public.pool_episode_packages (
 
 -- Read-only summary used by candidate ranking and package assembly. It is derived
 -- entirely from pool_channel_tiles, so it is rebuilt by rebuild() like the tables.
-create or replace view public.pool_packages as
+create or replace view public.pool_packages
+with (security_invoker = true)
+as
 select fp, profile, duration_ms, n_tiles, count(*)::integer as channel_tiles,
        max(created) as created
 from public.pool_channel_tiles
 group by fp, profile, duration_ms, n_tiles;
+revoke all on public.pool_packages from public, anon, authenticated;
+grant select on public.pool_packages to service_role;
 
 -- Vercel staging status. The object bytes live in Supabase Storage only until
 -- Telegram accepts the package; this row never stores a second durable copy.

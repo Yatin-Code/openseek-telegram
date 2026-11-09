@@ -94,10 +94,11 @@ class TelegramAccountSetup:
             except Exception as exc:
                 if type(exc).__name__ != "UserAlreadyParticipantError":
                     raise
-                group_id = self.input("You already joined this pool. Enter its numeric Telegram group ID: ").strip()
-                if not group_id:
-                    raise TelegramSetupError("group_id_required")
-                entity = await client.get_entity(group_id)
+                # The account already joined this exact invite: a fresh session
+                # has no numeric peer cached, so resolve the entity through the
+                # original validated invite (messages.checkChatInvite tells
+                # Telethon the already-joined channel, access hash included).
+                entity = await client.get_entity(invite)
             if entity is None:
                 raise TelegramSetupError("group_access_denied")
             if entity is None or bool(getattr(entity, "broadcast", False)) or not bool(getattr(entity, "megagroup", False)):

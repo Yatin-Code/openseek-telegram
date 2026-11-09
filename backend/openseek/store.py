@@ -6,6 +6,8 @@ Supabase/PostgREST. Telegram remains the only durable package store.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 from .cache import PROFILE
 from .db import DB
 
@@ -192,6 +194,28 @@ class ChannelStore:
     def __init__(self, db: DB):
         self.db = db
 
+    @contextmanager
+    def transaction(self):
+        """Atomically group channel-index writes, nesting safely inside store calls."""
+        with self.db._lock:
+            outermost = not self.db.conn.in_transaction
+            savepoint = "channel_store_transaction"
+            if outermost:
+                self.db.conn.execute("BEGIN IMMEDIATE")
+            else:
+                self.db.conn.execute(f"SAVEPOINT {savepoint}")
+            try:
+                yield
+                self.db.conn.execute("COMMIT" if outermost else f"RELEASE SAVEPOINT {savepoint}")
+            except BaseException:
+                if outermost:
+                    if self.db.conn.in_transaction:
+                        self.db.conn.execute("ROLLBACK")
+                else:
+                    self.db.conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                    self.db.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                raise
+
     # ---------------------------------------------------------------- scan state
     def state(self, channel_id: str) -> tuple[int, float] | None:
         """Read the last indexed message id and scan time. Locked read via DB.q."""
@@ -226,18 +250,12 @@ class ChannelStore:
     def record_tile(self, tile: dict) -> bool:
         """Insert a tile if absent; accept a matching digest and optionally fill metadata.
 
-        Runs in one BEGIN IMMEDIATE transaction so the first writer wins.
+        Runs in an immediate transaction or nested savepoint so the first writer wins.
         Returns whether this tile key is accepted (inserted or digest-compatible).
         """
-        with self.db._lock:
-            self.db.conn.execute("BEGIN IMMEDIATE")
-            try:
-                accepted, _inserted = self._record_tile_locked(tile)
-                self.db.conn.execute("COMMIT")
-                return accepted
-            except BaseException:
-                self.db.conn.execute("ROLLBACK")
-                raise
+        with self.transaction():
+            accepted, _inserted = self._record_tile_locked(tile)
+        return accepted
 
     def record_tiles(self, tiles: list[dict], *, channel_id: str, last_message_id: int,
                      scanned_at: float) -> int:

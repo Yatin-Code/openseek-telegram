@@ -67,8 +67,8 @@ class FakeProvider:
     def remove_vercel_secret(self, source_dir, name):
         self.env.pop(name, None)
 
-    def create_pairing_invite(self, url, setup_key):
-        self.pairing_calls.append((url, setup_key))
+    def create_pairing_invite(self, url, setup_key, *, enable_sharing=False):
+        self.pairing_calls.append((url, setup_key, enable_sharing))
         return {"code": "ABCD-EFGH-IJKL-MNOP", "spki_pin": ""}
 
     def deploy(self, source_dir):
@@ -171,7 +171,8 @@ def test_telegram_session_goes_only_to_the_participant_vercel_project(tmp_path):
     setup = ParticipantSetup(
         provider, source_dir=_source(tmp_path), state_path=state_path,
         input_fn=lambda prompt: {"Telegram API ID: ": "1234",
-                                 "Shared Telegram group invite link: ": "https://t.me/+invite"}[prompt],
+                                 "Shared Telegram group invite link: ": "https://t.me/+invite",
+                                 "Enable Nuvio guest-device access? [y/N] ": "y"}[prompt],
         secret_input_fn=lambda _prompt: "api_hash_secret",
         telegram_joiner=FakeTelegramJoiner(), print_fn=output.append)
 
@@ -185,6 +186,7 @@ def test_telegram_session_goes_only_to_the_participant_vercel_project(tmp_path):
     assert provider.health_pending == [False, False, False]
     assert "OPENSEEK_SETUP_KEY" not in provider.env
     assert provider.pairing_calls[0][0] == "https://my-openseek-node.vercel.app"
+    assert provider.pairing_calls[0][2] is True  # the wizard's explicit consent
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert state["step"] == "paired"
     assert "pairing_setup_key" not in state
@@ -194,3 +196,58 @@ def test_telegram_session_goes_only_to_the_participant_vercel_project(tmp_path):
     assert "api_hash_secret" not in "\n".join(output)
     assert "https://my-openseek-node.vercel.app|ABCD-EFGH-IJKL-MNOP" in "\n".join(output)
     assert f"https://my-openseek-node.vercel.app/#{provider.env['OPENSEEK_ADMIN_TOKEN'][0]}" in "\n".join(output)
+
+
+def _telegram_ready(tmp_path: Path) -> None:
+    from openseek.participant_setup import _atomic_state
+    _atomic_state(tmp_path / "state.json", {
+        "version": 1, "step": "telegram_ready",
+        "deployment_url": "https://my-openseek-node.vercel.app",
+        "vercel_project": "my-openseek-node", "supabase_ref": "sb-ref-1"})
+
+
+def test_new_invite_never_touches_the_node_without_guest_consent(tmp_path):
+    """`--new-pairing` must stop before any provider write when the participant
+    declines guest-device access: no env, no deploy, no invite, and the saved
+    checkpoint stays where it was."""
+    provider = FakeProvider()
+    _telegram_ready(tmp_path)
+    state_path = tmp_path / "state.json"
+    output = []
+    asked = []
+
+    def answer(prompt):
+        asked.append(prompt)
+        return {"Enable Nuvio guest-device access? [y/N] ": "n"}[prompt]
+
+    setup = ParticipantSetup(
+        provider, source_dir=_source(tmp_path), state_path=state_path,
+        input_fn=answer, print_fn=output.append)
+
+    assert setup.run() == 1
+    assert asked == ["Enable Nuvio guest-device access? [y/N] "], asked
+    assert any("no invite was created" in line.lower() for line in output), output
+    assert provider.auth_calls == 0            # the consent question comes first
+    assert provider.env == {}                  # no OPENSEEK_ADMIN_TOKEN / SETUP_KEY writes
+    assert provider.deploy_calls == 0 and provider.pairing_calls == []
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["step"] == "telegram_ready" and "pairing_setup_key" not in state
+
+
+def test_new_invite_carries_the_explicit_consent_into_the_request(tmp_path):
+    """Consenting is asked again on every new invite and is passed through as
+    the explicit `enable_sharing: True` request field, never implied."""
+    provider = FakeProvider()
+    _telegram_ready(tmp_path)
+    setup = ParticipantSetup(
+        provider, source_dir=_source(tmp_path), state_path=tmp_path / "state.json",
+        input_fn=lambda prompt: {"Enable Nuvio guest-device access? [y/N] ": "y"}[prompt],
+        print_fn=lambda _line: None)
+
+    assert setup.run() == 0
+    url, setup_key, enable_sharing = provider.pairing_calls[0]
+    assert enable_sharing is True
+    assert url == "https://my-openseek-node.vercel.app" and setup_key
+    assert "OPENSEEK_SETUP_KEY" not in provider.env   # the temporary key is removed again
+    state = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+    assert state["step"] == "paired" and "pairing_setup_key" not in state

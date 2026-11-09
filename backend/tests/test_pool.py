@@ -666,9 +666,10 @@ def test_duplicate_nvmt_upload_with_absent_hints_keeps_stored_hints(tmp_path, mo
         payload = json.loads(base64.urlsafe_b64decode(
             payload_b64 + "=" * (-len(payload_b64) % 4)))
         assert payload["imdb"] == "tt1234567" and payload["season"] == 2 and payload["episode"] == 5
-        assert payload["size_bytes"] == 1000000 and payload["filename_norm"] == "film.name.2024.1080p"
+        assert payload["size_bytes"] == 1000000 and payload["filename"] == "film.name.2024.1080p"
 
         # supplied hints still update, while absent companions preserve their stored values
+        tile_posts_before_correction = sum(c.startswith("openseek:v1:") for c in tg.captions)
         corrected = api(
             f"https://pool.test/v1/pool/{fp}/nvmt?profile=nvmt-v1-g5&duration_ms=20000&imdb=tt7654321",
             nvmt_package(5_000, 20_000, {0: (0, image)}), headers, 2)
@@ -676,6 +677,14 @@ def test_duplicate_nvmt_upload_with_absent_hints_keeps_stored_hints(tmp_path, mo
         imdb, season, episode, size_bytes, filename = stored()
         assert imdb == "tt7654321" and season == 2 and episode == 5
         assert size_bytes == 1000000 and filename == "film.name.2024.1080p"
+        latest_manifests = [c for c in tg.captions if c.startswith("openseek:hints:v1:")]
+        assert len(latest_manifests) == 3
+        latest_payload_b64 = latest_manifests[-1].split(":", 3)[3]
+        latest_payload = json.loads(base64.urlsafe_b64decode(
+            latest_payload_b64 + "=" * (-len(latest_payload_b64) % 4)))
+        assert latest_payload["imdb"] == "tt7654321"
+        assert latest_payload["filename"] == "film.name.2024.1080p"
+        assert sum(c.startswith("openseek:v1:") for c in tg.captions) == tile_posts_before_correction
 
         # a first upload without hints simply has absent hints (never a fabricated value)
         fresh = "b" * 64
@@ -940,6 +949,41 @@ def test_admin_pool_purge_is_dry_run_by_default_and_sweeps_orphans(tmp_path):
         assert core.db.q("SELECT COUNT(*) FROM pool_outbox")[0][0] == 1
         assert set(tg.deleted_messages) == {101, 103}
         assert core.db.path.stat().st_size < before_size
+    finally:
+        core.stop()
+
+
+def test_applied_purge_preserves_host_local_packages(tmp_path):
+    tg = FakeTelegramBotAPI()
+
+    class NoSourceProxy:
+        def stop(self):
+            pass
+
+    core = Core(Settings(data_dir=tmp_path / "pool-host", pool_enabled=True,
+                         pool_read_key=READ_KEY, pool_write_key=WRITE_KEY,
+                         telegram_bot_token="123456:test", telegram_channel_id="-100123"),
+                pool_storage=TelegramBotStore("123456:test", "-100123", opener=tg.urlopen),
+                proxy=NoSourceProxy())
+    fp = hashlib.sha256(b"purge preserves local package").hexdigest()
+    duration_ms = 20_000
+    tiles = {k: (k * 10_000, jpeg((35 + k, 55 + k, 75 + k))) for k in range(2)}
+    package = nvmt_package(10_000, duration_ms, tiles)
+    try:
+        result = core.pool.upload_package(fp, "nvmt-v1-g10", duration_ms, package,
+                                          imdb="tt1234567")
+        assert result["stored"] is True
+        local_path = core.pool.package_dir / f"{fp}.nvmt-v1-g10.nvmt"
+        assert local_path.is_file()
+        assert core.pool.package(fp, "nvmt-v1-g10")[0] == package
+
+        purged = core.pool.purge(dry_run=False)
+
+        assert purged["pool_packages"] == 0
+        assert core.db.q("SELECT COUNT(*) FROM pool_packages WHERE fp=?", (fp,))[0][0] == 1
+        assert core.pool.package(fp, "nvmt-v1-g10")[0] == package
+        assert local_path.is_file()
+        assert tg.deleted_messages == []
     finally:
         core.stop()
 

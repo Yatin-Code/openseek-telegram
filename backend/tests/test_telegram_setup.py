@@ -59,6 +59,41 @@ class FakeClient:
             yield SimpleNamespace(id=1)
 
 
+class StrictInviteClient(FakeClient):
+    """A double that models a fresh StringSession.
+
+    A session opened this run has no entity cache and no access hashes, so the
+    only referent `get_entity` can resolve is the validated invite link.
+    Telethon treats numeric strings as phone numbers there, which is exactly
+    the failure this class guards against.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.entity_lookups = []
+        self.iter_entities = []
+        self.permission_lookups = []
+
+    async def get_entity(self, invite):
+        self.entity_lookups.append(invite)
+        text = str(invite)
+        if isinstance(invite, int) or text.lstrip("-").isdigit():
+            raise AssertionError(
+                f"a fresh session cannot resolve numeric referent {text!r}; "
+                "resolve the validated invite link instead")
+        assert text.startswith("https://t.me/+"), text
+        return self.entity
+
+    async def iter_messages(self, entity, limit):
+        self.iter_entities.append(entity)
+        async for message in super().iter_messages(entity, limit):
+            yield message
+
+    async def get_permissions(self, entity, user):
+        self.permission_lookups.append(entity)
+        return await super().get_permissions(entity, user)
+
+
 @pytest.fixture
 def telethon_client(monkeypatch):
     entity = Entity()
@@ -115,15 +150,76 @@ def test_telegram_setup_explains_join_approval_is_not_supported():
 
 
 def test_telegram_setup_recovers_when_the_account_already_joined():
+    """The already-joined fallback resolves the pool from the original
+    validated invite link: a fresh session cannot resolve a numeric peer, and
+    an account that already joined is never asked for one."""
     class UserAlreadyParticipantError(Exception):
         pass
 
-    client = FakeClient(Entity(), join_error=UserAlreadyParticipantError())
+    client = StrictInviteClient(Entity(), join_error=UserAlreadyParticipantError())
+    input_calls = []
+
+    def record_input(prompt):
+        input_calls.append(prompt)
+        return ""  # any numeric answer would be wrong by design; keep it empty
+
     setup = TelegramAccountSetup(client_factory=lambda *_args, **_kwargs: client,
                                  session_factory=lambda: object(),
-                                 input_fn=lambda _prompt: "-1000000000123",
+                                 input_fn=record_input,
                                  peer_id_fn=lambda item: -1000000000000 - item.id,
                                  invite_request_factory=lambda invite_hash: SimpleNamespace(hash=invite_hash))
+
     result = setup.join(1234, "api-hash", "https://t.me/+invite-secret")
-    assert client.entity_lookup == "-1000000000123"
+
+    assert input_calls == [], input_calls
+    assert client.entity_lookups == ["https://t.me/+invite-secret"], client.entity_lookups
+    assert client.joined_hash is None  # the join clearly failed, nothing was re-imported
     assert result.channel_id == "-1000000123456"
+    assert result.session == "private-string-session"
+    assert client.disconnects == 1
+
+
+@pytest.mark.parametrize(
+    "client_kwargs, reason, screen",
+    [pytest.param({"history": False}, "shared_pool_history_unavailable", "history",
+                  id="hidden-history"),
+     pytest.param({"permissions": SimpleNamespace(send_messages=True, send_media=False)},
+                  "shared_pool_send_media_denied", "permissions", id="no-media"),
+     pytest.param({"broadcast": True}, "shared_pool_must_be_supergroup", "type",
+                  id="broadcast-channel")])
+def test_telegram_setup_reused_member_is_still_screened(client_kwargs, reason, screen):
+    """A reused member resolved from the invite goes through the same real
+    access checks as a fresh join: history, send-media permissions (where the
+    chain reaches them) and the supergroup type — never a bypass."""
+    class UserAlreadyParticipantError(Exception):
+        pass
+
+    entity = Entity()
+    if client_kwargs.pop("broadcast", False):
+        entity.broadcast, entity.megagroup = True, False
+    client = StrictInviteClient(entity, join_error=UserAlreadyParticipantError(),
+                                **client_kwargs)
+
+    def never_prompted(prompt):
+        raise AssertionError(f"already-joined must not prompt: {prompt!r}")
+
+    setup = TelegramAccountSetup(client_factory=lambda *_args, **_kwargs: client,
+                                 session_factory=lambda: object(),
+                                 input_fn=never_prompted,
+                                 peer_id_fn=lambda item: item.id,
+                                 invite_request_factory=lambda invite_hash: SimpleNamespace(hash=invite_hash))
+
+    with pytest.raises(TelegramSetupError, match=reason):
+        setup.join(1234, "api-hash", "https://t.me/+invite-secret")
+
+    assert client.entity_lookups == ["https://t.me/+invite-secret"], client.entity_lookups
+    assert client.disconnects == 1
+    if screen == "history":
+        assert client.iter_entities == [entity], client.iter_entities
+        assert client.permission_lookups == [], client.permission_lookups
+    elif screen == "permissions":
+        assert client.iter_entities == [entity], client.iter_entities
+        assert client.permission_lookups == [entity], client.permission_lookups
+    else:  # the type screen short-circuits before any history read
+        assert client.iter_entities == [], client.iter_entities
+        assert client.permission_lookups == [], client.permission_lookups

@@ -77,6 +77,10 @@ def test_missing_malformed_unknown_and_revoked_are_distinct(tmp_path):
         assert asgi(app, "GET", "/v1/pair/status").status_code == 401
         assert asgi(app, "GET", "/v1/pair/status",
                     headers={"Authorization": "Bearer"}).status_code == 400
+        malformed_shape = asgi(app, "GET", "/v1/pair/status",
+                               headers={"Authorization": "Bearer wrong"})
+        assert malformed_shape.status_code == 400
+        assert malformed_shape.json() == {"error": "bad_auth"}
         assert asgi(app, "GET", "/v1/pair/status",
                     headers={"Authorization": f"Bearer {token}"}).status_code == 403
     finally:
@@ -135,6 +139,33 @@ def test_read_key_cannot_write_and_refusal_code_is_stable(tmp_path):
         core.stop()
 
 
+def test_non_ascii_pool_credential_is_a_bad_auth_refusal(tmp_path):
+    core = make_core(tmp_path)
+    app = create_api_app(core)
+    url = f"/v1/pool/{FP}/manifest?profile={PROFILE}"
+    try:
+        refused = asgi(app, "GET", url,
+                       headers={"Authorization": f"Bearer {'é' * 40}".encode("latin-1")})
+        assert refused.status_code == 400
+        assert refused.json() == {"error": "bad_auth"}
+    finally:
+        core.stop()
+
+
+def test_revocation_store_failure_returns_auth_unavailable(tmp_path, monkeypatch):
+    core = make_core(tmp_path)
+    app = create_api_app(core)
+    monkeypatch.setattr(core.auth, "is_revoked_token",
+                        lambda _token: (_ for _ in ()).throw(RuntimeError("synthetic store outage")))
+    try:
+        response = asgi(app, "GET", "/v1/pair/status",
+                        headers={"Authorization": f"Bearer {'z' * 43}"})
+        assert response.status_code == 503
+        assert response.json() == {"error": "auth_unavailable"}
+    finally:
+        core.stop()
+
+
 def test_rate_limit_is_advertised_and_enforced_on_the_host_listener(tmp_path):
     """Criterion 5: the per-class budget is advertised in response headers and is
     enforced under a burst with 429 + Retry-After."""
@@ -175,6 +206,38 @@ def test_rate_limit_is_advertised_and_enforced_on_the_host_listener(tmp_path):
         core.stop()
 
 
+def test_candidate_and_staged_routes_use_pool_rate_budgets(tmp_path):
+    core = make_core(tmp_path)
+    core.public_limiter = PublicLimiter(PublicLimits(
+        per_minute={"health": 2, "pair": 2, "api": 1, "pool_read": 1,
+                    "pool_write": 1, "unknown": 2}))
+    app = create_api_app(core)
+    read_client = ("127.0.0.1", 41001)
+    write_client = ("127.0.0.2", 41002)
+    try:
+        candidate_path = "/v1/pool/candidates?imdb=tt1234567&duration_ms=20000"
+        candidate = asgi(app, "GET", candidate_path,
+                         headers={"Authorization": f"Bearer {READ_KEY}"}, client=read_client)
+        assert candidate.headers["x-ratelimit-limit"] == "1"
+        assert asgi(app, "GET", candidate_path,
+                    headers={"Authorization": f"Bearer {READ_KEY}"}, client=read_client).status_code == 429
+
+        upload_path = "/v1/pool/uploads"
+        payload = json.dumps({"fp": FP, "profile": "nvmt-v1-g10", "duration_ms": 20_000})
+        staged = asgi(app, "POST", upload_path,
+                      headers={"Authorization": f"Bearer {WRITE_KEY}",
+                               "Content-Type": "application/json"},
+                      body=payload.encode(), client=write_client)
+        assert staged.status_code == 400
+        assert staged.headers["x-ratelimit-limit"] == "1"
+        assert asgi(app, "POST", upload_path,
+                    headers={"Authorization": f"Bearer {WRITE_KEY}",
+                             "Content-Type": "application/json"},
+                    body=payload.encode(), client=write_client).status_code == 429
+    finally:
+        core.stop()
+
+
 def test_undocumented_host_path_answers_the_documented_not_found_shape(tmp_path):
     """Criterion 1: only documented routes answer; an undocumented path is the
     documented 404 shape (with or without a credential), and a documented path
@@ -191,9 +254,52 @@ def test_undocumented_host_path_answers_the_documented_not_found_shape(tmp_path)
         anonymous_pool = asgi(app, "GET", f"/v1/pool/{FP}/manifest?profile={PROFILE}")
         assert anonymous_pool.status_code == 401          # a documented route: auth first
 
-        # an authenticated but undocumented method on a documented path is 405
+        # Method validation happens before auth on authenticated route paths.
+        pair_wrong_method = asgi(app, "POST", "/v1/pair/status")
+        assert pair_wrong_method.status_code == 405
+        assert pair_wrong_method.json() == {"error": "method_not_allowed"}
+
+        # an authenticated but undocumented method on an anonymous path is 405
         wrong_method = asgi(app, "POST", "/v1/health")
         assert wrong_method.status_code == 405
         assert wrong_method.json() == {"error": "method_not_allowed"}
+    finally:
+        core.stop()
+
+
+def test_tick_secret_is_checked_before_request_body(tmp_path):
+    core = make_core(tmp_path, cron_secret="cron-secret-that-is-long-enough")
+    app = create_api_app(core)
+
+    async def raw_request(headers):
+        received = []
+        sent = []
+        scope = {
+            "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+            "method": "POST", "scheme": "https", "path": "/v1/internal/tick",
+            "raw_path": b"/v1/internal/tick", "query_string": b"",
+            "headers": [(name.lower().encode("ascii"), value.encode("latin-1"))
+                        for name, value in headers.items()],
+            "client": CLIENT, "server": ("pool.test", 443),
+        }
+
+        async def receive():
+            received.append(True)
+            return {"type": "http.request", "body": b"x", "more_body": False}
+
+        async def send(message):
+            sent.append(message)
+
+        await app(scope, receive, send)
+        return next(message["status"] for message in sent if message["type"] == "http.response.start"), len(received)
+
+    try:
+        missing_status, missing_reads = asyncio.run(raw_request({"content-length": "20000"}))
+        assert missing_status == 401
+        assert missing_reads == 0
+        authorized_status, authorized_reads = asyncio.run(raw_request({
+            "authorization": "Bearer cron-secret-that-is-long-enough", "content-length": "20000"}))
+        assert authorized_status == 413
+        assert authorized_reads == 0
     finally:
         core.stop()

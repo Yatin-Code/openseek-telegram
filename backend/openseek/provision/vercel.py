@@ -11,10 +11,44 @@ import hashlib
 import httpx
 from urllib.parse import quote
 
-from .errors import (AUTH, QUOTA, PROVIDER, ProviderError, code_for_status,
-                     transport_error)
+from .errors import (AUTH, CONFLICT, QUOTA, PROVIDER, ProviderError,
+                     code_for_status, transport_error)
 
 BASE_URL = "https://api.vercel.com"
+
+# SSO protection modes that make even production deployment URLs redirect to
+# Vercel's SSO endpoint. Preview-only protection is the safe relaxed state: it
+# keeps preview deployments authenticated while production URLs stay public.
+_BLOCKING_SSO_MODES = ("all", "prod_deployment_urls_and_all_previews",
+                       "all_except_custom_domains")
+_SSO_UNEXPECTED = ("Vercel answered with an unexpected response about this "
+                   "project's access mode. Check the project in your Vercel "
+                   "dashboard, then run the wizard again to resume.")
+_SSO_UNCONFIRMED = ("Vercel did not confirm the production access change. Check "
+                    "the project in your Vercel dashboard, then run the wizard "
+                    "again to resume.")
+
+
+def _project_json(response: httpx.Response) -> dict:
+    """Parse a project response or fail safely; the body is never quoted."""
+    plain = _SSO_UNEXPECTED
+    try:
+        body = response.json()
+    except ValueError:
+        raise ProviderError(PROVIDER, 0, plain) from None
+    if not isinstance(body, dict):
+        raise ProviderError(PROVIDER, 0, plain)
+    return body
+
+
+def _sso_mode(project: dict) -> str:
+    """The project's SSO deployment type ('' when unprotected)."""
+    protection = project.get("ssoProtection")
+    if protection is None:
+        return ""
+    if isinstance(protection, dict) and isinstance(protection.get("deploymentType"), str):
+        return protection["deploymentType"]
+    raise ProviderError(PROVIDER, 0, _SSO_UNEXPECTED)
 
 _DEPLOYMENT_GUIDANCE = {
     "ERROR": "Vercel finished the deployment with an error. The build log in your "
@@ -82,12 +116,42 @@ class VercelClient:
         body = response.json()
         return {"id": body["id"], "name": body["name"]} if isinstance(body, dict) else None
 
+    def ensure_production_access(self, project_id_or_name: str) -> dict:
+        """Make the project's production deployment URLs publicly reachable.
+
+        Vercel SSO protection redirects public URL reads to the Vercel sign-in,
+        which blocks the node's health check. A known blocking mode is repaired
+        exactly once by narrowing it to preview-only protection with an official
+        `PATCH /v9/projects/{idOrName}` whose body contains nothing but
+        `ssoProtection`; preview authentication stays enabled, password
+        protection, trusted IPs and every other project setting are left
+        untouched, and no paid setting is involved. Projects without blocking
+        SSO (and already-preview projects) are only read, never patched. The
+        final protection is verified from the response, with one re-read before
+        an unmodeled outcome fails safely.
+        """
+        path = f"/v9/projects/{quote(project_id_or_name, safe='')}"
+        snapshot = _project_json(self._request("GET", path))
+        mode = _sso_mode(snapshot)
+        if not mode or mode == "preview":
+            return snapshot
+        if mode not in _BLOCKING_SSO_MODES:
+            raise ProviderError(PROVIDER, 0, _SSO_UNEXPECTED)
+        patched = _project_json(self._request(
+            "PATCH", path, json={"ssoProtection": {"deploymentType": "preview"}}))
+        if _sso_mode(patched) == "preview":
+            return patched
+        snapshot = _project_json(self._request("GET", path))
+        if _sso_mode(snapshot) == "preview":
+            return snapshot
+        raise ProviderError(PROVIDER, 0, _SSO_UNCONFIRMED)
+
     def create_project(self, name: str, env_vars: dict[str, str]) -> dict:
         """Create the project with Production env variables (type encrypted)."""
         variables = [{"key": key, "value": value, "type": "encrypted",
                       "target": ["production"]} for key, value in sorted(env_vars.items())]
         response = self._request("POST", "/v11/projects",
-                                 json={"name": name, "framework": None,
+                                 json={"name": name, "framework": "fastapi",
                                        "environmentVariables": variables})
         body = response.json()
         return {"id": body.get("id", ""), "name": body.get("name", name)}
@@ -145,7 +209,7 @@ class VercelClient:
             entries.append({"file": path, "sha": digest, "size": len(content)})
         response = self._request("POST", "/v13/deployments", json={
             "name": name, "target": "production",
-            "projectSettings": {"framework": None}, "files": entries})
+            "projectSettings": {"framework": "fastapi"}, "files": entries})
         body = response.json()
         return {"id": body.get("id", ""), "state": body.get("readyState", ""),
                 "url": body.get("url", "")}

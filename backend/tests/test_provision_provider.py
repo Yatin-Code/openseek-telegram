@@ -112,6 +112,7 @@ def _node_factory(node: dict):
                                              "setup_pending": node["pending"]})
         if request.url.path == "/v1/setup/pairing":
             assert request.headers["authorization"].startswith("Bearer ")
+            node.setdefault("pairing_bodies", []).append(json.loads(request.content or b"{}"))
             return httpx.Response(200, json={"code": "ABCD-EFGH-IJKL-MNOP"})
         return httpx.Response(404)
 
@@ -146,6 +147,7 @@ def test_provider_lists_and_provisions(tmp_path):
         url, secret = provider.supabase_credentials(project)
         assert (url, secret) == ("https://abcdefghij.supabase.co", "service-key")
         provider.configure_private_bucket(url, secret)
+        vercel.project = "openseek-node"  # the double must know the project being linked
         provider.link_vercel_project(tmp_path, {"name": "openseek-node"})
         provider.set_vercel_secret(tmp_path, "OPENSEEK_PROFILE", "vercel", secret=False)
         assert vercel.env["OPENSEEK_PROFILE"] == "vercel"
@@ -153,6 +155,10 @@ def test_provider_lists_and_provisions(tmp_path):
         assert provider.check_health("https://openseek-1.vercel.app", pending=True)
         invite = provider.create_pairing_invite("https://openseek-1.vercel.app", "setup-key")
         assert invite["code"] == "ABCD-EFGH-IJKL-MNOP"
+        assert node["pairing_bodies"][-1] == {"label": "Nuvio TV", "enable_sharing": False}
+        assert provider.create_pairing_invite("https://openseek-1.vercel.app", "setup-key",
+                                              enable_sharing=True)["code"] == "ABCD-EFGH-IJKL-MNOP"
+        assert node["pairing_bodies"][-1]["enable_sharing"] is True  # a consented body stays explicit
         provider.remove_vercel_secret(tmp_path, "OPENSEEK_PROFILE")
         assert "OPENSEEK_PROFILE" not in vercel.env
     finally:
@@ -180,6 +186,7 @@ def test_full_participant_journey_with_rest_provider(tmp_path):
             "Vercel project name": "",
             "Telegram API ID": "123",
             "Shared Telegram group invite link": "https://t.me/+shared",
+            "Enable Nuvio guest-device access": "y",
         }.items():
             if key in prompt:
                 return value

@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -22,10 +23,15 @@ from openseek.remote import (RemoteChannelStore, RemotePairingStore,
                              SupabaseClient)
 from openseek.remote_admin import RemoteAdminStore
 from openseek.uploads import UploadService
-from test_participant_setup import FakeProvider, FakeTelegramJoiner, _source
+from test_participant_setup import FakeProvider, FakeTelegramJoiner, _source, _telegram_ready
 from test_pool_channel import MemoryChannel, jpeg
 from openseek.participant_setup import ParticipantSetup
 from openseek.telegram_setup import TelegramSetupResult
+
+
+class _NoopProxy:
+    def stop(self):
+        pass
 
 
 class StatefulSupabase:
@@ -220,6 +226,15 @@ def clean_vercel_module_import():
         sys.modules["openseek.vercel"] = previous
 
 
+@pytest.fixture
+def inline_asyncio_to_thread(monkeypatch):
+    """Keep fake-backed ASGI tests independent from executor scheduling."""
+    async def run_inline(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr("openseek.app.asyncio.to_thread", run_inline)
+
+
 def _node(tmp_path: Path, tag: str, telegram: MemoryChannel, fake: StatefulSupabase,
           *, contribution=True):
     from openseek.vercel import build_app
@@ -231,7 +246,7 @@ def _node(tmp_path: Path, tag: str, telegram: MemoryChannel, fake: StatefulSupab
                    telegram_api_hash=f"api-hash-{tag}",
                    supabase_url="https://project.supabase.co",
                    supabase_service_key=f"service-role-{tag}", supabase_bucket="openseek-staging")
-    core = Core(cfg, pool_storage=telegram)
+    core = Core(cfg, pool_storage=telegram, proxy=_NoopProxy())
     old_client = core.supabase
     client = SupabaseClient(cfg.supabase_url, cfg.supabase_service_key,
                             transport=httpx.MockTransport(fake), bucket=cfg.supabase_bucket)
@@ -257,6 +272,45 @@ def _request(app, method, path, *, token=None, body=None):
                                      base_url="https://participant.vercel.app") as client:
             headers = {"Authorization": f"Bearer {token}"} if token else {}
             return await client.request(method, path, json=body, headers=headers)
+    import asyncio
+    return asyncio.run(run())
+
+
+def _raw_asgi_post(app, authorization=None, *, body=b"", content_length=None):
+    """Exercise Guard directly so refusal tests can prove it never reads a body."""
+    async def run():
+        received = 0
+        messages = []
+        headers = [(b"host", b"participant.vercel.app"),
+                   (b"content-type", b"application/json")]
+        if authorization is not None:
+            value = authorization if isinstance(authorization, bytes) else authorization.encode("utf-8")
+            headers.append((b"authorization", value))
+        if content_length is not None:
+            headers.append((b"content-length", str(content_length).encode("ascii")))
+
+        async def receive():
+            nonlocal received
+            received += 1
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        async def send(message):
+            messages.append(message)
+
+        scope = {
+            "type": "http", "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "http_version": "1.1", "method": "POST", "scheme": "https",
+            "path": "/v1/setup/pairing", "raw_path": b"/v1/setup/pairing",
+            "query_string": b"", "root_path": "", "headers": headers,
+            "client": ("203.0.113.10", 43123), "server": ("participant.vercel.app", 443),
+            "state": {},
+        }
+        await app(scope, receive, send)
+        start = next(message for message in messages if message["type"] == "http.response.start")
+        response_body = b"".join(message.get("body", b"") for message in messages
+                                  if message["type"] == "http.response.body")
+        return start["status"], response_body, received
+
     import asyncio
     return asyncio.run(run())
 
@@ -300,11 +354,11 @@ def test_wizard_pair_publish_exact_and_hint_read_on_independent_nodes(
     setup_key_for_bridge = {"value": ""}
 
     class Provider(FakeProvider):
-        def create_pairing_invite(self, url, setup_key):
+        def create_pairing_invite(self, url, setup_key, *, enable_sharing=False):
             setup_key_for_bridge["value"] = setup_key
             monkeypatch.setenv("OPENSEEK_SETUP_KEY", setup_key)
             response = _request(owner_app, "POST", "/v1/setup/pairing", token=setup_key,
-                                body={"label": "Nuvio TV"})
+                                body={"label": "Nuvio TV", "enable_sharing": enable_sharing})
             assert response.status_code == 200, response.text
             invite = response.json()
             return {"code": invite["code"], "spki_pin": invite["spki_pin"]}
@@ -319,7 +373,8 @@ def test_wizard_pair_publish_exact_and_hint_read_on_independent_nodes(
     second = ParticipantSetup(
         provider, source_dir=source, state_path=state_path,
         input_fn=lambda prompt: {"Telegram API ID: ": "1234",
-                                 "Shared Telegram group invite link: ": "https://t.me/+shared"}[prompt],
+                                 "Shared Telegram group invite link: ": "https://t.me/+shared",
+                                 "Enable Nuvio guest-device access? [y/N] ": "y"}[prompt],
         secret_input_fn=lambda _prompt: "telegram-api-hash",
         telegram_joiner=telegram_joiner, print_fn=output.append)
     assert second.run() == 0
@@ -464,3 +519,201 @@ def test_wizard_pair_publish_exact_and_hint_read_on_independent_nodes(
 
     owner.stop()
     receiver.stop()
+
+
+def _invited_node(monkeypatch, tmp_path, clean_vercel_module_import, *, contribution):
+    """One isolated node in a fresh wizard-relevant state with a fixed setup key."""
+    monkeypatch.setenv("OPENSEEK_PROFILE", "vercel")
+    monkeypatch.setenv("OPENSEEK_POOL_MODE", "channel")
+    monkeypatch.setenv("OPENSEEK_SETUP_PENDING", "1")
+    monkeypatch.setenv("OPENSEEK_SUPABASE_URL", "https://project.supabase.co")
+    monkeypatch.setenv("OPENSEEK_SUPABASE_SERVICE_KEY", "import-only-test-key")
+    telegram = MemoryChannel()
+    fake = StatefulSupabase()
+    owner, owner_app = _node(tmp_path, "invite", telegram, fake, contribution=contribution)
+    return owner, owner_app, fake
+
+
+def test_setup_pairing_requires_consent_on_a_fresh_node(monkeypatch, tmp_path, clean_vercel_module_import):
+    """The live G7 regression, minimized: a fresh node keeps global sharing off,
+    so the wizard's pairing endpoint must refuse to hand out an invite that
+    pairing would instantly deny, and no request without the setup key can
+    reach or change the access flags."""
+    monkeypatch.setenv("OPENSEEK_SETUP_KEY", "setup-key-fresh")
+    owner, owner_app, fake = _invited_node(monkeypatch, tmp_path, clean_vercel_module_import,
+                                           contribution=False)
+    try:
+        blocked = _request(owner_app, "POST", "/v1/setup/pairing", token="setup-key-fresh",
+                           body={"label": "Nuvio TV"})
+        assert blocked.status_code == 409, blocked.text
+        assert blocked.json()["error"] == "sharing_disabled"
+        assert owner.state_store.get_setting("sharing_enabled") != "1"
+        assert fake.tables["pool_invites"] == []
+
+        sneaky = _request(owner_app, "POST", "/v1/setup/pairing", token="wrong-key",
+                          body={"label": "Nuvio TV", "enable_sharing": True})
+        assert sneaky.status_code == 404, sneaky.text  # the key is checked before any consent effect
+        assert owner.state_store.get_setting("sharing_enabled") != "1"
+        assert fake.tables["pool_invites"] == []
+    finally:
+        owner.stop()
+
+
+def test_setup_pairing_explicit_consent_enables_guest_access(monkeypatch, tmp_path,
+                                                             clean_vercel_module_import,
+                                                             inline_asyncio_to_thread):
+    """An explicit consent turns only the sharing switch on (never the
+    contribution switch): the invite becomes claimable, the paired guest reads
+    the pool with contribution false and publishing is denied by name."""
+    monkeypatch.setenv("OPENSEEK_SETUP_KEY", "setup-key-consent")
+    owner, owner_app, fake = _invited_node(monkeypatch, tmp_path, clean_vercel_module_import,
+                                           contribution=False)
+    try:
+        invited = _request(owner_app, "POST", "/v1/setup/pairing", token="setup-key-consent",
+                           body={"label": "Nuvio TV", "enable_sharing": True})
+        assert invited.status_code == 200, invited.text
+        assert owner.state_store.get_setting("sharing_enabled") == "1"
+        assert owner.state_store.get_setting("contrib_enabled") != "1"
+
+        token = _pair_from_bundle(owner_app, f"https://host.vercel.app|{invited.json()['code']}")
+        status = _request(owner_app, "GET", "/v1/pair/status", token=token)
+        assert status.status_code == 200 and status.json()["contribute"] is False, status.text
+
+        publish = _request(owner_app, "POST", "/v1/pool/uploads", token=token, body={
+            "fp": hashlib.sha256(b"consent-gated guest package").hexdigest(),
+            "profile": "nvmt-v1-g10", "duration_ms": 20_000, "size_bytes": 2_000_000,
+            "imdb": "tt7654321", "season": 1, "episode": 1,
+            "filename": "Consent.Gate.S01E01.mkv"})
+        assert publish.status_code == 403, publish.text
+        assert publish.json()["error"] == "not_contribute", publish.text
+    finally:
+        owner.stop()
+
+
+def test_setup_pairing_leaves_enabled_owner_flags_alone(monkeypatch, tmp_path,
+                                                        clean_vercel_module_import,
+                                                        inline_asyncio_to_thread):
+    """When the owner already enabled sharing, both and consent-free requests
+    create the invite without resetting the contribution choice."""
+    monkeypatch.setenv("OPENSEEK_SETUP_KEY", "setup-key-enabled")
+    owner, owner_app, fake = _invited_node(monkeypatch, tmp_path, clean_vercel_module_import,
+                                           contribution=True)
+    try:
+        owner.state_store.set_setting("sharing_enabled", "1")
+        owner.state_store.set_setting("contrib_enabled", "1")
+        first = _request(owner_app, "POST", "/v1/setup/pairing", token="setup-key-enabled",
+                         body={"enable_sharing": False})
+        assert first.status_code == 200, first.text
+        second = _request(owner_app, "POST", "/v1/setup/pairing", token="setup-key-enabled",
+                          body={})
+        assert second.status_code == 200, second.text
+
+        assert owner.state_store.get_setting("sharing_enabled") == "1"
+        assert owner.state_store.get_setting("contrib_enabled") == "1"
+        assert fake.tables["pool_invites"] and len(fake.tables["pool_invites"]) == 2
+    finally:
+        owner.stop()
+
+
+def test_fresh_wizard_consent_creates_a_claimable_guest_invite(monkeypatch, tmp_path,
+                                                               clean_vercel_module_import,
+                                                               inline_asyncio_to_thread):
+    """The composition the pre-enabled publish test had masked: a fresh node
+    with both switches closed, a saved `telegram_ready` state (no Telegram
+    involved), the wizard's explicit consent, and the REAL endpoint handler
+    together produce exactly one claimable invite whose paired guest can read
+    the pool but cannot contribute."""
+    monkeypatch.setenv("OPENSEEK_PROFILE", "vercel")
+    monkeypatch.setenv("OPENSEEK_POOL_MODE", "channel")
+    monkeypatch.setenv("OPENSEEK_SETUP_PENDING", "1")
+    monkeypatch.setenv("OPENSEEK_SUPABASE_URL", "https://project.supabase.co")
+    monkeypatch.setenv("OPENSEEK_SUPABASE_SERVICE_KEY", "import-only-test-key")
+    telegram = MemoryChannel()
+    fake = StatefulSupabase()
+    owner, owner_app = _node(tmp_path, "bridge", telegram, fake, contribution=False)
+    state_path = tmp_path / "state.json"
+    output = []
+    setup_key_for_bridge = {"value": ""}
+
+    class Provider(FakeProvider):
+        def create_pairing_invite(self, url, setup_key, *, enable_sharing=False):
+            setup_key_for_bridge["value"] = setup_key
+            monkeypatch.setenv("OPENSEEK_SETUP_KEY", setup_key)
+            response = _request(owner_app, "POST", "/v1/setup/pairing", token=setup_key,
+                                body={"label": "Nuvio TV", "enable_sharing": enable_sharing})
+            assert response.status_code == 200 and enable_sharing is True, response.text
+            invite = response.json()
+            return {"code": invite["code"], "spki_pin": invite["spki_pin"]}
+
+    provider = Provider()
+    _telegram_ready(tmp_path)
+    setup = ParticipantSetup(provider, source_dir=_source(tmp_path), state_path=state_path,
+                             input_fn=lambda prompt: {
+                                 "Enable Nuvio guest-device access? [y/N] ": "y"}[prompt],
+                             print_fn=output.append)
+    try:
+        assert setup.run() == 0, "\n".join(output)
+
+        bundle_line = next(line for line in output if "|" in line)
+        token = _pair_from_bundle(owner_app, bundle_line)
+        status = _request(owner_app, "GET", "/v1/pair/status", token=token)
+        assert status.status_code == 200 and status.json()["contribute"] is False, status.text
+
+        assert owner.state_store.get_setting("sharing_enabled") == "1"
+        assert owner.state_store.get_setting("contrib_enabled") != "1"  # consent touched only sharing
+        assert len(fake.tables["pool_invites"]) == 1  # exactly the consented invite
+        assert json.loads(state_path.read_text(encoding="utf-8"))["step"] == "paired"
+        assert "OPENSEEK_SETUP_KEY" not in provider.env          # temp key removed again
+        assert setup_key_for_bridge["value"] not in json.dumps(provider.env)
+    finally:
+        owner.stop()
+
+
+def test_setup_pairing_refuses_before_reading_untrusted_body(monkeypatch, tmp_path,
+                                                             clean_vercel_module_import):
+    """The setup key and profile gate run in Guard before size checks or body parsing."""
+    monkeypatch.setenv("OPENSEEK_SETUP_KEY", "setup-key-guard")
+    owner, owner_app, fake = _invited_node(monkeypatch, tmp_path, clean_vercel_module_import,
+                                           contribution=False)
+    try:
+        invalid_consent = b'{"enable_sharing":"invalid"}'
+        status, _, received = _raw_asgi_post(
+            owner_app, "Bearer wrong-key", body=invalid_consent,
+            content_length=len(invalid_consent))
+        assert status == 404
+        assert received == 0
+
+        for authorization in ("Bearer wrong-key", "Basic setup-key-guard", None):
+            status, _, received = _raw_asgi_post(
+                owner_app, authorization, body=b"{", content_length=1)
+            assert status == 404
+            assert received == 0
+
+        malformed_unicode, _, received = _raw_asgi_post(
+            owner_app, b"Bearer \xff", body=b"{}", content_length=2)
+        assert malformed_unicode == 404
+        assert received == 0
+
+        monkeypatch.delenv("OPENSEEK_SETUP_KEY")
+        unavailable, _, received = _raw_asgi_post(
+            owner_app, None, body=b"{", content_length=17 * 1024)
+        assert unavailable == 404
+        assert received == 0
+
+        monkeypatch.setenv("OPENSEEK_SETUP_KEY", "setup-key-guard")
+        owner.settings = replace(owner.settings, profile="local")
+        wrong_profile, _, received = _raw_asgi_post(
+            owner_app, "Bearer setup-key-guard", body=b"{", content_length=17 * 1024)
+        assert wrong_profile == 404
+        assert received == 0
+        owner.settings = replace(owner.settings, profile="vercel")
+
+        malformed_body, _, received = _raw_asgi_post(
+            owner_app, "Bearer setup-key-guard", body=b'{"enable_sharing":"yes"}',
+            content_length=len(b'{"enable_sharing":"yes"}'))
+        assert malformed_body == 400
+        assert received == 1
+        assert owner.state_store.get_setting("sharing_enabled") != "1"
+        assert fake.tables["pool_invites"] == []
+    finally:
+        owner.stop()

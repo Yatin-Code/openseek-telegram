@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import base64
+import asyncio
 import hashlib
 import io
 import json
 import logging
 import os
+import threading
 import time
+from contextlib import asynccontextmanager
 from collections import deque
 
 from .cache import PROFILE
@@ -39,6 +42,8 @@ class TelegramLibrarian:
         self._senders: dict[int, float] = {}
         self._recent: deque[float] = deque()
         self._blocked: dict[int, float] = {}
+        self._package_locks: dict[tuple[str, str], list] = {}
+        self._package_locks_guard = threading.Lock()
 
     def attach(self) -> None:
         self.store.set_message_handler(self.handle_message)
@@ -131,6 +136,45 @@ class TelegramLibrarian:
             log.warning("librarian repost failed (%s)", type(exc).__name__)
 
     async def _handle_nvmt_package(self, event, store: TelegramMTProtoStore, sender_id: int, raw_b64: str) -> None:
+        key = None
+        try:
+            rem = len(raw_b64) % 4
+            padded = raw_b64 + ("=" * ((4 - rem) % 4))
+            submitted = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+            fp, profile = submitted.get("fp"), submitted.get("profile")
+            if profile == PROFILE:
+                profile = "nvmt-v1-g10"
+            if is_fingerprint(fp) and profile in NVMT_PROFILES:
+                key = (fp, profile)
+        except Exception:
+            pass
+        if key is None:
+            return await self._handle_nvmt_package_unlocked(event, store, sender_id, raw_b64)
+        async with self._serialize_package(key):
+            return await self._handle_nvmt_package_unlocked(event, store, sender_id, raw_b64)
+
+    @asynccontextmanager
+    async def _serialize_package(self, key: tuple[str, str]):
+        # Count waiters before they block so an entry cannot be removed while another
+        # coroutine is queued on its lock. Remove idle keys to bound attacker-driven
+        # package-key growth.
+        with self._package_locks_guard:
+            entry = self._package_locks.get(key)
+            if entry is None:
+                entry = [asyncio.Lock(), 0]
+                self._package_locks[key] = entry
+            entry[1] += 1
+        try:
+            async with entry[0]:
+                yield
+        finally:
+            with self._package_locks_guard:
+                entry[1] -= 1
+                if entry[1] == 0 and self._package_locks.get(key) is entry:
+                    self._package_locks.pop(key, None)
+
+    async def _handle_nvmt_package_unlocked(self, event, store: TelegramMTProtoStore,
+                                            sender_id: int, raw_b64: str) -> None:
         message = getattr(event, "message", None)
         document = getattr(message, "document", None)
         mime = getattr(document, "mime_type", "") or ""
@@ -151,6 +195,8 @@ class TelegramLibrarian:
             rem = len(raw_b64) % 4
             padded = raw_b64 + ("=" * ((4 - rem) % 4))
             manifest_dict = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+            if type(manifest_dict.get("v")) is not int or manifest_dict["v"] != 1:
+                raise PoolError(400, "unsupported_manifest_version")
             fp = manifest_dict.get("fp")
             profile = manifest_dict.get("profile")
             if profile == PROFILE:
@@ -164,7 +210,7 @@ class TelegramLibrarian:
             duration_ms = int(manifest_dict.get("duration_ms", 0))
             size_bytes = int(manifest_dict["size_bytes"]) if manifest_dict.get("size_bytes") is not None else None
             filename = manifest_dict.get("filename")
-            validate_pool_hints(imdb, season, episode, duration_ms, size_bytes, filename)
+            hints = validate_pool_hints(imdb, season, episode, duration_ms, size_bytes, filename)
         except Exception as exc:
             self._block(sender_id)
             await self._delete(event)
@@ -199,9 +245,8 @@ class TelegramLibrarian:
             log.info("librarian rejected package (%s)", code)
             return
 
-        expected_max_tiles = tile_count(duration_ms)
         max_tiles_allowed = getattr(self, "max_package_tiles", POOL_LIBRARIAN_MAX_PACKAGE_TILES)
-        if len(tiles) > expected_max_tiles or len(tiles) > max_tiles_allowed:
+        if len(tiles) > n_slots or len(tiles) > max_tiles_allowed:
             self._block(sender_id)
             await self._delete(event)
             await self._reply_sender(store, sender_id, "Rejected: package_too_large")
@@ -230,16 +275,22 @@ class TelegramLibrarian:
                 log.info("librarian rejected invalid tile in package (%s)", type(exc).__name__)
                 return
 
-        # Republish a complete manifest. The contributor's caption may carry only
-        # the fields it was asked for; the channel copy must also carry grid,
-        # n_tiles and created, or a rebuild cannot index it.
-        manifest_record = dict(manifest_dict)
-        manifest_record.update({"grid": grid, "n_tiles": len(tiles)})
-        manifest_record.setdefault("v", 1)
-        manifest_record.setdefault("created", int(time.time()))
-        encoded = base64.urlsafe_b64encode(
-            json.dumps(manifest_record, separators=(",", ":"), ensure_ascii=True).encode()).decode().rstrip("=")
-        manifest_cap = f"openseek:hints:v1:{encoded}"
+        # Republish only the validated canonical fields. The original caption can
+        # contain paths and arbitrary extras, neither of which belong in the pool.
+        manifest_record = {
+            "v": 1, "fp": fp, "profile": profile,
+            "imdb": hints["imdb"], "season": hints["season"],
+            "episode": hints["episode"], "duration_ms": hints["duration_ms"],
+            "size_bytes": hints["size_bytes"], "n_tiles": len(tiles),
+            "grid": grid, "created": int(time.time()),
+        }
+        if hints["filename_norm"]:
+            manifest_record["filename"] = hints["filename_norm"]
+        manifest_cap = self._manifest_caption(manifest_record)
+        if manifest_cap is None:
+            await self._delete(event)
+            await self._reply_sender(store, sender_id, "Rejected: manifest_too_large")
+            return
 
         if self.db and work_key and hasattr(self.db, "sender_quota_claim"):
             if not self.db.sender_quota_claim(sender_id, work_key, today_utc, 3):
@@ -276,7 +327,7 @@ class TelegramLibrarian:
                 try:
                     await store._client.delete_messages(store._entity, to_delete)
                 except Exception as del_exc:
-                    log.warning("failed to rollback reposted messages: %s", del_exc)
+                    log.warning("failed to rollback reposted messages (%s)", type(del_exc).__name__)
             if self.db and work_key and hasattr(self.db, "sender_quota_release"):
                 self.db.sender_quota_release(sender_id, work_key, today_utc)
             await self._delete(event)
@@ -284,14 +335,46 @@ class TelegramLibrarian:
             log.warning("librarian package repost failed (%s)", type(exc).__name__)
             return
 
-        for msg in posted_messages:
-            self.index.record_message(msg)
-
-        self.index.record_manifest(manifest_record)
+        try:
+            with self.index.atomic_recording():
+                if not self.index.record_manifest(manifest_record):
+                    raise ValueError("manifest index rejected record")
+                for msg in posted_messages:
+                    if not self.index.record_message(msg):
+                        raise ValueError("tile index rejected record")
+        except Exception:
+            to_delete = [*posted_ids, manifest_posted_id]
+            try:
+                await store._client.delete_messages(store._entity, [mid for mid in to_delete if mid is not None])
+            except Exception as del_exc:
+                log.warning("failed to rollback unindexed reposts (%s)", type(del_exc).__name__)
+            if self.db and work_key and hasattr(self.db, "sender_quota_release"):
+                self.db.sender_quota_release(sender_id, work_key, today_utc)
+            await self._delete(event)
+            await self._reply_sender(store, sender_id, "Rejected: index_failed")
+            return
 
         await self._delete(event)
         await self._reply_sender(store, sender_id, f"Accepted package for {fp[:8]} ({len(posted_messages)} tiles)")
         log.info("librarian accepted and reposted package (%d tiles)", len(posted_messages))
+
+    @staticmethod
+    def _manifest_caption(manifest_record: dict) -> str | None:
+        def encode(record):
+            raw = json.dumps(record, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+            encoded = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+            return f"openseek:hints:v1:{encoded}"
+
+        record = dict(manifest_record)
+        caption = encode(record)
+        while len(caption.encode("utf-8")) > 900 and record.get("filename"):
+            shortened = record["filename"][:-1].rstrip(".")
+            if shortened:
+                record["filename"] = shortened
+            else:
+                record.pop("filename")
+            caption = encode(record)
+        return caption if len(caption.encode("utf-8")) <= 900 else None
 
     @staticmethod
     def _compute_work_key(imdb: str | None, season: int, episode: int) -> str:

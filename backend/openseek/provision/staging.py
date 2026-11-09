@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from ..pool import MAX_NVMT_BYTES
 from ..remote import SupabaseClient
+from .errors import CONFLICT, ProviderError
 
 # The single name the OpenSeek docs (docs/VERCEL.md) and config's default bucket use.
 DEFAULT_STAGING_BUCKET = "openseek-staging"
@@ -34,16 +35,24 @@ def ensure_staging_bucket(provisioner, *, ref: str, service_key: str,
     existed" / the bucket name and cap). Any mismatch in shape is a typed error, never
     a secret leak.
     """
-    names = {str(row.get("name") or row.get("id") or "")
-             for row in provisioner.list_buckets(ref)}
-    if bucket in names:
-        created = False
-    else:
-        client = SupabaseClient(project_url(ref), service_key, transport=transport,
-                                bucket=bucket)
-        try:
-            created = client.create_bucket(bucket, public=False, size_limit=size_limit)
-        finally:
-            client.close()
+    buckets = {str(row.get("name") or row.get("id") or ""): row
+               for row in provisioner.list_buckets(ref)}
+    existing = buckets.get(bucket)
+    if existing is not None:
+        actual_limit = existing.get("file_size_limit")
+        if (existing.get("public") is not False or
+                type(actual_limit) is not int or actual_limit != size_limit):
+            raise ProviderError(
+                CONFLICT, 409,
+                "The existing staging bucket is not private with the required file-size limit. "
+                "Correct its Storage settings and run setup again.")
+        return f"Private staging bucket {bucket} already existed ({size_limit} bytes per file)."
+
+    client = SupabaseClient(project_url(ref), service_key, transport=transport,
+                            bucket=bucket)
+    try:
+        created = client.create_bucket(bucket, public=False, size_limit=size_limit)
+    finally:
+        client.close()
     state = ("created" if created else "already existed (kept)")
     return f"Private staging bucket {bucket} {state} ({size_limit} bytes per file)."

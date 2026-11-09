@@ -17,6 +17,27 @@ from typing import Callable
 _FP = r"[0-9a-f]{64}"
 _EPISODE_KEY = r"[0-9a-f]{64}"
 _INDEX = r"[0-9]{1,6}"
+_SEGMENT = r"[^/]+"
+
+# Full documented pool surface for the owner/LAN listener's rate classes. The
+# public listener intentionally has a smaller anonymous allowlist below.
+HOST_POOL_ROUTES = (
+    ("pool_read", "GET", re.compile(r"/v1/pool/candidates")),
+    ("pool_read", "GET", re.compile(rf"/v1/pool/{_FP}/manifest")),
+    ("pool_read", "GET", re.compile(rf"/v1/pool/{_FP}/tiles/{_SEGMENT}")),
+    ("pool_write", "PUT", re.compile(rf"/v1/pool/{_FP}/tiles/{_SEGMENT}")),
+    ("pool_read", "GET", re.compile(rf"/v1/pool/{_FP}/nvmt/manifest")),
+    ("pool_read", "GET", re.compile(rf"/v1/pool/{_FP}/nvmt")),
+    ("pool_write", "PUT", re.compile(rf"/v1/pool/{_FP}/nvmt")),
+    ("pool_read", "GET", re.compile(rf"/v1/pool/episodes/{_EPISODE_KEY}")),
+    ("pool_write", "PUT", re.compile(rf"/v1/pool/candidates/{_FP}/offset")),
+    ("pool_write", "DELETE", re.compile(rf"/v1/pool/candidates/{_FP}/offset")),
+    ("pool_write", "PUT", re.compile(rf"/v1/pool/candidates/{_FP}/reject")),
+    ("pool_write", "DELETE", re.compile(rf"/v1/pool/candidates/{_FP}/reject")),
+    ("pool_write", "POST", re.compile(r"/v1/pool/uploads")),
+    ("pool_write", "POST", re.compile(rf"/v1/pool/uploads/{_SEGMENT}/finalize")),
+    ("pool_write", "GET", re.compile(rf"/v1/pool/uploads/{_SEGMENT}")),
+)
 
 # Routes that need no token: health, invitation pairing, and the configured public pool reads/writes.
 OPEN_ROUTES = (
@@ -45,6 +66,9 @@ def host_kind(method: str, path: str, guest_allowed: Callable[[str, str], bool])
     """Limit class for the owner/LAN listener: the same per-class budgets as the
     public listener, but an unlisted path keeps its normal routing (the documented
     404 or auth answer) instead of the public listener's deny-by-default."""
+    for kind, route_method, rx in HOST_POOL_ROUTES:
+        if route_method == method and rx.fullmatch(path):
+            return kind
     return classify(method, path, guest_allowed) or "api"
 
 

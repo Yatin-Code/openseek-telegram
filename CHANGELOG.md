@@ -31,7 +31,12 @@ All notable changes are documented here. The format follows [Keep a Changelog](h
 ### Fixed
 * Dashboard: a rejected admin secret renders an "Admin access denied" notice instead of a broken page, and phone and TV widths wrap pairing and invitation text instead of overflowing (#75).
 * Generation: a blocked source answers `400 source_forbidden` instead of surfacing an unhandled 500 (#79).
-* G7 participant-setup repairs (#50, not accepted yet): resuming an interrupted `openseek setup` skips completed provisioning; a Nuvio guest can claim an invite only after an explicit per-invite consent that enables sharing and leaves contributions off; and a serialized Telethon StringSession no longer raises ENAMETOOLONG when it is probed as a file path on Python ≤ 3.12, which had surfaced as `503 telegram_unavailable` package reads.
+* Participant setup (#50): resuming an interrupted `openseek setup` skips completed provisioning; the wizard requests explicit Nuvio guest-device access for each invitation, enabling sharing without changing existing contribution choices; and a serialized Telethon StringSession no longer raises ENAMETOOLONG when it is probed as a file path on Python 3.12, which had surfaced as `503 telegram_unavailable` package reads.
+* Setup pairing returns `404 not_found` for a missing or invalid setup key, unavailable key, or non-Vercel profile before reading the request body.
+* A failed librarian package-index write rolls back its SQLite tile and hint changes, preserves existing rows, and releases the failed submission's quota claim.
+* Librarian rollback warnings log only the exception class, keeping raw exception details out of logs.
+* Reviewed #78 host-generation repair: host-profile dashboard jobs publish through the host PoolService path.
+* Generation packaging preserves scheduled cache slots for frames whose actual PTS is within extraction tolerance, including sparse g5 slots (#78).
 
 ## [0.2.0] - 2026-10-19
 

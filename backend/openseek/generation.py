@@ -14,6 +14,7 @@ import threading
 import time
 from .pool import (MAX_DURATION_MS, MAX_NVMT_BYTES, NVMT_PROFILES, PoolError,
                    decode_nvmt, encode_nvmt)
+from .scheduler import GRID_MS
 from .uploads import UploadError
 
 log = logging.getLogger("openseek.generation")
@@ -193,13 +194,18 @@ class GenerationService:
         profile = job.generation_profile
         grid = NVMT_PROFILES[profile]
         slots = math.ceil(entry.duration_ms / grid)
+        tolerance_ms = int(getattr(getattr(self.core, "settings", None),
+                                   "tolerance_ms", GRID_MS // 2))
         package_tiles: dict[int, tuple[int, bytes]] = {}
         total_bytes = 20
         for k, pts_ms in sorted(entry.tiles.items()):
-            # The extractor produces a ten-second grid. For a five-second profile,
-            # those frames occupy every other slot and remain sparse by design.
-            slot = round(pts_ms / grid)
-            if slot >= slots or abs(pts_ms - slot * grid) > 10_000 or slot in package_tiles:
+            # The cache key is the scheduled ten-second tile. Keep that identity when
+            # mapping to NVMT, even when the decoded PTS is within tolerance of the
+            # scheduled timestamp; g5 therefore uses every other profile slot.
+            scheduled_ms = k * GRID_MS
+            slot, remainder = divmod(scheduled_ms, grid)
+            if (remainder or slot >= slots or abs(pts_ms - scheduled_ms) > tolerance_ms or
+                    slot in package_tiles):
                 continue
             tile = self.core.cache.tile_bytes(job.fp, k)
             if tile is None:
@@ -221,7 +227,17 @@ class GenerationService:
                  package: bytes, size_bytes: int | None, hints: dict) -> None:
         channel_store = self.core.channel_store
         if channel_store is None:
-            raise GenerationError("pool_unavailable")
+            # Issue #78 (F3 local/VPS): a host install has no MTProto channel store;
+            # its PoolService validates the package, publishes the shared tiles plus
+            # the hints manifest and keeps the byte-exact package and index itself.
+            pool = self.core.pool
+            if not hasattr(pool, "upload_package"):
+                raise GenerationError("pool_unavailable")
+            pool.upload_package(fp, profile, duration_ms, package, imdb=hints["imdb"],
+                                season=hints["season"], episode=hints["episode"],
+                                size_bytes=size_bytes, filename=hints["filename"])
+            self.store.update(generation_id, state="complete", error=None)
+            return
         channel_store.start()
         if getattr(channel_store, "can_post", None) is not True:
             raise GenerationError("read_only_channel")

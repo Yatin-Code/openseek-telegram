@@ -555,6 +555,16 @@ class PoolService:
         except AttributeError:
             return self.storage.get(file_id, MAX_NVMT_BYTES)
 
+    def _package_exists(self, file_id: str) -> bool:
+        """Check host-local package locators on disk and Telegram locators remotely."""
+        locator = str(file_id)
+        if locator.startswith("file:"):
+            name = locator.split(":", 1)[1]
+            if not name or Path(name).name != name:
+                return False
+            return (self.package_dir / name).is_file()
+        return self.storage.file_exists(locator)
+
     def _store_package_file(self, fp: str, profile: str, data: bytes) -> tuple[str, int]:
         """Keep the host's own package on local disk, never as a second Telegram copy."""
         path = self.package_dir / f"{fp}.{profile}.nvmt"
@@ -601,14 +611,25 @@ class PoolService:
             except PoolError as exc:
                 if exc.code not in ("tile_conflict", "media_metadata_conflict"):
                     raise
+        self._publish_shared_manifest(fp, profile, duration_ms, len(tiles), hints, grid)
+
+    def _publish_shared_manifest(self, fp: str, profile: str, duration_ms: int,
+                                 n_tiles: int, hints: dict, grid: int) -> None:
+        """Publish the canonical, normalized hint record without reposting tile bytes."""
+        if not isinstance(self.storage, TelegramBotStore):
+            return
         manifest = {"v": 1, "fp": fp, "profile": profile, "imdb": hints["imdb"],
                     "season": hints["season"], "episode": hints["episode"],
                     "duration_ms": duration_ms, "size_bytes": hints["size_bytes"],
-                    "filename_norm": hints["filename_norm"], "n_tiles": len(tiles),
-                    "grid": grid, "created": int(time.time())}
+                    "n_tiles": n_tiles, "grid": grid, "created": int(time.time())}
+        if hints["filename_norm"]:
+            manifest["filename"] = hints["filename_norm"]
         encoded = base64.urlsafe_b64encode(
             json.dumps(manifest, separators=(",", ":"), ensure_ascii=True).encode()).decode().rstrip("=")
-        self.storage.post_message(f"openseek:hints:v1:{encoded}")
+        caption = f"openseek:hints:v1:{encoded}"
+        if len(caption.encode("utf-8")) > 900:
+            raise PoolError(400, "bad_hints")
+        self.storage.post_message(caption)
 
     def manifest(self, fp: str, profile: str) -> dict | None:
         if not is_fingerprint(fp) or profile != PROFILE:
@@ -848,7 +869,8 @@ class PoolService:
                 old_hint_rows = self.db.q(
                     "SELECT imdb,season,episode,duration_ms,size_bytes,filename_norm,n_tiles,grid "
                     "FROM pool_hints WHERE fp=? AND profile=?", (fp, profile))
-                hints = _merge_absent_hint_fields(hints, tuple(old_hint_rows[0]) if old_hint_rows else None)
+                previous_hints = tuple(old_hint_rows[0]) if old_hint_rows else None
+                hints = _merge_absent_hint_fields(hints, previous_hints)
             merged = dict(incoming)
             if previous:
                 old_duration, old_slots, old_count, old_size, old_digest, old_file, old_message = previous
@@ -868,6 +890,12 @@ class PoolService:
                 raise PoolError(413, "package_too_large")
             digest = hashlib.sha256(package).hexdigest()
             if previous and digest == previous[4]:
+                old_values = (previous_hints[0], previous_hints[1], previous_hints[2],
+                              previous_hints[4], previous_hints[5]) if previous_hints else None
+                new_values = (hints["imdb"], hints["season"], hints["episode"],
+                              hints["size_bytes"], hints["filename_norm"])
+                if old_values != new_values:
+                    self._publish_shared_manifest(fp, profile, duration_ms, len(merged), hints, grid)
                 self._store_package_metadata(fp, profile, duration_ms, n_slots, len(merged), len(package),
                                              digest, previous[5], previous[6], episode_key, hints, grid)
                 return {"stored": False, "duplicate": True, "tiles": len(merged), "sha256": digest}
@@ -940,7 +968,7 @@ class PoolService:
                 if not self.storage.file_exists(row[3]):
                     invalid_tiles.append(row)
             for row in packages:
-                if not self.storage.file_exists(row[2]):
+                if not self._package_exists(row[2]):
                     invalid_packages.append(row)
             cutoff = time.time() - outbox_older_than_days * 86400
             before = self.db.path.stat().st_size if self.db.path.exists() else 0
@@ -951,6 +979,9 @@ class PoolService:
             messages_attempted = 0
             if not dry_run:
                 for row in [*invalid_tiles, *invalid_packages]:
+                    file_id = row[3] if len(row) == 5 else row[2]
+                    if str(file_id).startswith("file:"):
+                        continue
                     try:
                         self.storage.delete_message(int(row[-1]))
                         messages_attempted += 1

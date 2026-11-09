@@ -24,6 +24,11 @@ from urllib.parse import urlsplit
 import httpx
 
 
+# Asked before each Nuvio invite. The exact string is part of the dialogue:
+# wizard tests answer this prompt and count only the required prompts.
+_PAIRING_CONSENT_PROMPT = "Enable Nuvio guest-device access? [y/N] "
+
+
 class SetupFailure(RuntimeError):
     """A user-safe setup failure; provider output and secrets are never included."""
 
@@ -46,7 +51,7 @@ class SetupProvider(Protocol):
     def link_vercel_project(self, source_dir: Path, project: dict) -> None: ...
     def set_vercel_secret(self, source_dir: Path, name: str, value: str, *, secret: bool) -> None: ...
     def remove_vercel_secret(self, source_dir: Path, name: str) -> None: ...
-    def create_pairing_invite(self, url: str, setup_key: str) -> dict: ...
+    def create_pairing_invite(self, url: str, setup_key: str, *, enable_sharing: bool = False) -> dict: ...
     def deploy(self, source_dir: Path) -> str: ...
     def check_health(self, url: str, *, pending: bool = True) -> bool: ...
 
@@ -142,6 +147,19 @@ def _safe_vercel_url(value: str) -> str:
     return f"https://{parsed.netloc}"
 
 
+# Ordered provider-bootstrap checkpoints. The resume file step is only ever
+# written forward: a resume picks the remaining work up from the saved cursor
+# instead of replaying completed provisioning.
+_BOOTSTRAP_PHASES = ("authorized", "supabase_selected", "schema_applied", "supabase_ready",
+                     "vercel_selected", "vercel_configured", "deployed", "healthy")
+_PHASE_INDEX = {name: index for index, name in enumerate(_BOOTSTRAP_PHASES)}
+
+
+def _phase_index(step: object) -> int:
+    """Position of a bootstrap checkpoint; -1 for a fresh or unknown/legacy step."""
+    return _PHASE_INDEX.get(str(step), -1)
+
+
 class ParticipantSetup:
     """One observable wizard flow, with provider work isolated behind `SetupProvider`."""
 
@@ -193,52 +211,73 @@ class ParticipantSetup:
 
         try:
             self.provider.authenticate()
-            self.state["step"] = "authorized"
-            self._save()
+            self._advance("authorized")  # a fresh run records it; a resumed later
+            # phase is never rewritten down to it, not even when the
+            # re-authentication above fails.
 
-            supabase = self._supabase_project()
-            self.state["supabase_ref"] = _project_ref(supabase)
-            self.state["step"] = "supabase_selected"
-            self._save()
+            phase = _phase_index(self.state.get("step"))
+            if phase >= _PHASE_INDEX["supabase_selected"] and not str(self.state.get("supabase_ref") or ""):
+                # A progressed state must carry its own project ref, even when no
+                # key fetch is needed any more: never relist, re-prompt or
+                # recreate a resource as a substitute for it.
+                raise SetupFailure("Supabase project selection", "saved_project_missing")
+            credentials: tuple[str, str] | None = None
+            if phase < _PHASE_INDEX["vercel_configured"]:
+                ref = self._supabase_project_reference()
+                if phase < _PHASE_INDEX["schema_applied"]:
+                    schema = Path(__file__).parent / "supabase" / "schema.sql"
+                    self.provider.apply_schema(ref, self.state_path.parent / "supabase", schema)
+                    self._advance("schema_applied")  # a later bucket failure resumes past the applied SQL
+                # One service-key fetch per invocation: the staging bucket (when
+                # still pending) and the Vercel env upserts both consume it. The
+                # values are never written to the resume state.
+                credentials = self.provider.supabase_credentials({"id": ref})
+                if phase < _PHASE_INDEX["supabase_ready"]:
+                    url, secret = credentials
+                    self.provider.configure_private_bucket(url, secret)
+                    self.state["supabase_url"] = url
+                    self._advance("supabase_ready")
 
-            schema = Path(__file__).parent / "supabase" / "schema.sql"
-            self.provider.apply_schema(_project_ref(supabase), self.state_path.parent / "supabase", schema)
-            supabase_url, supabase_secret = self.provider.supabase_credentials(supabase)
-            self.provider.configure_private_bucket(supabase_url, supabase_secret)
-            self.state["supabase_url"] = supabase_url
-            self.state["step"] = "supabase_ready"
-            self._save()
+            if phase < _PHASE_INDEX["vercel_selected"]:
+                vercel = self._vercel_project()  # interrupted CLI creates are discovered here
+                self.state["vercel_project"] = _project_name(vercel)
+                self.state.pop("vercel_creating", None)
+                self.state.pop("vercel_projects_before", None)
+                self._advance("vercel_selected")
+            elif not str(self.state.get("vercel_project") or ""):
+                raise SetupFailure("Vercel project selection", "saved_project_missing")
+            project_name = str(self.state["vercel_project"])
 
-            vercel = self._vercel_project()
-            self.state["vercel_project"] = _project_name(vercel)
-            self.state.pop("vercel_creating", None)
-            self.state.pop("vercel_projects_before", None)
-            self.state["step"] = "vercel_selected"
-            self._save()
-            self.provider.link_vercel_project(self.source_dir, vercel)
-            admin_token = self._owner_token()
-            for key, value, secret in (
-                ("OPENSEEK_PROFILE", "vercel", False),
-                ("OPENSEEK_POOL_MODE", "channel", False),
-                ("OPENSEEK_SETUP_PENDING", "1", False),
-                ("OPENSEEK_ADMIN_TOKEN", admin_token, True),
-                ("OPENSEEK_SUPABASE_URL", supabase_url, False),
-                ("OPENSEEK_SUPABASE_SERVICE_KEY", supabase_secret, True),
-                ("OPENSEEK_SUPABASE_BUCKET", "openseek-staging", False),
-            ):
-                self.provider.set_vercel_secret(self.source_dir, key, value, secret=secret)
-            self.state["step"] = "vercel_configured"
-            self._save()
+            if phase < _PHASE_INDEX["deployed"]:
+                # This fresh invocation is re-linked to the saved project because
+                # the remaining env/deploy work needs it; linking is not a
+                # provisioning operation and never repeats one.
+                self.provider.link_vercel_project(self.source_dir, {"name": project_name})
+                if phase < _PHASE_INDEX["vercel_configured"]:
+                    if credentials is None:  # the cursor above guarantees the fetch
+                        raise SetupFailure("Vercel configuration", "credentials_unavailable")
+                    self._configure_vercel_environment(*credentials)
+                deployment = _safe_vercel_url(self.provider.deploy(self.source_dir))
+                self.state["deployment_url"] = deployment
+                self._advance("deployed")
 
-            deployment = self.provider.deploy(self.source_dir)
-            deployment = _safe_vercel_url(deployment)
-            self.state["deployment_url"] = deployment
-            self.state["step"] = "deployed"
-            self._save()
-            if not self.provider.check_health(deployment, pending=True):
-                raise SetupFailure("health check", "deployment_not_healthy_yet")
-            self.state["step"] = "healthy"
-            self._save()
+            deployment = str(self.state.get("deployment_url") or "")
+            if _phase_index(self.state.get("step")) < _PHASE_INDEX["healthy"]:
+                if not deployment:
+                    raise SetupFailure("health check", "saved_deployment_missing")
+                # A resumed run never sends a saved URL to the network unvalidated:
+                # a wrong URL fails before any binding or access change.
+                deployment = _safe_vercel_url(deployment)
+                if phase >= _PHASE_INDEX["deployed"]:
+                    # This invocation deployed nothing itself (or only re-checked),
+                    # so it re-binds the recorded project first: the selected
+                    # project's production access is repaired here without env,
+                    # schema, bucket or deployment work.
+                    self.provider.link_vercel_project(
+                        self.source_dir, {"name": str(self.state["vercel_project"])})
+                if not self.provider.check_health(deployment, pending=True):
+                    raise SetupFailure("health check", "deployment_not_healthy_yet")
+                self._advance("healthy")
         except SetupFailure as exc:
             if exc.reason in {"quota", "plan_limit", "payment_required"}:
                 self.print(f"Free-plan limit reached during {exc.step}. Setup is saved; no paid plan was enabled. Resume after freeing quota or choosing another free project.")
@@ -347,6 +386,13 @@ class ParticipantSetup:
         if not deployment or not project:
             self.print("The node deployment details are missing. Resume the provider setup first.")
             return 1
+        # Guest-device access is consented to again on every new invite and is
+        # never stored: a later replacement creates its own explicit decision.
+        self.print("A Nuvio guest invite lets the device pair and read the shared pool. This does not change your pool-contribution setting.")
+        answer = self.input(_PAIRING_CONSENT_PROMPT).strip().lower()
+        if answer not in {"y", "yes"}:
+            self.print("No invite was created and nothing on the node was changed. Rerun `openseek setup` to be asked again.")
+            return 1
         try:
             self.provider.authenticate()
             self.provider.link_vercel_project(self.source_dir, {"name": project})
@@ -363,7 +409,7 @@ class ParticipantSetup:
             self._save()
             if not self.provider.check_health(deployment, pending=False):
                 raise SetupFailure("pairing setup deployment", "deployment_not_healthy_yet")
-            invite = self.provider.create_pairing_invite(deployment, setup_key)
+            invite = self.provider.create_pairing_invite(deployment, setup_key, enable_sharing=True)
             code = str(invite.get("code") or "")
             if not code or len(code.replace("-", "")) != 16:
                 raise SetupFailure("Nuvio pairing invite", "invalid_invite_response")
@@ -408,6 +454,24 @@ class ParticipantSetup:
         value = secrets.token_urlsafe(32)
         _atomic_secret(path, value)
         return value
+
+    def _supabase_project_reference(self) -> str:
+        """The project ref to provision against.
+
+        Before `supabase_selected` this is the interactive selection; afterwards
+        only the saved ref is used: no re-listing, no re-prompt, no re-creating.
+        """
+        if _phase_index(self.state.get("step")) < _PHASE_INDEX["supabase_selected"]:
+            ref = _project_ref(self._supabase_project())
+            if not ref:
+                raise SetupFailure("Supabase project selection", "project_ref_unavailable")
+            self.state["supabase_ref"] = ref
+            self._advance("supabase_selected")
+            return ref
+        ref = str(self.state.get("supabase_ref") or "")
+        if not ref:
+            raise SetupFailure("Supabase project selection", "saved_project_missing")
+        return ref
 
     def _supabase_project(self) -> dict:
         ref = str(self.state.get("supabase_ref") or "")
@@ -460,8 +524,41 @@ class ParticipantSetup:
         self._save()                         # an interrupted CLI create is found from the list diff
         return self.provider.create_vercel_project(self.source_dir)
 
+    def _configure_vercel_environment(self, supabase_url: str, supabase_secret: str) -> None:
+        """Upsert the bootstrap env keys, skipping keys a partial run already set.
+
+        Only the finished key names are recorded in `bootstrap_env_done`, never
+        values; the marker is cleared with the `vercel_configured` save.
+        """
+        done = set(self.state.get("bootstrap_env_done") or [])
+        for key, value, secret in (
+            ("OPENSEEK_PROFILE", "vercel", False),
+            ("OPENSEEK_POOL_MODE", "channel", False),
+            ("OPENSEEK_SETUP_PENDING", "1", False),
+            ("OPENSEEK_ADMIN_TOKEN", self._owner_token(), True),
+            ("OPENSEEK_SUPABASE_URL", supabase_url, False),
+            ("OPENSEEK_SUPABASE_SERVICE_KEY", supabase_secret, True),
+            ("OPENSEEK_SUPABASE_BUCKET", "openseek-staging", False),
+        ):
+            if key in done:
+                continue
+            self.provider.set_vercel_secret(self.source_dir, key, value, secret=secret)
+            done.add(key)
+            self.state["bootstrap_env_done"] = sorted(done)
+            self._save()                     # a later failure resumes past this key
+        self.state.pop("bootstrap_env_done", None)
+        self._advance("vercel_configured")   # the same save clears the partial metadata
+
     def _save(self) -> None:
         _atomic_state(self.state_path, self.state)
+
+    def _advance(self, phase: str) -> None:
+        """Save a checkpoint only when it moves the saved step forward. A resumed
+        later phase is never downgraded, so failed or repeated authentication
+        cannot rewrite completed progress."""
+        if _phase_index(phase) > _phase_index(self.state.get("step")):
+            self.state["step"] = phase
+            self._save()
 
 
 class CliSetupProvider:
@@ -639,13 +736,13 @@ class CliSetupProvider:
         self._run([self.vercel, "env", "rm", name, "production", "--yes"], cwd=source_dir,
                   step=f"Vercel {name} removal", allow_failure=True)
 
-    def create_pairing_invite(self, url: str, setup_key: str) -> dict:
+    def create_pairing_invite(self, url: str, setup_key: str, *, enable_sharing: bool = False) -> dict:
         try:
             with self.httpx_client_factory(timeout=20, follow_redirects=False, trust_env=False) as client:
                 response = client.post(
                     f"{url.rstrip('/')}/v1/setup/pairing",
                     headers={"authorization": f"Bearer {setup_key}"},
-                    json={"label": "Nuvio TV"})
+                    json={"label": "Nuvio TV", "enable_sharing": enable_sharing})
                 if response.status_code >= 400:
                     raise SetupFailure("Nuvio pairing invite", "pairing_endpoint_unavailable")
                 body = response.json()

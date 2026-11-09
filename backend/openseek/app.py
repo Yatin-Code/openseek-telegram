@@ -38,7 +38,7 @@ from .db import DB
 from .envfile import write_env_file
 from .fetch import RangeProxy
 from .ids import is_device_id, is_fingerprint, is_invite_id, parse_index
-from .jobs import JobManager
+from .jobs import JobManager, SourceForbidden
 from .logutil import plain, setup_logging
 from .netpolicy import DestinationPolicy, filter_forwarded_headers
 from .pairing import PairingClosed, PairingFailed, PairingManager, RateLimited
@@ -64,7 +64,7 @@ MAX_BODY = 16 * 1024
 MAX_MS = 12 * 3600 * 1000
 MAX_VERCEL_RESPONSE = 4_500_000
 PUBLIC_PATHS = {"/v1/health", "/v1/pair/start", "/v1/pair/claim",
-                "/v1/setup/pairing", "/v1/internal/tick"}  # setup/tick authenticate their own Bearer secrets
+                "/v1/setup/pairing"}  # setup authenticates its own Bearer secret
 # Headers a reverse proxy, tunnel or load balancer adds. The owner and admin APIs are direct-connection only: a request that carries any of them
 # was relayed by something else, so its TCP peer address says nothing about who sent it. Refused (remote access is what the guest listener is for).
 PROXY_HEADERS = ("x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "x-forwarded-port", "forwarded", "x-real-ip",
@@ -292,6 +292,16 @@ def _bearer_credential(authorization: str | None) -> tuple[str | None, bool]:
     return credential, False
 
 
+def _setup_pairing_key_valid(profile: str, expected: str, authorization: str | None) -> bool:
+    scheme, separator, supplied = (authorization or "").partition(" ")
+    if profile != "vercel" or not expected or not separator or scheme.lower() != "bearer":
+        return False
+    try:
+        return hmac.compare_digest(supplied.encode("ascii"), expected.encode("ascii"))
+    except UnicodeEncodeError:
+        return False
+
+
 def _rate_headers(limit: int, remaining: int, reset: int) -> list[tuple[bytes, bytes]]:
     return [(b"x-ratelimit-limit", str(limit).encode()),
             (b"x-ratelimit-remaining", str(remaining).encode()),
@@ -333,7 +343,7 @@ class Guard:
                 path = getattr(route, "path", None)
                 if not path or not getattr(route, "methods", None):
                     continue          # mounts and other non-endpoint routes do not define the API surface
-                self._documented.append(compile_path(path)[0])
+                self._documented.append((frozenset(getattr(route, "methods", ())), compile_path(path)[0]))
 
     async def _deny(self, send, client, status: int, obj: dict, extra: list | None = None):
         if self.public and client[0]:
@@ -400,7 +410,16 @@ class Guard:
             return await _send_json(send, 403, {"error": "proxy_refused"})
 
         path = scope.get("path", "")
-        if self._documented and not any(rx.fullmatch(path) for rx in self._documented):
+        if self._documented:
+            route_methods = [methods for methods, rx in self._documented if rx.fullmatch(path)]
+            if not route_methods:
+                return await _send_json(send, 404, {"error": "not_found"})
+            if not any(scope["method"] in methods for methods in route_methods):
+                return await _send_json(send, 405, {"error": "method_not_allowed"})
+
+        if path == "/v1/setup/pairing" and not _setup_pairing_key_valid(
+                self.core.settings.profile, os.environ.get("OPENSEEK_SETUP_KEY", ""),
+                headers.get("authorization")):
             return await _send_json(send, 404, {"error": "not_found"})
 
         # Authenticate from the headers BEFORE the body is read: a missing, malformed or
@@ -497,6 +516,19 @@ class Guard:
         """H6: missing, malformed, and revoked credentials are distinct documented refusals,
         and they arrive before the body is read. Checks a later handler owns (a guest's
         contribution right, a read key trying to write) still reach that handler."""
+        if path == "/v1/internal/tick":
+            secret, admin = self.core.settings.cron_secret, self.core.admin_token
+            if not secret and not admin:
+                await self._deny(send, client, 503, {"error": "tick_unconfigured"})
+                return True
+            credential, malformed = _bearer_credential(authorization)
+            given = (credential or "").encode("utf-8", "replace")
+            accepted = [value.encode("utf-8") for value in (secret, admin) if value]
+            if malformed or credential is None or not any(
+                    hmac.compare_digest(given, value) for value in accepted):
+                await self._deny(send, client, 401, {"error": "unauthorized"})
+                return True
+            return False
         if is_pool_route:
             if self.core.pool is None:
                 return False                      # no pool surface: the uniform 404 stays the handler's answer
@@ -514,10 +546,14 @@ class Guard:
             if self._pool_key(credential):
                 return False                      # a pool key: the handler applies read/write rights
             if token_shaped(credential):
-                if self.core.auth.is_revoked_token(credential):
-                    await self._deny(send, client, 403, {"error": "revoked_key"})
-                else:
-                    await self._deny(send, client, 403, {"error": "forbidden"})
+                try:
+                    revoked = self.core.auth.is_revoked_token(credential)
+                except Exception as exc:
+                    log.warning("device revocation lookup unavailable (%s)", type(exc).__name__)
+                    await self._deny(send, client, 503, {"error": "auth_unavailable"})
+                    return True
+                await self._deny(send, client, 403,
+                                 {"error": "revoked_key" if revoked else "forbidden"})
                 return True
             await self._deny(send, client, 400, {"error": "bad_auth"})
             return True
@@ -530,7 +566,16 @@ class Guard:
         if credential is None:
             await self._deny(send, client, 401, {"error": "unauthorized"})
             return True
-        if token_shaped(credential) and self.core.auth.is_revoked_token(credential):
+        if not token_shaped(credential):
+            await self._deny(send, client, 400, {"error": "bad_auth"})
+            return True
+        try:
+            revoked = self.core.auth.is_revoked_token(credential)
+        except Exception as exc:
+            log.warning("device revocation lookup unavailable (%s)", type(exc).__name__)
+            await self._deny(send, client, 503, {"error": "auth_unavailable"})
+            return True
+        if revoked:
             await self._deny(send, client, 403, {"error": "revoked_key"})
             return True
         await self._deny(send, client, 401, {"error": "unauthorized"})
@@ -539,7 +584,7 @@ class Guard:
     def _pool_key(self, credential: str) -> bool:
         settings = self.core.settings
         for key in (settings.pool_read_key, settings.pool_write_key):
-            if key and hmac.compare_digest(credential, key):
+            if key and credential.isascii() and key.isascii() and hmac.compare_digest(credential, key):
                 return True
         return False
 
@@ -682,6 +727,7 @@ class SharingIn(BaseModel):
 class SetupPairingIn(BaseModel):
     model_config = ConfigDict(extra="ignore")
     label: StrictStr = Field(default="Nuvio TV", max_length=64)
+    enable_sharing: StrictBool = False
 
 
 class PermIn(BaseModel):
@@ -811,11 +857,20 @@ def create_api_app(core: Core, public: bool = False) -> FastAPI:
         # The participant wizard exposes this short-lived key only while creating
         # the initial Nuvio invite, then removes it and redeploys.
         expected = os.environ.get("OPENSEEK_SETUP_KEY", "")
-        scheme, _, supplied = request.headers.get("authorization", "").partition(" ")
-        if (core.settings.profile != "vercel" or not expected or scheme.lower() != "bearer" or
-                not hmac.compare_digest(supplied, expected)):
+        if not _setup_pairing_key_valid(core.settings.profile, expected,
+                                        request.headers.get("authorization")):
             return err(404, "not_found")
         label = body.label if body is not None else "Nuvio TV"
+        enable_sharing = bool(body.enable_sharing) if body is not None else False
+        if enable_sharing:
+            # The participant explicitly consented to Nuvio guest-device access
+            # for this invite. Only the sharing switch is recorded; the owner's
+            # contribution choice and every other flag are left untouched.
+            core.state_store.set_setting("sharing_enabled", "1")
+        if not core.sharing_enabled():
+            # An invite created while sharing stays off would be refused by the
+            # pairing gate: fail named instead of completing falsely.
+            return err(409, "sharing_disabled")
         try:
             invite = await asyncio.to_thread(core.invites.create, label, 86400, "guest", None, True)
         except Exception as exc:
@@ -1302,75 +1357,119 @@ def api_openapi(core: Core) -> dict:
 
 
 # ===================================================================== admin app
-_ADMIN_HTML = """<!doctype html><html><head><meta charset="utf-8"><title>OpenSeek admin</title>
-<style>body{font:15px system-ui,sans-serif;margin:2em;max-width:52em;color:#222}code{font-size:1.1em}
-table{border-collapse:collapse}td,th{border:1px solid #ccc;padding:.3em .6em}.code{font-size:2.4em;
-letter-spacing:.15em;font-family:monospace}button{font-size:1em;margin:.2em}</style></head><body>
+_ADMIN_HTML = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>OpenSeek admin</title>
+<style>*{box-sizing:border-box}body{font:15px system-ui,sans-serif;margin:2em auto;width:calc(100% - 2em);max-width:52em;color:#222}
+code{font-size:1.1em;overflow-wrap:anywhere;word-break:break-word}table{border-collapse:collapse;width:100%;table-layout:fixed}
+.pairing-details,.invite-details{overflow-wrap:anywhere;word-break:break-word}
+td,th{border:1px solid #ccc;padding:.3em .6em;overflow-wrap:anywhere}.code{font-size:2.4em;letter-spacing:.15em;
+font-family:monospace;overflow-wrap:anywhere}button{font:inherit;min-height:2.5rem;margin:.2em;padding:.35em .7em;white-space:normal}
+input,select{font:inherit;max-width:100%;min-width:0;min-height:2.5rem}input[type=url]{width:100%}form{max-width:100%}
+@media(max-width:600px){body{margin:1em auto}.code{font-size:clamp(1.5em,9vw,2.4em);letter-spacing:.1em}
+.setup-form label,.generation-form label{display:block;margin:.35em 0}.setup-form input,.generation-form input,.generation-form select{display:block;width:100%}
+.device-table thead{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap;border:0}
+.device-table tbody,.device-table tbody tr{display:block;width:100%}.device-table tbody tr{border:1px solid #ccc;margin:.6em 0;padding:.2em .6em}
+.device-table td{display:grid;grid-template-columns:7rem minmax(0,1fr);align-items:center;gap:.5rem;border:0;padding:.3em 0}
+.device-table td::before{font-weight:600}.device-table td:nth-child(1)::before{content:"Device ID"}.device-table td:nth-child(2)::before{content:"Name"}
+.device-table td:nth-child(3)::before{content:"NVMT uploads"}.device-table td:nth-child(4)::before{content:"Actions"}
+.device-table .empty-row td{display:block}.device-table .empty-row td::before{content:none}}</style></head><body>
 <h1>OpenSeek</h1><div id=s>loading…</div>
 <script>
 const PROFILE='__PROFILE__';
-const T=(location.hash||'').slice(1)||sessionStorage.getItem('osk')||'';if(T)sessionStorage.setItem('osk',T);history.replaceState(null,'',location.pathname);
+let T=(location.hash||'').slice(1)||sessionStorage.getItem('osk')||'';if(T)sessionStorage.setItem('osk',T);history.replaceState(null,'',location.pathname);
 const H={'X-OpenSeek-Admin':T};
 const PAIR_KEY='oskPairing';
+let authFailed=false;
+let loadFailureVisible=false;
 function esc(t){return String(t).replace(/[&<>"']/g,c=>'&#'+c.charCodeAt(0)+';')}
+function isRecord(value){return value!==null&&typeof value==='object'&&!Array.isArray(value)}
+function failure(kind){const e=new Error(kind);e.kind=kind;return e}
+async function adminRequest(url,options){let response;try{response=await fetch(url,options)}catch(_){throw failure('network')}
+if(response.status===204)return {response,data:null};let data=null;
+try{data=await response.json()}catch(_){if(response.ok)throw failure('malformed')}
+if(response.status===403&&isRecord(data)&&data.error==='admin_auth')throw failure('auth');
+if(response.ok&&!isRecord(data))throw failure('malformed');return {response,data}}
+function showFailure(kind){const root=document.getElementById('s');if(kind==='auth'){
+authFailed=true;try{sessionStorage.removeItem('osk');sessionStorage.removeItem(PAIR_KEY)}catch(_){}
+window.lastPairing='';window.lastInvite='';window.setupMessage='';window.generationMessage='';T='';delete H['X-OpenSeek-Admin'];
+const next=PROFILE==='vercel'?'Reopen the dashboard with the correct admin link from your deployment.':
+'On the server, run python -m openseek dashboard to get a fresh link, then reopen it.';
+root.innerHTML='<section role="alert" aria-live="assertive" tabindex="-1"><h2>Admin access denied</h2><p>The admin secret was not accepted. '+esc(next)+'</p></section>';
+return}
+if(loadFailureVisible)return;loadFailureVisible=true;
+root.innerHTML='<section role="alert" aria-live="assertive" tabindex="-1"><h2>Dashboard status unavailable</h2><p>OpenSeek could not load a valid dashboard response. Check that the server is reachable, then retry.</p><button type="button" onclick="load()">Retry</button></section>';
+}
+async function safely(action){try{return await action()}catch(e){showFailure(e&&e.kind==='auth'?'auth':'load');return null}}
 function setupErrorText(code){const messages={telegram_access_denied:'OpenSeek cannot read this channel. Add the bot or account to the channel and grant access to its message history.',telegram_login_required:'Telegram rejected these credentials. Check the bot token or StringSession and Telegram API ID/hash.',telegram_unavailable:'Telegram could not be reached. Check the network and try again.',telegram_error:'Telegram could not verify this channel. Check the channel ID and account permissions.'};return messages[code]||('Setup failed ('+code+'). Check the channel ID, Telegram credentials, and channel permissions.')}
-async function act(m,u){await fetch(u,{method:m,headers:H});if(m==='DELETE'&&u==='/admin/pair'){sessionStorage.removeItem(PAIR_KEY);window.lastPairing=''}load()}
-async function openPair(){const r=await fetch('/admin/pair',{method:'POST',headers:H});const j=await r.json();
-window.lastPairing=r.ok?('Nuvio code: '+j.code+' | TLS pin: '+j.spki_pin+(j.join?' | Join link: '+j.join:'')):'Could not open pairing: '+(j.error||'request_failed');
-if(r.ok)sessionStorage.setItem(PAIR_KEY,window.lastPairing);else sessionStorage.removeItem(PAIR_KEY);load()}
-async function sharing(on){await fetch('/admin/sharing',{method:'PUT',headers:Object.assign({'Content-Type':'application/json'},H),body:JSON.stringify({enabled:on})});load()}
-async function poolContributions(on){await fetch('/admin/pool/contributions',{method:'PUT',headers:Object.assign({'Content-Type':'application/json'},H),body:JSON.stringify({enabled:on})});load()}
-async function deviceContribution(id,on){await fetch('/admin/devices/'+encodeURIComponent(id)+'/permissions',{method:'PUT',headers:Object.assign({'Content-Type':'application/json'},H),body:JSON.stringify({contribute:on})});load()}
-async function mkinvite(){const r=await fetch('/admin/invites',{method:'POST',headers:Object.assign({'Content-Type':'application/json'},H),body:JSON.stringify({public:!!window.pubOn})});
-const j=await r.json();window.lastInvite=r.ok?('Server '+j.address+' - code '+j.code+' (valid '+Math.round(j.expires_in_s/3600)+' h, one use). Join string: '+j.join):'Could not create: '+j.error;load()}
-async function generate(event){event.preventDefault();const d=Object.fromEntries(new FormData(event.currentTarget));d.season=Number(d.season||0);d.episode=Number(d.episode||0);
-const r=await fetch('/admin/generations',{method:'POST',headers:Object.assign({'Content-Type':'application/json'},H),body:JSON.stringify(d)});const j=await r.json();window.generationMessage=r.ok?'Generation started: '+j.generation_id:'Could not start generation: '+(j.error||'request_failed');load()}
+async function act(m,u){return safely(async()=>{await adminRequest(u,{method:m,headers:H});if(m==='DELETE'&&u==='/admin/pair'){sessionStorage.removeItem(PAIR_KEY);window.lastPairing=''}await load()})}
+async function openPair(){return safely(async()=>{const x=await adminRequest('/admin/pair',{method:'POST',headers:H}),r=x.response,j=x.data;
+if(r.ok&&(typeof j.code!=='string'||typeof j.spki_pin!=='string'))throw failure('malformed');
+window.lastPairing=r.ok?('Nuvio code: '+j.code+' | TLS pin: '+j.spki_pin+(j.join?' | Join link: '+j.join:'')):'Could not open pairing: '+((j&&j.error)||'request_failed');
+if(r.ok)sessionStorage.setItem(PAIR_KEY,window.lastPairing);else sessionStorage.removeItem(PAIR_KEY);await load()})}
+async function sharing(on){return safely(async()=>{await adminRequest('/admin/sharing',{method:'PUT',headers:Object.assign({'Content-Type':'application/json'},H),body:JSON.stringify({enabled:on})});await load()})}
+async function poolContributions(on){return safely(async()=>{await adminRequest('/admin/pool/contributions',{method:'PUT',headers:Object.assign({'Content-Type':'application/json'},H),body:JSON.stringify({enabled:on})});await load()})}
+async function deviceContribution(id,on){return safely(async()=>{await adminRequest('/admin/devices/'+encodeURIComponent(id)+'/permissions',{method:'PUT',headers:Object.assign({'Content-Type':'application/json'},H),body:JSON.stringify({contribute:on})});await load()})}
+async function mkinvite(){return safely(async()=>{const x=await adminRequest('/admin/invites',{method:'POST',headers:Object.assign({'Content-Type':'application/json'},H),body:JSON.stringify({public:!!window.pubOn})}),r=x.response,j=x.data;
+if(r.ok&&(typeof j.address!=='string'||typeof j.code!=='string'||typeof j.join!=='string'||!Number.isFinite(j.expires_in_s)))throw failure('malformed');
+window.lastInvite=r.ok?('Server '+j.address+' - code '+j.code+' (valid '+Math.round(j.expires_in_s/3600)+' h, one use). Join string: '+j.join):'Could not create: '+((j&&j.error)||'request_failed');await load()})}
+async function generate(event){event.preventDefault();return safely(async()=>{const d=Object.fromEntries(new FormData(event.currentTarget));d.season=Number(d.season||0);d.episode=Number(d.episode||0);
+const x=await adminRequest('/admin/generations',{method:'POST',headers:Object.assign({'Content-Type':'application/json'},H),body:JSON.stringify(d)}),r=x.response,j=x.data;
+if(r.ok&&typeof j.generation_id!=='string')throw failure('malformed');window.generationMessage=r.ok?'Generation started: '+j.generation_id:'Could not start generation: '+((j&&j.error)||'request_failed');await load()})}
 window.setupScreen=false;
-async function setupSubmit(event){event.preventDefault();const f=event.currentTarget;const d=Object.fromEntries(new FormData(f));d.telegram_api_id=Number(d.telegram_api_id);
-const r=await fetch('/admin/setup',{method:'POST',headers:Object.assign({'Content-Type':'application/json'},H),body:JSON.stringify(d)});const j=await r.json();
-if(!r.ok){document.getElementById('setupError').textContent=setupErrorText(j.error||'setup_failed');return}
-window.setupMessage='Telegram history is readable. Initial scan indexed '+j.initial_scan.indexed+' tiles; '+(j.channel_writable?'channel posting is available.':'this channel is read-only, so uploads are disabled. Grant the bot Post Messages permission to enable uploads.');window.setupScreen=false;load()}
-async function load(){if(!T){document.getElementById('s').textContent=PROFILE==='vercel'?'Open this page with the admin secret in the URL fragment: https://'+location.host+'/#<OPENSEEK_ADMIN_TOKEN>':'Open this page with: python -m openseek dashboard';return}
-const cfg=await (await fetch('/admin/setup',{headers:H})).json();let setupHtml='';if(cfg.setup_required){setupHtml=
+async function setupSubmit(event){event.preventDefault();return safely(async()=>{const f=event.currentTarget;const d=Object.fromEntries(new FormData(f));d.telegram_api_id=Number(d.telegram_api_id);
+const x=await adminRequest('/admin/setup',{method:'POST',headers:Object.assign({'Content-Type':'application/json'},H),body:JSON.stringify(d)}),r=x.response,j=x.data;
+if(!r.ok){document.getElementById('setupError').textContent=setupErrorText((j&&j.error)||'setup_failed');return}
+if(!isRecord(j.initial_scan)||!Number.isFinite(j.initial_scan.indexed)||typeof j.channel_writable!=='boolean')throw failure('malformed');
+window.setupMessage='Telegram history is readable. Initial scan indexed '+j.initial_scan.indexed+' tiles; '+(j.channel_writable?'channel posting is available.':'this channel is read-only, so uploads are disabled. Grant the bot Post Messages permission to enable uploads.');window.setupScreen=false;await load()})}
+async function load(){if(authFailed)return;if(!T){document.getElementById('s').textContent=PROFILE==='vercel'?'Open this page with the admin secret in the URL fragment: https://'+location.host+'/#<OPENSEEK_ADMIN_TOKEN>':'Open this page with: python -m openseek dashboard';return}
+return safely(async()=>{
+const cx=await adminRequest('/admin/setup',{headers:H});if(!cx.response.ok)throw failure('load');const cfg=cx.data;
+if(typeof cfg.setup_required!=='boolean')throw failure('malformed');let setupHtml='';if(cfg.setup_required){setupHtml=
 '<h2>Connect the Telegram pool</h2><p>OpenSeek stores packages in Telegram. Enter the channel and Telegram API details. Provide one identity: a bot token or a StringSession. The channel must allow history access; posting permission enables uploads.</p>'+
-'<form onsubmit="setupSubmit(event)"><p><label>Channel ID or username<br><input name="telegram_channel_id" required maxlength="128"></label></p>'+
+'<form class="setup-form" onsubmit="setupSubmit(event)"><p><label>Channel ID or username<br><input name="telegram_channel_id" required maxlength="128"></label></p>'+
 '<p><label>Telegram API ID<br><input name="telegram_api_id" type="number" min="1" required></label></p>'+
 '<p><label>Telegram API hash<br><input name="telegram_api_hash" type="password" autocomplete="off" required></label></p>'+
 '<p><label>Bot token (leave blank when using a StringSession)<br><input name="telegram_bot_token" type="password" autocomplete="off"></label></p>'+
 '<p><label>StringSession (leave blank when using a bot token)<br><input name="telegram_session" type="password" autocomplete="off"></label></p>'+
 '<p>Credentials are saved in the per-install private .env file. They are never shown in logs or returned by the server.</p>'+
 '<button type="submit">Verify channel and start scan</button> <span id="setupError" role="alert"></span></form>';}
-window.setupScreen=false;const r=await (await fetch('/admin/status',{headers:H})).json();
+window.setupScreen=false;const rx=await adminRequest('/admin/status',{headers:H});if(!rx.response.ok)throw failure('load');const r=rx.data;
+if(!isRecord(r.pairing)||typeof r.pairing.open!=='boolean'||!isRecord(r.server)||!Array.isArray(r.server.addresses)||
+!Array.isArray(r.devices)||!r.devices.every(isRecord)||!isRecord(r.cache)||
+!['entries','tiles','bytes','max_bytes'].every(k=>Number.isFinite(r.cache[k])))throw failure('malformed');
 if(!r.pairing.open){sessionStorage.removeItem(PAIR_KEY);window.lastPairing=''}else if(!window.lastPairing){window.lastPairing=sessionStorage.getItem(PAIR_KEY)||''}
 let h=setupHtml;
 if(window.setupMessage){h+='<p>'+esc(window.setupMessage)+'</p>';window.setupMessage=''}
 h+='<h2>Server</h2><p>'+(r.server.profile==='vercel'?'Dashboard host <code>'+esc(location.host)+'</code>':'API port <code>'+esc(r.server.port)+'</code>, addresses: <code>'+esc(r.server.addresses.join(', '))+'</code>')+
 '<br>Pin: <code>'+esc(r.server.spki_pin)+'</code></p><h2>Pairing</h2>';
-if(window.lastPairing)h+='<p>'+esc(window.lastPairing)+'</p>';
+if(window.lastPairing)h+='<p class=pairing-details>'+esc(window.lastPairing)+'</p>';
 if(r.pairing.open){h+=(r.pairing.code?'<p class=code>'+esc(r.pairing.code)+'</p>':'')+'<p>expires in '+esc(r.pairing.expires_in_s)+
 ' s, attempts left '+esc(r.pairing.attempts_left)+'</p><button onclick="act(\\'DELETE\\',\\'/admin/pair\\')">Close</button>'}
 else{h+=(r.pairing.burned?'<p><b>Last window burned after too many wrong codes.</b></p>':'')+
 '<button onclick="openPair()">Open pairing window</button>'}
-h+='<h2>Devices</h2><table><tr><th>id</th><th>name</th><th>NVMT uploads</th><th></th></tr>';
+h+='<h2>Devices</h2><table class="device-table"><thead><tr><th scope="col">id</th><th scope="col">name</th><th scope="col">NVMT uploads</th><th scope="col">Actions</th></tr></thead><tbody>';
+if(!r.devices.length)h+='<tr class="empty-row"><td colspan="4">No paired devices</td></tr>';
 for(const d of r.devices){h+='<tr><td><code>'+esc(d.device_id)+'</code></td><td>'+esc(d.name)+'</td><td>'+
 (d.role==='guest'?'<button onclick="deviceContribution(\\''+esc(d.device_id)+'\\','+(!d.contribute)+')">'+(d.contribute?'Disable':'Enable')+'</button>': 'Owner')+
 '</td><td><button onclick="act(\\'DELETE\\',\\'/admin/devices/'+esc(d.device_id)+'\\')">Revoke</button></td></tr>'}
-h+='</table>';
-const sh=await (await fetch('/admin/sharing',{headers:H})).json();
+h+='</tbody></table>';
+const sx=await adminRequest('/admin/sharing',{headers:H});if(!sx.response.ok)throw failure('load');const sh=sx.data;
+if(typeof sh.enabled!=='boolean'||!Array.isArray(sh.invites)||!sh.invites.every(i=>isRecord(i)&&typeof i.invite_id==='string'))throw failure('malformed');
 h+='<h2>Sharing</h2><p>Sharing is <b>'+(sh.enabled?'ON':'OFF')+'</b> <button onclick="sharing('+(sh.enabled?'false':'true')+')">Turn '+(sh.enabled?'off':'on')+'</button></p>';
 if(sh.enabled){h+='<p>Guest NVMT contributions are <b>'+(sh.pool_contributions_enabled?'ON':'OFF')+'</b> <button onclick="poolContributions('+(sh.pool_contributions_enabled?'false':'true')+')">Turn guest uploads '+(sh.pool_contributions_enabled?'off':'on')+'</button></p>'}
-window.pubOn=!!(sh.public&&sh.public.listening&&sh.public.host);if(sh.enabled){h+='<button onclick="mkinvite()">Create invitation'+(window.pubOn?' (public: '+esc(sh.public.host)+')':' (LAN)')+'</button> <span id=inv>'+esc(window.lastInvite||'')+'</span><table><tr><th>invitation</th><th>state</th><th>expires in</th><th></th></tr>';
+window.pubOn=!!(sh.public&&sh.public.listening&&sh.public.host);if(sh.enabled){h+='<button onclick="mkinvite()">Create invitation'+(window.pubOn?' (public: '+esc(sh.public.host)+')':' (LAN)')+'</button> <span class="invite-details" id=inv>'+esc(window.lastInvite||'')+'</span><table><tr><th>invitation</th><th>state</th><th>expires in</th><th></th></tr>';
 for(const i of sh.invites){h+='<tr><td>'+esc(i.label||i.invite_id.slice(0,8))+'</td><td>'+esc(i.state)+'</td><td>'+esc(i.expires_in_s)+' s</td><td>'+
 (i.state=='open'?'<button onclick="act(\\'DELETE\\',\\'/admin/invites/'+esc(i.invite_id)+'\\')">Revoke</button>':'')+'</td></tr>'}
 h+='</table>'}
 h+='<h2>Pool</h2>';
- h+='<h2>Generate NVMT package</h2><p>This runs only when you start it here. It reads the media URL and publishes the generated package to Telegram.</p><form onsubmit="generate(event)">'+
+const gx=await adminRequest('/admin/generations',{headers:H});if(!gx.response.ok)throw failure('load');const gj=gx.data;
+if(!Array.isArray(gj.jobs)||!gj.jobs.every(isRecord))throw failure('malformed');
+const jobsHtml=gj.jobs.map(j=>'<p><code>'+esc(j.generation_id)+'</code> '+esc(j.state)+' · '+esc(j.tiles_done||0)+'/'+esc(j.tiles_total||'?')+' tiles'+(j.error?' · '+esc(j.error):'')+'</p>').join('');
+ h+='<h2>Generate NVMT package</h2><p>This runs only when you start it here. It reads the media URL and publishes the generated package to Telegram.</p><form class="generation-form" onsubmit="generate(event)">'+
 '<p><label>Media URL<br><input name="source_url" type="url" required maxlength="4096" style="width:100%"></label></p><p><label>Profile <select name="profile"><option>nvmt-v1-g10</option><option>nvmt-v1-g5</option></select></label> '+
 '<label>IMDb ID <input name="imdb" placeholder="tt1234567"></label> <label>Season <input name="season" type="number" min="0" value="0"></label> <label>Episode <input name="episode" type="number" min="0" value="0"></label></p>'+
 '<p><label>Filename hint <input name="filename" maxlength="1024"></label> <button type="submit">Generate and publish</button></p></form>'+
-(window.generationMessage?'<p role="status">'+esc(window.generationMessage)+'</p>':'')+'<div id="generationJobs"></div>';
-const gj=await (await fetch('/admin/generations',{headers:H})).json();document.getElementById('generationJobs').innerHTML=gj.jobs.map(j=>'<p><code>'+esc(j.generation_id)+'</code> '+esc(j.state)+' · '+esc(j.tiles_done||0)+'/'+esc(j.tiles_total||'?')+' tiles'+(j.error?' · '+esc(j.error):'')+'</p>').join('');
-const pr=await fetch('/admin/pool/status',{headers:H});const p=await pr.json();
+(window.generationMessage?'<p role="status">'+esc(window.generationMessage)+'</p>':'')+'<div id="generationJobs">'+jobsHtml+'</div>';
+const px=await adminRequest('/admin/pool/status',{headers:H}),pr=px.response,p=isRecord(px.data)?px.data:{error:'request_failed'};
 if(!pr.ok)h+='<p role="alert">Pool setup check failed: '+esc(setupErrorText(p.reason||p.error||'setup_failed'))+'</p>';
 h+='<p>Mode <b>'+esc(p.mode)+'</b>';
 if(p.mode==='channel'){h+='; channel <code>'+esc(p.channel_id)+'</code>; '+esc(p.tiles)+' tiles; history '+
@@ -1384,7 +1483,7 @@ else{h+='; no shared pool connections'}
 h+='</p>';
 h+='<h2>Cache</h2><p>'+esc(r.cache.entries)+' titles, '+esc(r.cache.tiles)+' tiles, '+
 esc((r.cache.bytes/1048576).toFixed(1))+' MiB of '+esc((r.cache.max_bytes/1048576).toFixed(0))+' MiB; '+
-esc(r.active_sources)+' active source(s)</p>';document.getElementById('s').innerHTML=h}
+esc(r.active_sources)+' active source(s)</p>';loadFailureVisible=false;document.getElementById('s').innerHTML=h})}
 load();setInterval(load,3000);
 </script></body></html>"""
 
@@ -1594,7 +1693,11 @@ def create_admin_app(core: Core) -> FastAPI:
 
     @app.post("/admin/generations", status_code=202)
     async def generation_start(background_tasks: BackgroundTasks, body: GenerationIn):
-        if core.pool is None or core.channel_store is None:
+        # Issue #78 (F3 local/VPS): in host mode the PoolService publishes packages,
+        # shared tiles and hints itself — no MTProto channel store exists there, so it
+        # is the generation capability. Channel installs still keep their store.
+        if core.pool is None or (core.channel_store is None and
+                                 not hasattr(core.pool, "upload_package")):
             return err(409, "pool_unavailable")
         try:
             generation_id, job = await asyncio.to_thread(

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import getpass
 import hashlib
 import io
@@ -494,8 +495,22 @@ class TelegramMTProtoStore:
 
 
 def _looks_like_path(value: str) -> bool:
-    path = Path(value).expanduser()
-    return path.exists() or value.endswith(".session") or "/" in value or "\\" in value
+    # Explicit path hints win before any filesystem probe: a serialized
+    # Telethon StringSession is a bare 353-character name, and probing it on
+    # disk under Python <= 3.12 raises OSError(ENAMETOOLONG) (Name_MAX 255),
+    # which escaped `_session()` and surfaced as PoolError 503
+    # "telegram_unavailable" (the G7 Vercel package-read failure).
+    if value.endswith(".session") or "/" in value or "\\" in value:
+        return True
+    try:
+        return Path(value).expanduser().exists()
+    except OSError as exc:
+        if exc.errno == errno.ENAMETOOLONG:
+            # A bare component longer than NAME_MAX (255) can never name an
+            # existing POSIX file, so this must be a serialized session:
+            # classify it as serialized rather than crashing node startup.
+            return False
+        raise
 
 
 def _invite_hash(invite: str) -> str:

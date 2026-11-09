@@ -6,6 +6,7 @@ All channel-table access goes through a `ChannelStore` (SQLite) or
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
 import hashlib
 import json
 import logging
@@ -198,6 +199,19 @@ class ChannelIndex:
             "fp": fp, "profile": profile, "k": k, "pts_ms": pts_ms,
             "duration_ms": duration_ms, "n_tiles": n_tiles, "size": size,
             "sha256": digest, "message_id": message_id, "created": self.clock()})
+
+    @contextmanager
+    def atomic_recording(self):
+        """Group a librarian manifest and its tile references as one index update.
+
+        A remote store without transaction support fails closed before any index row
+        is changed rather than risking a partial package record.
+        """
+        transaction = getattr(self.store, "transaction", None)
+        if not callable(transaction):
+            raise RuntimeError("channel store cannot atomically record a package")
+        with transaction():
+            yield
 
     def record_manifest(self, hints: dict) -> bool:
         """Store validated hints into pool_hints."""
