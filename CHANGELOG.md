@@ -29,6 +29,7 @@ All notable changes are documented here. The format follows [Keep a Changelog](h
 * The native Windows admin application and its build, release, installer and licensing paths. The server's browser dashboard at `http://127.0.0.1:8788` is the admin interface.
 
 ### Fixed
+* Dashboard generation accepts a blank optional IMDb field instead of failing with `bad_hints` after extraction (#80).
 * Dashboard: a rejected admin secret renders an "Admin access denied" notice instead of a broken page, and phone and TV widths wrap pairing and invitation text instead of overflowing (#75).
 * Generation: a blocked source answers `400 source_forbidden` instead of surfacing an unhandled 500 (#79).
 * Participant setup (#50): resuming an interrupted `openseek setup` skips completed provisioning; the wizard requests explicit Nuvio guest-device access for each invitation, enabling sharing without changing existing contribution choices; and a serialized Telethon StringSession no longer raises ENAMETOOLONG when it is probed as a file path on Python 3.12, which had surfaced as `503 telegram_unavailable` package reads.

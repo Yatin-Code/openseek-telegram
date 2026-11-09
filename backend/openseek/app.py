@@ -25,7 +25,7 @@ from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import (BaseModel, ConfigDict, Field, StrictBool, StrictInt,
-                      StrictStr, ValidationError)
+                      StrictStr, ValidationError, field_validator)
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.routing import compile_path
 
@@ -686,6 +686,14 @@ class GenerationIn(BaseModel):
     season: StrictInt = Field(default=0, ge=0, le=9999)
     episode: StrictInt = Field(default=0, ge=0, le=9999)
     filename: StrictStr | None = Field(default=None, max_length=1024)
+
+    @field_validator("imdb", mode="before")
+    @classmethod
+    def _blank_imdb_is_absent(cls, value: object) -> object:
+        """Blank/whitespace-only IMDb is absent; nonblank values are untouched."""
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
 
 
 class PoolPurgeIn(BaseModel):

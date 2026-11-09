@@ -254,3 +254,72 @@ def test_host_publication_failure_reports_failed_status(tmp_path, origin):
         assert core.generations.active == {} and core.jobs.jobs == {}
     finally:
         core.stop()
+
+
+_OMITTED = object()
+
+
+@pytest.mark.parametrize("imdb", [_OMITTED, "", "   "])
+def test_absent_or_blank_imdb_generation_completes(tmp_path, origin, imdb):
+    """Absent or blank IMDb behaves as absent: the job completes and publishes
+    without an IMDb hint. All other inputs are identical."""
+    tg = FakeTelegramBotAPI()
+    core = Core(host_settings(tmp_path / "host-blank-imdb"),
+                policy=make_policy([origin], {HOST: ["127.0.0.1"]}),
+                engine_factory=lambda _src: FakeEngine(duration_ms=12_000, gop_ms=2_000, delay=0.0),
+                pool_storage=TelegramBotStore("123456:test", "-100123", opener=tg.urlopen))
+    payload = {"source_url": origin.url("/f/pillar.mkv", host=HOST), "profile": PROFILE,
+               "season": 0, "episode": 0, "filename": "qa-h2-20261110.mp4"}
+    if imdb is not _OMITTED:
+        payload["imdb"] = imdb
+    try:
+        started = asyncio.run(admin_call(core, "POST", "/admin/generations", json=payload))
+        assert started.status_code == 202, started.text
+        generation_id = started.json()["generation_id"]
+
+        def settled():
+            row = asyncio.run(admin_call(core, "GET", f"/admin/generations/{generation_id}")).json()
+            return row if row and row["state"] in ("complete", "failed") else None
+        row = wait_for(settled)
+        assert row["state"] == "complete", row
+        assert row["error"] is None
+
+        hint_captions = [c for c in tg.captions if c.startswith("openseek:hints:v1:")]
+        assert len(hint_captions) == 1 and len(tg.files) == 2
+        encoded = hint_captions[0].split(":", 3)[3]
+        hint_manifest = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
+        assert hint_manifest["imdb"] is None
+        assert hint_manifest["filename"] == "qa.h2.20261110"
+    finally:
+        core.stop()
+
+
+
+def test_nonblank_invalid_imdb_is_still_rejected(tmp_path, origin):
+    """Explicit invalid nonblank IMDb keeps its documented bad_hints refusal.
+
+    Blank is absent, but a supplied value that is not a tt-digit IMDb is
+    still rejected at publication rather than silently dropped.
+    """
+    tg = FakeTelegramBotAPI()
+    core = Core(host_settings(tmp_path / "host-bad-imdb"),
+                policy=make_policy([origin], {HOST: ["127.0.0.1"]}),
+                engine_factory=lambda _src: FakeEngine(duration_ms=12_000, gop_ms=2_000, delay=0.0),
+                pool_storage=TelegramBotStore("123456:test", "-100123", opener=tg.urlopen))
+    try:
+        started = asyncio.run(admin_call(
+            core, "POST", "/admin/generations",
+            json={"source_url": origin.url("/f/pillar.mkv", host=HOST), "profile": PROFILE,
+                  "imdb": "bogus", "season": 0, "episode": 0, "filename": "qa-h2-20261110.mp4"}))
+        assert started.status_code == 202, started.text
+        generation_id = started.json()["generation_id"]
+
+        def settled():
+            row = asyncio.run(admin_call(core, "GET", f"/admin/generations/{generation_id}")).json()
+            return row if row and row["state"] in ("complete", "failed") else None
+        row = wait_for(settled)
+        assert row["state"] == "failed", row
+        assert row["error"] == "bad_hints"
+        assert tg.files == {} and tg.messages == 0
+    finally:
+        core.stop()
