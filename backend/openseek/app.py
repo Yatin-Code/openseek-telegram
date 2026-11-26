@@ -329,7 +329,8 @@ class Guard:
     """Pure ASGI middleware: client-IP policy (SR-17), body limit (SR-11), bearer auth (SR-6),
     security headers (SR-19). X-Forwarded-For and friends are never consulted."""
 
-    def __init__(self, app, core: Core, admin: bool = False, public: bool = False):
+    def __init__(self, app, core: Core, admin: bool = False, public: bool = False,
+                 *, routes_app=None):
         self.app = app
         self.core = core
         self.admin = admin
@@ -339,8 +340,9 @@ class Guard:
         # answer for a route that does not exist (H6 criterion 1).
         self._documented = []
         if not admin and not public:
-            router = getattr(app, "router", None)
-            routes = getattr(router, "routes", None) or getattr(app, "routes", [])
+            routes_app = routes_app if routes_app is not None else app
+            router = getattr(routes_app, "router", None)
+            routes = getattr(router, "routes", None) or getattr(routes_app, "routes", [])
             for route in routes:
                 path = getattr(route, "path", None)
                 if not path or not getattr(route, "methods", None):
