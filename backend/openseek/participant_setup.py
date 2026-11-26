@@ -184,7 +184,7 @@ class ParticipantSetup:
             return 2
         if self.state.get("step") == "healthy":
             return self._continue_telegram()
-        if self.state.get("step") in {"telegram_deployed", "telegram_ready"}:
+        if self.state.get("step") in {"telegram_deployed", "telegram_health_pending", "telegram_ready"}:
             if self.state.get("step") == "telegram_ready":
                 return self._create_pairing_invite()
             return self._finish_telegram_deploy()
@@ -205,6 +205,12 @@ class ParticipantSetup:
             else:
                 self.print(f"Dashboard owner secret file is missing: {token_path}. Run `openseek setup --new-pairing` to reset it.")
             return 0
+        if self.provision_node():
+            return 1
+        return self._continue_telegram()
+
+    def provision_node(self) -> int:
+        """Provision a setup-pending node and checkpoint its verified deployment."""
         self.print("Join the shared OpenSeek pool")
         self.print("This creates resources in your own provider accounts and uses their current free-plan limits.")
         self.print("The wizard never selects or enables a paid upgrade. A free-plan limit pauses setup for you to resume later.")
@@ -288,8 +294,6 @@ class ParticipantSetup:
             self.print("Setup could not save its progress. Check that your local setup folder is writable, then retry.")
             return 1
 
-        self.print(f"Your OpenSeek node is healthy at {deployment}.")
-        self.print("Run `openseek setup` again to connect your Telegram account and continue setup.")
         return 0
 
     def _continue_telegram(self) -> int:
@@ -366,11 +370,12 @@ class ParticipantSetup:
             self.provider.authenticate()
             self.provider.link_vercel_project(
                 self.source_dir, {"name": str(self.state.get("vercel_project") or "")})
-            deployment = self.provider.deploy(self.source_dir)
-            deployment = _safe_vercel_url(deployment)
-            self.state["deployment_url"] = deployment
-            self.state["step"] = "telegram_deployed"
-            self._save()
+            if self.state["step"] != "telegram_health_pending":
+                deployment = _safe_vercel_url(self.provider.deploy(self.source_dir))
+                self.state["deployment_url"] = deployment
+                self.state["step"] = "telegram_health_pending"
+                self._save()
+            deployment = _safe_vercel_url(self.state["deployment_url"])
             if not self.provider.check_health(deployment, pending=False):
                 raise SetupFailure("Telegram node health check", "deployment_not_healthy_yet")
         except SetupFailure as exc:

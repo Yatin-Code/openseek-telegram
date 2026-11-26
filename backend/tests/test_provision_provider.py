@@ -199,9 +199,7 @@ def test_full_participant_journey_with_rest_provider(tmp_path):
         input_fn=answers, print_fn=output.append,
         secret_input_fn=lambda _prompt: "api-hash",
         telegram_joiner=FakeTelegramJoiner())
-    assert setup.run() == 0, "\n".join(output)    # infrastructure -> healthy
-    assert node["pending"] is True
-    assert setup.run() == 0                       # Telegram + pairing
+    assert setup.run() == 0, "\n".join(output)
     assert setup.state["step"] == "paired"
     assert node["pending"] is False
     assert any("ABCD-EFGH-IJKL-MNOP" in line for line in output)

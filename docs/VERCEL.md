@@ -87,7 +87,7 @@ python -m openseek setup --provider rest --new-pairing
 The replacement does not revoke an invitation you lost or already shared; revoke
 it from the browser dashboard.
 
-After the node is healthy, rerun the same wizard to connect Telegram. It asks for the
+Once the node is healthy, the wizard continues directly to Telegram. It asks for the
 Telegram application ID and hidden API hash, then authorizes your Telegram user account
 with its phone, login code, and optional two-step password. It joins the shared invite
 directly and checks that the account can read group history and send messages and media.
