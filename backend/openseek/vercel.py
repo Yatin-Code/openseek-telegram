@@ -30,8 +30,8 @@ runtime_core: Core | None = None
 class VercelGuard:
     """Dispatch owner routes through owner auth and all API routes through device auth."""
 
-    def __init__(self, app, core: Core):
-        self.api = Guard(app, core)
+    def __init__(self, app, core: Core, *, routes_app: FastAPI):
+        self.api = Guard(app, core, routes_app=routes_app)
         self.admin = Guard(app, core, admin=True)
 
     async def __call__(self, scope, receive, send):
@@ -244,7 +244,9 @@ def build_app(settings: Settings | None = None, *, core: Core | None = None):
     # Keep the exported object a FastAPI instance for Vercel's framework detector.
     # Guard is installed outermost, so unauthenticated requests cannot trigger a
     # Telegram scan before the API's normal request checks run.
-    api.add_middleware(VercelGuard, core=core)
+    # Starlette supplies the wrapped ASGI app to middleware. Pass the router's
+    # app separately so the API guard can recognize documented paths and methods.
+    api.add_middleware(VercelGuard, core=core, routes_app=api)
     return api
 
 

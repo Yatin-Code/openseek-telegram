@@ -324,6 +324,49 @@ def test_participant_setup_deployment_has_only_a_public_health_route(tmp_path):
     assert missing_pool.status_code == 404
 
 
+def test_vercel_health_unsupported_method_is_405(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENSEEK_PROFILE", "vercel")
+    monkeypatch.setenv("OPENSEEK_POOL_MODE", "channel")
+    monkeypatch.setenv("OPENSEEK_TELEGRAM_CHANNEL_ID", "-100123456")
+    monkeypatch.setenv("OPENSEEK_TELEGRAM_SESSION", "1abc")
+    monkeypatch.setenv("OPENSEEK_TELEGRAM_API_ID", "1")
+    monkeypatch.setenv("OPENSEEK_TELEGRAM_API_HASH", "api-hash")
+    monkeypatch.setenv("OPENSEEK_SUPABASE_URL", "https://project.supabase.co")
+    monkeypatch.setenv("OPENSEEK_SUPABASE_SERVICE_KEY", "service-key")
+    monkeypatch.setenv("OPENSEEK_ADMIN_TOKEN", ADMIN_TOKEN)
+    monkeypatch.setenv("OPENSEEK_DATA_DIR", str(tmp_path / "module-data"))
+    cfg = settings(tmp_path)
+    core = Core(cfg, proxy=NoSourceProxy())
+    core.channel_store = ChannelStore()
+    core.channel_index = ChannelIndex()
+    core.pool = Pool()
+    core.uploads = Uploads()
+    core.telegram_session_lease = SessionLease()
+    from openseek.vercel import build_app
+    app = build_app(cfg, core=core)
+    try:
+        options = request(app, "OPTIONS", "/v1/health", extra_headers={
+            "Origin": "https://other.example",
+            "Access-Control-Request-Method": "GET",
+        })
+        assert options.status_code == 405
+        assert options.json() == {"error": "method_not_allowed"}
+        assert "access-control-allow-origin" not in options.headers
+
+        unknown = request(app, "OPTIONS", "/v1/does-not-exist")
+        assert unknown.status_code == 404
+        assert unknown.json() == {"error": "not_found"}
+
+        get = request(app, "GET", "/v1/health")
+        assert get.status_code == 200
+
+        protected = request(app, "GET", "/v1/pair/status")
+        assert protected.status_code == 401
+        assert protected.json() == {"error": "unauthorized"}
+    finally:
+        core.stop()
+
+
 def test_vercel_owner_pairing_uses_durable_state_and_separate_owner_auth(tmp_path, monkeypatch):
     monkeypatch.setenv("VERCEL", "1")
     from openseek.vercel import build_app
