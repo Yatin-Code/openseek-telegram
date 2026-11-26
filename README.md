@@ -112,7 +112,7 @@ Use this when you prefer dashboards to the wizard. It creates the same resources
 
 1. Click the button (or **Vercel → Add New → Project → Import Git Repository**). Vercel clones the repository into your Git account.
 2. Keep the repository name you like.
-3. Set **Root Directory = `backend`**.
+3. Set **Root Directory = `backend`** and **Framework Preset = FastAPI**. If Vercel detects a different preset, select FastAPI before deploying so it picks up `openseek.vercel:app`.
 4. If you already have the Supabase values, paste them in the import form; otherwise deploy now and redeploy in step 6 after adding the env vars.
 
 ### 2. Create the Supabase project
