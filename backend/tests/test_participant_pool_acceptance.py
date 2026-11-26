@@ -365,19 +365,16 @@ def test_wizard_pair_publish_exact_and_hint_read_on_independent_nodes(
 
     provider = Provider()
     source = _source(tmp_path)
-    first = ParticipantSetup(provider, source_dir=source, state_path=state_path,
-                             input_fn=lambda _prompt: "1", print_fn=output.append)
-    assert first.run() == 0
-
     telegram_joiner = FakeTelegramJoiner()
-    second = ParticipantSetup(
+    setup = ParticipantSetup(
         provider, source_dir=source, state_path=state_path,
-        input_fn=lambda prompt: {"Telegram API ID: ": "1234",
+        input_fn=lambda prompt: {"Choose a number: ": "1",
+                                 "Telegram API ID: ": "1234",
                                  "Shared Telegram group invite link: ": "https://t.me/+shared",
                                  "Enable Nuvio guest-device access? [y/N] ": "y"}[prompt],
         secret_input_fn=lambda _prompt: "telegram-api-hash",
         telegram_joiner=telegram_joiner, print_fn=output.append)
-    assert second.run() == 0
+    assert setup.run() == 0
     bundle = next(line for line in output if "|" in line)
     assert setup_key_for_bridge["value"] not in json.dumps(provider.env)
     assert provider.env["OPENSEEK_TELEGRAM_SESSION"] == ("telegram_session_secret", True)

@@ -109,7 +109,7 @@ def test_participant_wizard_provisions_and_health_checks_own_node(tmp_path):
                              state_path=tmp_path / "state.json", print_fn=output.append,
                              input_fn=lambda _prompt: next(answers))
 
-    assert setup.run() == 0
+    assert setup.provision_node() == 0
 
     assert provider.auth_calls == 1
     assert provider.schema_calls[0][0] == "sb-ref-1"
@@ -138,13 +138,13 @@ def test_participant_wizard_resumes_after_deployment_failure_without_recreating_
     answers = iter(["1", "1"])
     first = ParticipantSetup(provider, source_dir=_source(tmp_path), state_path=state_path,
                              input_fn=lambda _prompt: next(answers), print_fn=lambda _line: None)
-    assert first.run() == 1
+    assert first.provision_node() == 1
     assert json.loads(state_path.read_text())["step"] == "vercel_configured"
 
     provider.fail_deploy = False
     second = ParticipantSetup(provider, source_dir=_source(tmp_path), state_path=state_path,
                               print_fn=lambda _line: None)
-    assert second.run() == 0
+    assert second.provision_node() == 0
     assert provider.create_supabase_calls == 0
     assert provider.create_vercel_calls == 0
     assert provider.deploy_calls == 2
@@ -156,7 +156,7 @@ def test_participant_wizard_can_create_free_plan_resources(tmp_path):
     setup = ParticipantSetup(provider, source_dir=_source(tmp_path),
                              state_path=tmp_path / "state.json", input_fn=lambda _prompt: next(answers),
                              print_fn=lambda _line: None)
-    assert setup.run() == 0
+    assert setup.provision_node() == 0
     assert provider.create_supabase_calls == 1
     assert provider.create_vercel_calls == 1
 
@@ -251,3 +251,35 @@ def test_new_invite_carries_the_explicit_consent_into_the_request(tmp_path):
     assert "OPENSEEK_SETUP_KEY" not in provider.env   # the temporary key is removed again
     state = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
     assert state["step"] == "paired" and "pairing_setup_key" not in state
+
+
+def test_resume_after_telegram_health_failure_reuses_deployment(tmp_path):
+    from openseek.participant_setup import _atomic_state
+
+    provider = FakeProvider()
+    state_path = tmp_path / "state.json"
+    _atomic_state(state_path, {"version": 1, "step": "healthy",
+                               "deployment_url": "https://my-openseek-node.vercel.app",
+                               "vercel_project": "my-openseek-node"})
+    joiner = FakeTelegramJoiner()
+    health = provider.check_health
+    provider.check_health = lambda url, *, pending: False
+    setup = ParticipantSetup(provider, source_dir=_source(tmp_path), state_path=state_path,
+                             telegram_joiner=joiner, input_fn=lambda prompt: "1234",
+                             secret_input_fn=lambda prompt: "api-hash", print_fn=lambda line: None)
+    assert setup.run() == 1
+    assert provider.deploy_calls == 1
+
+    provider.check_health = health
+    prompts = []
+    def consent(prompt):
+        prompts.append(prompt)
+        return "y"
+
+    resumed = ParticipantSetup(provider, source_dir=_source(tmp_path), state_path=state_path,
+                               telegram_joiner=joiner, input_fn=consent, print_fn=lambda line: None)
+    assert resumed.run() == 0
+    assert prompts == ["Enable Nuvio guest-device access? [y/N] "]
+    assert len(joiner.calls) == 1
+    assert provider.deploy_calls == 3  # Telegram, invite, then temporary-key cleanup
+    assert resumed.state["step"] == "paired"

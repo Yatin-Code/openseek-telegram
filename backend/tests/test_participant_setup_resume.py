@@ -156,7 +156,7 @@ def test_resume_after_vercel_deploy_failure_skips_completed_provisioning(tmp_pat
     answers = iter(["1", "1"])
     first = ParticipantSetup(provider, source_dir=_source(tmp_path), state_path=state_path,
                              input_fn=lambda _prompt: next(answers), print_fn=output.append)
-    assert first.run() == 1
+    assert first.provision_node() == 1
     assert _state(tmp_path)["step"] == "vercel_configured"
     assert provider.schema_refs == ["sb-ref-1"]
     assert provider.bucket_urls == ["https://pool.supabase.co"]
@@ -167,7 +167,7 @@ def test_resume_after_vercel_deploy_failure_skips_completed_provisioning(tmp_pat
     output.clear()
     resumed = ParticipantSetup(provider, source_dir=_source(tmp_path), state_path=state_path,
                                input_fn=_no_input, print_fn=output.append)
-    assert resumed.run() == 0
+    assert resumed.provision_node() == 0
 
     calls = provider.calls
     assert calls.count("apply_schema") == 1, calls
@@ -202,7 +202,7 @@ def test_resume_after_vercel_secret_configuration_failure_skips_completed_provis
     answers = iter(["1", "1"])
     first = ParticipantSetup(provider, source_dir=_source(tmp_path), state_path=state_path,
                              input_fn=lambda _prompt: next(answers), print_fn=lambda _line: None)
-    assert first.run() == 1
+    assert first.provision_node() == 1
     assert _state(tmp_path)["step"] == "vercel_selected"
     assert provider.schema_refs == ["sb-ref-1"]
     assert provider.calls.count("deploy") == 0, provider.calls
@@ -210,7 +210,7 @@ def test_resume_after_vercel_secret_configuration_failure_skips_completed_provis
     provider.fail_secret = None
     resumed = ParticipantSetup(provider, source_dir=_source(tmp_path), state_path=state_path,
                                input_fn=_no_input, print_fn=lambda _line: None)
-    assert resumed.run() == 0
+    assert resumed.provision_node() == 0
 
     calls = provider.calls
     assert calls.count("apply_schema") == 1, calls
@@ -238,7 +238,7 @@ def test_interrupted_supabase_project_creation_resumes_without_recreating(tmp_pa
     first = ParticipantSetup(provider, source_dir=_source(tmp_path), state_path=state_path,
                              input_fn=lambda _prompt: next(first_answers),
                              print_fn=lambda _line: None)
-    assert first.run() == 1
+    assert first.provision_node() == 1
     state = _state(tmp_path)
     assert state["supabase_create_name"] == "pool-node"
     assert provider.calls.count("create_supabase_project") == 1, provider.calls
@@ -251,7 +251,7 @@ def test_interrupted_supabase_project_creation_resumes_without_recreating(tmp_pa
                                input_fn=lambda prompt: (prompts.append(prompt),
                                                         next(resumed_answers))[1],
                                print_fn=lines.append)
-    assert resumed.run() == 0
+    assert resumed.provision_node() == 0
 
     assert provider.calls.count("create_supabase_project") == 1, provider.calls
     assert prompts == ["Choose a number: "], prompts
@@ -271,7 +271,7 @@ def test_interrupted_vercel_project_creation_resumes_from_project_list_diff(tmp_
     first = ParticipantSetup(provider, source_dir=_source(tmp_path), state_path=state_path,
                              input_fn=lambda _prompt: next(first_answers),
                              print_fn=lambda _line: None)
-    assert first.run() == 1
+    assert first.provision_node() == 1
     state = _state(tmp_path)
     assert state["vercel_creating"] is True
     assert state["vercel_projects_before"] == []
@@ -279,7 +279,7 @@ def test_interrupted_vercel_project_creation_resumes_from_project_list_diff(tmp_
     provider.fail_create_vercel = False
     resumed = ParticipantSetup(provider, source_dir=_source(tmp_path), state_path=state_path,
                                input_fn=_no_input, print_fn=lambda _line: None)
-    assert resumed.run() == 0
+    assert resumed.provision_node() == 0
 
     assert provider.calls.count("create_vercel_project") == 1, provider.calls
     state = _state(tmp_path)
@@ -300,7 +300,7 @@ def test_resume_after_bucket_failure_applies_schema_once(tmp_path):
     answers = iter(["1", "1"])
     first = ParticipantSetup(provider, source_dir=_source(tmp_path), state_path=state_path,
                              input_fn=lambda _prompt: next(answers), print_fn=lambda _line: None)
-    assert first.run() == 1
+    assert first.provision_node() == 1
     assert _state(tmp_path)["step"] == "schema_applied"
     assert provider.schema_refs == ["sb-ref-1"]
 
@@ -311,7 +311,7 @@ def test_resume_after_bucket_failure_applies_schema_once(tmp_path):
                                input_fn=lambda prompt: (lines.append("input:" + prompt),
                                                         next(resumed_answers))[1],
                                print_fn=lines.append)
-    assert resumed.run() == 0, "\n".join(lines)
+    assert resumed.provision_node() == 0, "\n".join(lines)
 
     calls = provider.calls
     assert calls.count("apply_schema") == 1, calls
@@ -333,7 +333,7 @@ def test_resume_after_health_failure_does_not_redeploy_or_reconfigure(tmp_path):
     answers = iter(["1", "1"])
     first = ParticipantSetup(provider, source_dir=_source(tmp_path), state_path=state_path,
                              input_fn=lambda _prompt: next(answers), print_fn=lambda _line: None)
-    assert first.run() == 1
+    assert first.provision_node() == 1
     state = _state(tmp_path)
     assert state["step"] == "deployed"
     assert state["deployment_url"] == "https://my-openseek-node.vercel.app"
@@ -341,7 +341,7 @@ def test_resume_after_health_failure_does_not_redeploy_or_reconfigure(tmp_path):
     provider.fail_health = False
     resumed = ParticipantSetup(provider, source_dir=_source(tmp_path), state_path=state_path,
                                input_fn=_no_input, print_fn=lambda _line: None)
-    assert resumed.run() == 0
+    assert resumed.provision_node() == 0
 
     calls = provider.calls
     assert calls.count("deploy") == 1, calls
@@ -363,20 +363,20 @@ def test_auth_failure_during_resume_preserves_saved_checkpoint(tmp_path):
     answers = iter(["1", "1"])
     first = ParticipantSetup(provider, source_dir=_source(tmp_path), state_path=state_path,
                              input_fn=lambda _prompt: next(answers), print_fn=lambda _line: None)
-    assert first.run() == 1
+    assert first.provision_node() == 1
     assert _state(tmp_path)["step"] == "vercel_configured"
 
     provider.fail_deploy = False
     provider.fail_auth = True
     resumed = ParticipantSetup(provider, source_dir=_source(tmp_path), state_path=state_path,
                                input_fn=_no_input, print_fn=lambda _line: None)
-    assert resumed.run() == 1
+    assert resumed.provision_node() == 1
     assert _state(tmp_path)["step"] == "vercel_configured"
 
     provider.fail_auth = False
     recovered = ParticipantSetup(provider, source_dir=_source(tmp_path), state_path=state_path,
                                  input_fn=_no_input, print_fn=lambda _line: None)
-    assert recovered.run() == 0
+    assert recovered.provision_node() == 0
     assert _state(tmp_path)["step"] == "healthy"
 
 
@@ -389,7 +389,7 @@ def test_partial_vercel_configuration_resume_skips_completed_env_keys(tmp_path):
     answers = iter(["1", "1"])
     first = ParticipantSetup(provider, source_dir=_source(tmp_path), state_path=state_path,
                              input_fn=lambda _prompt: next(answers), print_fn=lambda _line: None)
-    assert first.run() == 1
+    assert first.provision_node() == 1
     state = _state(tmp_path)
     assert state["step"] == "vercel_selected"
     assert state["bootstrap_env_done"] == ["OPENSEEK_POOL_MODE", "OPENSEEK_PROFILE",
@@ -399,7 +399,7 @@ def test_partial_vercel_configuration_resume_skips_completed_env_keys(tmp_path):
     provider.fail_secret = None
     resumed = ParticipantSetup(provider, source_dir=_source(tmp_path), state_path=state_path,
                                input_fn=_no_input, print_fn=lambda _line: None)
-    assert resumed.run() == 0
+    assert resumed.provision_node() == 0
 
     calls = provider.calls
     for key in ("OPENSEEK_PROFILE", "OPENSEEK_POOL_MODE", "OPENSEEK_SETUP_PENDING",
@@ -427,7 +427,7 @@ def test_missing_saved_resource_in_progressed_state_fails_closed(tmp_path):
     setup = ParticipantSetup(provider, source_dir=_source(tmp_path), state_path=state_path,
                              input_fn=lambda prompt: (prompts.append(prompt), "1")[1],
                              print_fn=lines.append)
-    assert setup.run() == 1
+    assert setup.provision_node() == 1
     assert _state(tmp_path)["step"] == "vercel_selected"  # checkpoint preserved
     assert prompts == [], prompts
     assert provider.calls.count("create_supabase_project") == 0, provider.calls
@@ -442,7 +442,7 @@ def test_missing_saved_resource_in_progressed_state_fails_closed(tmp_path):
     setup2 = ParticipantSetup(provider2, source_dir=_source(tmp_path), state_path=state2,
                               input_fn=lambda prompt: (prompts2.append(prompt), "1")[1],
                               print_fn=lambda _line: None)
-    assert setup2.run() == 1
+    assert setup2.provision_node() == 1
     assert json.loads(state2.read_text(encoding="utf-8"))["step"] == "vercel_selected"
     assert prompts2 == [], prompts2
     assert provider2.calls.count("create_vercel_project") == 0, provider2.calls
@@ -463,7 +463,7 @@ def test_missing_saved_supabase_ref_at_vercel_configured_fails_closed(tmp_path):
     setup = ParticipantSetup(provider, source_dir=_source(tmp_path), state_path=state_path,
                              input_fn=lambda prompt: (prompts.append(prompt), "1")[1],
                              print_fn=lines.append)
-    assert setup.run() == 1
+    assert setup.provision_node() == 1
     assert _state(tmp_path)["step"] == "vercel_configured"  # checkpoint preserved
     assert prompts == [], prompts
     calls = provider.calls
@@ -491,7 +491,7 @@ def test_deployed_checkpoint_with_non_vercel_url_fails_before_health(tmp_path):
         setup = ParticipantSetup(provider, source_dir=_source(tmp_path), state_path=state_path,
                                  input_fn=lambda prompt: (prompts.append(prompt), "1")[1],
                                  print_fn=lines.append)
-        assert setup.run() == 1, url
+        assert setup.provision_node() == 1, url
         assert json.loads(state_path.read_text(encoding="utf-8"))["step"] == "deployed"
         assert provider.health == [], (url, provider.calls)  # no network call from state
         calls = provider.calls
@@ -570,7 +570,7 @@ def test_deployed_resume_restores_production_access_before_health(tmp_path):
     setup = ParticipantSetup(provider, source_dir=_source(tmp_path), state_path=state_path,
                              input_fn=_no_input, print_fn=output.append)
     try:
-        assert setup.run() == 0, "\n".join(output)
+        assert setup.provision_node() == 0, "\n".join(output)
 
         patches = [(method, path, body) for method, path, body
                    in vercel_calls if method == "PATCH"]
@@ -603,7 +603,7 @@ def test_production_access_refusal_preserves_deployed_checkpoint(tmp_path):
     setup = ParticipantSetup(provider, source_dir=_source(tmp_path), state_path=state_path,
                              input_fn=_no_input, print_fn=lines.append)
     try:
-        assert setup.run() == 1, "\n".join(lines)
+        assert setup.provision_node() == 1, "\n".join(lines)
         assert json.loads(state_path.read_text(encoding="utf-8"))["step"] == "deployed"
         assert provider._node_calls == []
         assert any("Vercel production access" in line for line in lines), lines
